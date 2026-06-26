@@ -149,9 +149,6 @@ JSON-RPC plugins must explicitly declare which engine capabilities they need. Th
 | Permission | RPC Method | What it does |
 |------------|------------|--------------|
 | `llm_chat` | `llm/chat` | Call the LLM provider (`chat` endpoint) |
-| `wiki_search` | `wiki/search` | Search Wiki knowledge base |
-| `wiki_write` | `wiki/write` | Write Wiki pages |
-| `wiki_decay` | `wiki/decay` | Wiki frequency decay |
 | `subagent_spawn` | `subagent/spawn` | Spawn a subagent to handle a task |
 | `message_send` | `message/send` | Send messages to channels |
 | `user_ask` | `user/ask` | Ask the user questions |
@@ -161,7 +158,7 @@ Example manifest:
 ```yaml
 permissions:
   - llm_chat
-  - wiki_search
+  - subagent_spawn
 ```
 
 If a script calls a method it doesn't have permission for, Gasket returns:

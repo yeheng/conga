@@ -41,16 +41,14 @@ pub mod subagents;
 pub mod token_tracker;
 pub mod tools;
 pub mod vault;
-pub mod wiki;
 
 // ── Root-level re-exports (used by external crates at crate root) ──
 
 pub use error::ConfigValidationError;
-pub use gasket_storage::{EventStore, SessionStore, SqliteStore};
+pub use gasket_storage::JsonStore;
 pub use gasket_types::SubagentSpawner;
 pub use session::AgentConfig;
 pub use subagents::ModelResolver;
-pub use wiki::create_wiki_tables;
 
 // ── Facade re-exports (merged from gasket-core) ─────────────
 

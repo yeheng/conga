@@ -2,58 +2,6 @@
 
 use crate::kernel::KernelConfig;
 
-fn default_wiki_base() -> String {
-    dirs::home_dir()
-        .expect("home directory not available")
-        .join(".gasket/wiki")
-        .to_str()
-        // SAFETY: home_dir always returns valid UTF-8 on supported platforms.
-        .unwrap()
-        .to_string()
-}
-
-fn default_sources_base() -> String {
-    dirs::home_dir()
-        .expect("home directory not available")
-        .join(".gasket/sources")
-        .to_str()
-        // SAFETY: home_dir always returns valid UTF-8 on supported platforms.
-        .unwrap()
-        .to_string()
-}
-
-fn default_batch_size() -> usize {
-    20
-}
-
-fn default_dedup_threshold() -> f64 {
-    0.85
-}
-
-fn default_max_pages() -> usize {
-    15
-}
-
-fn default_limit() -> usize {
-    10
-}
-
-fn default_max_cost() -> f64 {
-    0.10
-}
-
-fn default_cost_warning() -> f64 {
-    0.05
-}
-
-fn default_lint_interval() -> String {
-    "24h".to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
 /// Default model for agent
 pub const DEFAULT_MODEL: &str = "gpt-4o";
 /// Default maximum iterations for agent loop
@@ -102,89 +50,6 @@ impl Default for EvolutionConfig {
             enabled: true,
             batch_messages: 20,
             concurrency: 3,
-        }
-    }
-}
-
-/// Wiki system configuration
-#[derive(Clone, Debug)]
-pub struct WikiConfig {
-    pub enabled: bool,
-    pub base_path: String,
-    pub sources_path: String,
-    pub ingest: WikiIngestConfig,
-    pub query: WikiQueryConfig,
-    pub lint: WikiLintConfig,
-}
-
-impl Default for WikiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_path: default_wiki_base(),
-            sources_path: default_sources_base(),
-            ingest: WikiIngestConfig::default(),
-            query: WikiQueryConfig::default(),
-            lint: WikiLintConfig::default(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct WikiIngestConfig {
-    pub batch_size: usize,
-    pub auto_ingest: bool,
-    pub dedup_threshold: f64,
-    pub max_pages_per_ingest: usize,
-    pub max_cost_per_ingest: f64,
-    pub cost_warning_threshold: f64,
-}
-
-impl Default for WikiIngestConfig {
-    fn default() -> Self {
-        Self {
-            batch_size: default_batch_size(),
-            auto_ingest: true,
-            dedup_threshold: default_dedup_threshold(),
-            max_pages_per_ingest: default_max_pages(),
-            max_cost_per_ingest: default_max_cost(),
-            cost_warning_threshold: default_cost_warning(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct WikiQueryConfig {
-    pub default_limit: usize,
-    pub hybrid_search: bool,
-    pub answer_filing: bool,
-}
-
-impl Default for WikiQueryConfig {
-    fn default() -> Self {
-        Self {
-            default_limit: default_limit(),
-            hybrid_search: true,
-            answer_filing: true,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct WikiLintConfig {
-    pub enabled: bool,
-    pub interval: String,
-    pub auto_fix: bool,
-    pub semantic_checks: bool,
-}
-
-impl Default for WikiLintConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_true(),
-            interval: default_lint_interval(),
-            auto_fix: true,
-            semantic_checks: true,
         }
     }
 }
@@ -251,8 +116,6 @@ pub struct AgentConfig {
     pub prompts: PromptsConfig,
     /// Self-evolution configuration (auto-learning from conversations).
     pub evolution: Option<EvolutionConfig>,
-    /// Wiki knowledge system configuration (replaces memory system).
-    pub wiki: Option<WikiConfig>,
     /// Optional path to an external stop-words file for keyword-based history recall.
     pub stop_words_path: Option<std::path::PathBuf>,
 }
@@ -282,7 +145,6 @@ impl Default for AgentConfig {
             external_hook_timeout_secs: DEFAULT_EXTERNAL_HOOK_TIMEOUT_SECS,
             prompts: PromptsConfig::default(),
             evolution: Some(EvolutionConfig::default()),
-            wiki: None,
             stop_words_path: None,
         }
     }

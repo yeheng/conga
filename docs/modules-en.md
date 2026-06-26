@@ -80,18 +80,10 @@ trait Tool: Send + Sync {
 | `MessageTool` | communication | Send message through Broker to channel |
 | `cron` | system | Manage scheduled tasks (CRUD) |
 | `ask_user` | communication | Ask the user a question and wait for response |
-| `search_sops` | wiki | Search SOPs (Standard Operating Procedures) |
 | `create_plan` | planning | Create a structured plan for a goal |
-| `evolution` | memory | Extract memories from conversation |
-| `wiki_delete` | wiki | Delete a wiki page |
 | `clear_session` | session | Clear current session history |
 | `history_query` | history | Query conversation history by keywords |
 | `history_search` | history | Semantic search through history |
-| `wiki_search` | wiki | Search wiki pages using Tantivy BM25 |
-| `wiki_read` | wiki | Read a wiki page by path |
-| `wiki_write` | wiki | Write/update a wiki page |
-| `wiki_decay` | wiki | Run frequency decay on wiki pages |
-| `wiki_refresh` | wiki | Sync on-disk wiki files into search index |
 | Plugin tools | plugin | External script tools loaded from `~/.gasket/plugins/` |
 
 ### Helper Modules
@@ -100,9 +92,6 @@ trait Tool: Send + Sync {
 |------|-------------|
 | `registry.rs` | `ToolRegistry` — Tool registry with semantic routing support |
 | `base.rs` | Re-exports `Tool` trait, `ToolContext`, `ToolError` from types crate |
-| `wiki_decay.rs` | `WikiDecayTool` — Wiki page decay tool (formerly memory_decay) |
-| `wiki_refresh.rs` | `WikiRefreshTool` — Wiki index refresh tool (formerly memory_refresh) |
-| `wiki_tools.rs` | `WikiReadTool`, `WikiSearchTool`, `WikiWriteTool` — Wiki read/write/search tools |
 
 ---
 
@@ -124,24 +113,18 @@ The plugin system loads external scripts via YAML manifests and exposes them as 
 | `runner/daemon.rs` | `JsonRpcDaemon` — persistent JSON-RPC process with request multiplexing |
 | `dispatcher/mod.rs` | `RpcDispatcher` — routes RPC calls with permission enforcement |
 | `dispatcher/llm_chat.rs` | Handler for `llm/chat` |
-| `dispatcher/wiki_search.rs` | Handler for `wiki/search` |
-| `dispatcher/wiki_write.rs` | Handler for `wiki/write` |
-| `dispatcher/wiki_decay.rs` | Handler for `wiki/decay` |
 | `dispatcher/subagent.rs` | Handler for `subagent/spawn` |
 
 ### Protocols
 
 - **Simple**: One-shot JSON input/output via stdin/stdout
-- **JsonRpc**: Bidirectional JSON-RPC 2.0 with callback methods (`llm/chat`, `wiki/search`, etc.)
+- **JsonRpc**: Bidirectional JSON-RPC 2.0 with callback methods (`llm/chat`, etc.)
 
 ### Permissions (Default Deny)
 
 | Permission | RPC Method |
 |------------|------------|
 | `LlmChat` | `llm/chat` |
-| `WikiSearch` | `wiki/search` |
-| `WikiWrite` | `wiki/write` |
-| `WikiDecay` | `wiki/decay` |
 | `SubagentSpawn` | `subagent/spawn` |
 | `MessageSend` | `message/send` |
 | `UserAsk` | `user/ask` |
@@ -302,13 +285,12 @@ flowchart LR
 | `processor` | `process_history()` — Token-budget-aware history processing |
 | `query` | `HistoryQueryBuilder` — History query builder |
 | `search/` | FTS5 full-text search types |
-| `wiki/` | Wiki page storage (page_store, relation_store, source_store) |
 
 ### SqliteStore
 
 - Uses `sqlx::SqlitePool` native async I/O
 - WAL mode for concurrent reads
-- Submodules: `fs.rs` (filesystem), `event_store.rs` (events), `wiki/` (knowledge base)
+- Submodules: `fs.rs` (filesystem), `event_store.rs` (events)
 
 ---
 
@@ -578,46 +560,6 @@ Detailed description and usage of the skill...
 
 - **always_load: true** — Auto-load at startup
 - **always_load: false** — Load on demand
-
----
-
-## 17. wiki/ — Wiki Knowledge System
-
-> Detailed design: [wiki-module-design-en.md](wiki-module-design-en.md)
-
-> Located at `engine/src/wiki/`, three-layer architecture: Raw Sources → Compiled Wiki → Search Index.
-
-### Module Structure
-
-| File | Responsibility |
-|------|----------------|
-| `mod.rs` | Wiki module exports and re-exports |
-| `page.rs` | `WikiPage`, `PageType`, `PageSummary`, `PageFilter`, `slugify()` |
-| `store.rs` | `PageStore` — Wiki page CRUD |
-| `index.rs` | `PageIndex` — Tantivy BM25 full-text search |
-| `query/mod.rs` | `WikiQueryEngine`, `QueryResult`, `ScoredCandidate`, `SearchHit`, `Reranker`, `TantivyIndex` |
-| `ingest/mod.rs` | Knowledge ingestion pipeline (parser, extractor, dedup) |
-| `ingest/parser.rs` | `SourceParser`, `MarkdownParser`, `HtmlParser`, `PlainTextParser`, `ConversationParser` |
-| `ingest/extractor.rs` | `KnowledgeExtractor`, `ExtractedItem`, `ExtractionResult` |
-| `ingest/dedup.rs` | `SemanticDeduplicator`, `DedupResult` |
-| `lint/mod.rs` | `WikiLinter`, `LintReport`, `FixReport` — Health checks (structural only) |
-| `lint/structural.rs` | `StructuralIssue`, `StructuralIssueType`, `Severity`, `StructuralLintConfig` |
-| `log.rs` | `WikiLog`, `LogEntry` — Operation logging |
-| `lifecycle.rs` | `DecayReport`, `FrequencyManager` — Frequency decay and promotion management |
-
-### Storage Wiki Module
-
-> Located at `storage/src/wiki/`
-
-| File | Responsibility |
-|------|----------------|
-| `mod.rs` | Wiki storage module exports |
-| `page_store.rs` | `WikiPageStore`, `PageRow`, `DecayCandidate`, `WikiPageInput` |
-| `tables.rs` | `create_wiki_tables()` — DDL table creation |
-| `types.rs` | `Frequency`, `TokenBudget` — Core type definitions |
-| `log_store.rs` | `WikiLogStore` — Log persistence |
-| `relation_store.rs` | `WikiRelationStore` — Page relations |
-| `source_store.rs` | `WikiSourceStore` — Source tracking |
 
 ---
 

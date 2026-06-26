@@ -217,9 +217,6 @@ impl Default for RpcDispatcher {
 ///
 /// Registers all built-in callback handlers for plugin RPC methods:
 /// - `llm/chat` - LLM chat completions
-/// - `wiki/search` - Wiki search
-/// - `wiki/write` - Wiki write
-/// - `wiki/decay` - Wiki decay
 /// - `subagent/spawn` - Subagent spawning
 ///   Generic handler that delegates an RPC method to an engine tool.
 pub struct ToolDelegateHandler {
@@ -290,24 +287,6 @@ pub fn build_dispatcher() -> RpcDispatcher {
     let mut d = RpcDispatcher::new();
     // Unwrap is safe: built-in handlers have unique method names.
     d.register(Arc::new(LlmChatHandler)).unwrap();
-    d.register(Arc::new(ToolDelegateHandler::new(
-        "wiki/search",
-        Permission::WikiSearch,
-        "wiki_search",
-    )))
-    .unwrap();
-    d.register(Arc::new(ToolDelegateHandler::new(
-        "wiki/write",
-        Permission::WikiWrite,
-        "wiki_write",
-    )))
-    .unwrap();
-    d.register(Arc::new(ToolDelegateHandler::new(
-        "wiki/decay",
-        Permission::WikiDecay,
-        "wiki_decay",
-    )))
-    .unwrap();
     d.register(Arc::new(SubagentSpawnHandler)).unwrap();
     d.register(Arc::new(ToolDelegateHandler::new(
         "message/send",
@@ -507,7 +486,7 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new();
         let handler = Arc::new(EchoHandler {
             method: "test/notify".to_string(),
-            permission: Permission::WikiSearch,
+            permission: Permission::LlmChat,
         });
         dispatcher.register(handler).unwrap();
 
@@ -518,7 +497,7 @@ mod tests {
             params: Some(json!({"event": "test"})),
         };
 
-        let permissions = vec![Permission::WikiSearch];
+        let permissions = vec![Permission::LlmChat];
         let ctx = create_test_ctx();
         let response = dispatcher.dispatch(request, &permissions, &ctx).await;
 

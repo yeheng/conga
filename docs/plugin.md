@@ -149,9 +149,6 @@ JSON-RPC 插件必须显式声明所需的引擎能力。默认策略是**全部
 | 权限 | RPC 方法 | 功能 |
 |------|----------|------|
 | `llm_chat` | `llm/chat` | 调用 LLM 提供商（chat 接口） |
-| `wiki_search` | `wiki/search` | 搜索 Wiki 知识库 |
-| `wiki_write` | `wiki/write` | 写入 Wiki 页面 |
-| `wiki_decay` | `wiki/decay` | Wiki 频率衰减 |
 | `subagent_spawn` | `subagent/spawn` | 创建子代理处理任务 |
 | `message_send` | `message/send` | 发送消息到渠道 |
 | `user_ask` | `user/ask` | 向用户提问 |
@@ -161,7 +158,7 @@ JSON-RPC 插件必须显式声明所需的引擎能力。默认策略是**全部
 ```yaml
 permissions:
   - llm_chat
-  - wiki_search
+  - subagent_spawn
 ```
 
 如果脚本调用了未授权的 RPC 方法，Gasket 会返回：

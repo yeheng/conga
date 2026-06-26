@@ -84,17 +84,9 @@ trait Tool: Send + Sync {
 | `ask_user` | interaction | 否 | 向用户提问并等待回复 |
 | `message` | communication | 否 | 通过 Broker 发消息到渠道 |
 | `cron` | system | 否 | 管理定时任务 (CRUD) |
-| `history_query` | wiki | 否 | 按关键词查询对话历史（SQLite 本地搜索） |
-| `history_search` | wiki | 否 | 语义搜索历史对话（需要 `embedding` 特性） |
-| `wiki_search` | wiki | 否 | Tantivy BM25 搜索 Wiki 页面 |
-| `wiki_read` | wiki | 否 | 按路径读取 Wiki 页面 |
-| `wiki_write` | wiki | 否 | 写入/更新 Wiki 页面 |
-| `wiki_decay` | wiki | 否 | 运行 Wiki 频率衰减 |
-| `wiki_refresh` | wiki | 否 | 刷新 Wiki 索引 |
-| `wiki_delete` | wiki | 是 | 删除 Wiki 页面 |
-| `search_sops` | wiki | 否 | 搜索 SOP（标准操作流程）页面 |
+| `history_query` | history | 否 | 按关键词查询对话历史（SQLite 本地搜索） |
+| `history_search` | history | 否 | 语义搜索历史对话（需要 `embedding` 特性） |
 | `create_plan` | system | 否 | 创建执行计划（需要 LLM provider） |
-| `evolution` | system | 否 | 从对话中提取记忆（需要 LLM provider） |
 | `new_session` | system | 是 | 开启新会话并清空历史 |
 | `clear_session` | system | 是 | 清空当前会话历史 |
 | 插件工具 | plugin | 否 | 从 `~/.gasket/plugins/` 加载的外部脚本工具 |
@@ -105,9 +97,6 @@ trait Tool: Send + Sync {
 |------|------|
 | `registry.rs` | `ToolRegistry` — 工具注册表，管理所有可用工具 |
 | `base.rs` | 工具基础类型和辅助函数 |
-| `wiki_decay.rs` | `WikiDecayTool` — Wiki 页面衰减工具（原 memory_decay） |
-| `wiki_refresh.rs` | `WikiRefreshTool` — Wiki 索引刷新工具（原 memory_refresh） |
-| `wiki_tools.rs` | `WikiReadTool`, `WikiSearchTool`, `WikiWriteTool` — Wiki 读写搜索工具 |
 
 > **注意**: 沙箱相关类型（`ProcessManager`, `SandboxConfig`）从 `sandbox` crate re-export。
 
@@ -131,24 +120,18 @@ trait Tool: Send + Sync {
 | `runner/daemon.rs` | `JsonRpcDaemon` — 持久化 JSON-RPC 进程，支持请求多路复用 |
 | `dispatcher/mod.rs` | `RpcDispatcher` — 带权限校验的 RPC 方法路由 |
 | `dispatcher/llm_chat.rs` | `llm/chat` 处理器 |
-| `dispatcher/memory_search.rs` | `memory/search` 处理器 |
-| `dispatcher/memory_write.rs` | `memory/write` 处理器 |
-| `dispatcher/memory_decay.rs` | `memory/decay` 处理器 |
 | `dispatcher/subagent.rs` | `subagent/spawn` 处理器 |
 
 ### 协议
 
 - **Simple**: 一次性 JSON 输入/输出，通过 stdin/stdout 通信
-- **JsonRpc**: 双向 JSON-RPC 2.0，支持回调引擎能力（LLM、记忆、子代理等）
+- **JsonRpc**: 双向 JSON-RPC 2.0，支持回调引擎能力（LLM、子代理等）
 
 ### 权限（默认拒绝）
 
 | 权限 | YAML 值 | RPC 方法 |
 |------|---------|----------|
 | `LlmChat` | `llm_chat` | `llm/chat` |
-| `WikiSearch` | `wiki_search` | `wiki/search` |
-| `WikiWrite` | `wiki_write` | `wiki/write` |
-| `WikiDecay` | `wiki_decay` | `wiki/decay` |
 | `SubagentSpawn` | `subagent_spawn` | `subagent/spawn` |
 | `MessageSend` | `message_send` | `message/send` |
 | `UserAsk` | `user_ask` | `user/ask` |
@@ -314,13 +297,12 @@ flowchart LR
 | `processor` | `process_history()` — Token-budget-aware 历史处理 |
 | `query` | `HistoryQueryBuilder` — 历史查询构建器 |
 | `search/` | FTS5 全文搜索类型 |
-| `wiki/` | Wiki 页面存储（page_store, relation_store, source_store） |
 
 ### SqliteStore
 
 - 使用 `sqlx::SqlitePool` 原生异步 I/O
 - WAL 模式支持并发读
-- 子模块: `fs.rs` (文件系统), `event_store.rs` (事件), `wiki/` (知识库)
+- 子模块: `fs.rs` (文件系统), `event_store.rs` (事件)
 
 ---
 
@@ -582,46 +564,6 @@ always_load: false
 
 - **always_load: true** — 启动时自动加载
 - **always_load: false** — 按需加载
-
----
-
-## 17. wiki/ — Wiki 知识系统
-
-> 详细设计文档: [wiki-module-design.md](wiki-module-design.md)
-
-> 位于 `engine/src/wiki/`，三层架构：原始来源 → 编译 Wiki → 搜索索引。
-
-### 模块结构
-
-| 文件 | 职责 |
-|------|------|
-| `mod.rs` | Wiki 模块导出与 re-export |
-| `page.rs` | `WikiPage`, `PageType`, `PageSummary`, `PageFilter`, `slugify()` |
-| `store.rs` | `PageStore` — Wiki 页面 CRUD |
-| `index.rs` | `PageIndex` — Tantivy BM25 全文搜索 |
-| `query/mod.rs` | `WikiQueryEngine`, `QueryResult`, `ScoredCandidate`, `SearchHit`, `Reranker`, `TantivyIndex` |
-| `ingest/mod.rs` | 知识摄入管线（parser, extractor, dedup） |
-| `ingest/parser.rs` | `SourceParser`, `MarkdownParser`, `HtmlParser`, `PlainTextParser`, `ConversationParser` |
-| `ingest/extractor.rs` | `KnowledgeExtractor`, `ExtractedItem`, `ExtractionResult` |
-| `ingest/dedup.rs` | `SemanticDeduplicator`, `DedupResult` |
-| `lint/mod.rs` | `WikiLinter`, `LintReport`, `FixReport` — 健康检查（仅结构化检查） |
-| `lint/structural.rs` | `StructuralIssue`, `StructuralIssueType`, `Severity`, `StructuralLintConfig` |
-| `log.rs` | `WikiLog`, `LogEntry` — 操作日志 |
-| `lifecycle.rs` | `DecayReport`, `FrequencyManager` — 频率衰减与晋升管理 |
-
-### Storage Wiki 模块
-
-> 位于 `storage/src/wiki/`
-
-| 文件 | 职责 |
-|------|------|
-| `mod.rs` | Wiki storage 模块导出 |
-| `page_store.rs` | `WikiPageStore`, `PageRow`, `DecayCandidate`, `WikiPageInput` |
-| `tables.rs` | `create_wiki_tables()` — DDL 建表 |
-| `types.rs` | `Frequency`, `TokenBudget` — 核心类型定义 |
-| `log_store.rs` | `WikiLogStore` — 日志持久化 |
-| `relation_store.rs` | `WikiRelationStore` — 页面关系 |
-| `source_store.rs` | `WikiSourceStore` — 来源追踪 |
 
 ---
 

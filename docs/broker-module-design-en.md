@@ -86,7 +86,6 @@ flowchart TB
         ST["Topic::Stream(String)"]
         CT["Topic::CronTrigger"]
         HB["Topic::Heartbeat"]
-        WC["Topic::WikiChanged"]
         CU["Topic::Custom(String)"]
     end
 

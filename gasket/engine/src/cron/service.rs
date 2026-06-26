@@ -18,7 +18,8 @@ use super::types::{CronJob, RefreshNextRunEntry, RefreshReport};
 ///
 /// **Hybrid Architecture**:
 /// - Config lives in `~/.gasket/cron/*.md` files
-/// - Execution state lives in SQLite `cron_state` table
+/// - Execution state lives in a JSON state file (`cron_path`, typically
+///   `~/.gasket/state/cron.json`)
 pub struct CronService {
     registry: RwLock<CronRegistry>,
     persistence: CronPersistence,
@@ -27,9 +28,9 @@ pub struct CronService {
 
 impl CronService {
     /// Create a new cron service.
-    pub async fn new(workspace: PathBuf, db: gasket_storage::CronStore) -> Self {
+    pub async fn new(workspace: PathBuf, cron_path: PathBuf) -> Self {
         let registry = RwLock::new(CronRegistry::new());
-        let persistence = CronPersistence::new(db);
+        let persistence = CronPersistence::new(cron_path);
         let service = Self {
             registry,
             persistence,
@@ -306,20 +307,6 @@ impl CronService {
 
     pub async fn ensure_system_cron_jobs(&self) {
         let system_jobs = [
-            (
-                "system-wiki-decay",
-                "Wiki Decay",
-                "0 0 */6 * * * *",
-                Some("wiki_decay".to_string()),
-                None,
-            ),
-            (
-                "system-wiki-refresh",
-                "Wiki Refresh",
-                "0 0 */3 * * * *",
-                Some("wiki_refresh".to_string()),
-                Some(serde_json::json!({"action": "sync"})),
-            ),
             (
                 "system-cron-refresh",
                 "Cron Reload",

@@ -17,36 +17,13 @@ use crate::session::config::AgentConfigExt;
 use crate::session::finalizer::ResponseFinalizer;
 use crate::session::{prompt, AgentConfig, AgentSession};
 use gasket_providers::LlmProvider;
-use gasket_storage::{EventStore, SessionStore};
 
 /// Bundle of embedding-specific dependencies for session construction.
-///
-/// All three fields are required: the broadcast sender is **not** optional —
-/// it is the channel the indexer listens on, so omitting it would silently
-/// detach the indexer from event flow. Callers that don't want embedding
-/// indexing simply don't build a session with embedding at all.
 #[cfg(feature = "embedding")]
 pub struct EmbeddingContext {
     pub searcher: Arc<gasket_embedding::RecallSearcher>,
     pub indexer: gasket_embedding::EmbeddingIndexer,
-    pub event_store_tx: tokio::sync::broadcast::Sender<gasket_types::SessionEvent>,
 }
-
-/// Wiki preparation prompt appended to system prompt when wiki is enabled.
-///
-/// Instructs the agent to proactively query wiki via tools before responding,
-/// replacing the old automatic context injection mechanism.
-const WIKI_PREPARATION_PROMPT: &str = "\
-## Wiki Knowledge System
-
-You have access to a personal wiki knowledge base via these tools:
-- `wiki_search(query)`: Search wiki pages by keyword
-- `wiki_read(path)`: Read a specific wiki page by path
-- `wiki_write(path, title, content)`: Create or update a wiki page
-
-**Preparation Protocol**: Before responding to any user query, always use `wiki_search` \
-to check if relevant knowledge already exists in the wiki. This ensures your responses \
-build upon accumulated knowledge rather than starting from scratch.";
 
 /// Builder for constructing an `AgentSession`.
 ///
@@ -57,17 +34,13 @@ pub struct SessionBuilder {
     workspace: PathBuf,
     config: AgentConfig,
     tools: Arc<crate::tools::ToolRegistry>,
-    sqlite_store: Arc<gasket_storage::SqliteStore>,
+    store: Arc<gasket_storage::JsonStore>,
     /// Optional semantic recall searcher + indexer (embedding feature).
     #[cfg(feature = "embedding")]
     embedding_recall: Option<(
         Arc<gasket_embedding::RecallSearcher>,
         gasket_embedding::EmbeddingIndexer,
     )>,
-    /// Optional shared broadcast sender so the AgentSession's EventStore
-    /// shares the same channel as the embedding infrastructure.
-    #[cfg(feature = "embedding")]
-    event_store_tx: Option<tokio::sync::broadcast::Sender<gasket_types::SessionEvent>>,
 }
 
 impl SessionBuilder {
@@ -77,18 +50,16 @@ impl SessionBuilder {
         workspace: PathBuf,
         config: AgentConfig,
         tools: Arc<crate::tools::ToolRegistry>,
-        sqlite_store: Arc<gasket_storage::SqliteStore>,
+        store: Arc<gasket_storage::JsonStore>,
     ) -> Self {
         Self {
             provider,
             workspace,
             config,
             tools,
-            sqlite_store,
+            store,
             #[cfg(feature = "embedding")]
             embedding_recall: None,
-            #[cfg(feature = "embedding")]
-            event_store_tx: None,
         }
     }
 
@@ -104,34 +75,14 @@ impl SessionBuilder {
         self
     }
 
-    /// Share the broadcast sender from an external EventStore so that
-    /// the AgentSession's EventStore and the embedding indexer listen
-    /// on the same channel.
-    #[cfg(feature = "embedding")]
-    pub fn with_event_store_tx(
-        mut self,
-        tx: tokio::sync::broadcast::Sender<gasket_types::SessionEvent>,
-    ) -> Self {
-        self.event_store_tx = Some(tx);
-        self
-    }
-
     /// Build the complete `AgentSession`.
     ///
     /// All services are constructed in dependency order as local variables —
     /// the compiler guarantees every value is initialized before use.
     pub async fn build(self) -> Result<AgentSession, AgentError> {
-        // ── 1. Storage layer ─────────────────────────────────────────
-        let pool = self.sqlite_store.pool();
-        let session_store = SessionStore::new(pool.clone());
-        #[cfg(feature = "embedding")]
-        let event_store = if let Some(tx) = self.event_store_tx {
-            EventStore::with_pool_and_sender(pool.clone(), tx)
-        } else {
-            EventStore::new(pool.clone())
-        };
-        #[cfg(not(feature = "embedding"))]
-        let event_store = EventStore::new(pool.clone());
+        // ── 1. Storage layer (JsonStore is the sole backend) ────────
+        let session_store: Arc<dyn gasket_storage::SessionStoreTrait> = self.store.clone();
+        let event_store: Arc<dyn gasket_storage::EventStoreTrait> = self.store.clone();
 
         // ── 2. Query provider for real model limits ──────────────────
         let model_limits = self
@@ -233,12 +184,6 @@ impl SessionBuilder {
             system_prompt.push_str(&skills);
         }
 
-        // ── 7. Wiki availability check (prompt only) ──────────────
-        if is_wiki_available(&self.config) {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(WIKI_PREPARATION_PROMPT);
-        }
-
         // ── 8. Hook registry ─────────────────────────────────────────
         let hooks = crate::session::history::builder::build_default_hooks_builder().build_shared();
 
@@ -255,14 +200,6 @@ impl SessionBuilder {
             history_config,
         );
 
-        // ── 10. Wiki PageStore for finalizer (index.md rebuild) ──
-        let wiki_root = self.workspace.join("wiki");
-        let page_store = if wiki_root.exists() {
-            Some(crate::wiki::PageStore::new(pool.clone(), wiki_root))
-        } else {
-            None
-        };
-
         let finalizer = ResponseFinalizer::new(
             context_builder.hooks().clone(),
             context_builder.event_store().clone(),
@@ -270,7 +207,6 @@ impl SessionBuilder {
             None,
             effective_max_tokens,
             self.config.after_response_hook_timeout_secs,
-            page_store,
         );
 
         let mut config = self.config;
@@ -295,27 +231,15 @@ impl SessionBuilder {
 // Internal helpers — pure functions, no builder state
 // ---------------------------------------------------------------------------
 
-/// Check if wiki is configured and minimally available.
-///
-/// Returns true if wiki config is enabled and the base path exists.
-/// Does NOT initialize PageStore/PageIndex/WikiLog — that happens
-/// during tool registration in `tools/builder.rs`.
-fn is_wiki_available(config: &AgentConfig) -> bool {
-    config
-        .wiki
-        .as_ref()
-        .is_some_and(|cfg| cfg.enabled && std::path::Path::new(&cfg.base_path).exists())
-}
-
 /// Build an AgentSession with all services initialized.
 pub async fn build_session(
     provider: Arc<dyn LlmProvider>,
     workspace: PathBuf,
     config: AgentConfig,
     tools: Arc<crate::tools::ToolRegistry>,
-    sqlite_store: Arc<gasket_storage::SqliteStore>,
+    store: Arc<gasket_storage::JsonStore>,
 ) -> Result<AgentSession, AgentError> {
-    SessionBuilder::new(provider, workspace, config, tools, sqlite_store)
+    SessionBuilder::new(provider, workspace, config, tools, store)
         .build()
         .await
 }
@@ -327,12 +251,11 @@ pub async fn build_session_with_embedding(
     workspace: PathBuf,
     config: AgentConfig,
     tools: Arc<crate::tools::ToolRegistry>,
-    sqlite_store: Arc<gasket_storage::SqliteStore>,
+    store: Arc<gasket_storage::JsonStore>,
     embedding: EmbeddingContext,
 ) -> Result<AgentSession, AgentError> {
-    SessionBuilder::new(provider, workspace, config, tools, sqlite_store)
+    SessionBuilder::new(provider, workspace, config, tools, store)
         .with_embedding_recall(embedding.searcher, embedding.indexer)
-        .with_event_store_tx(embedding.event_store_tx)
         .build()
         .await
 }

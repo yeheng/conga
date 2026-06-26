@@ -20,13 +20,11 @@ use gasket_storage::count_tokens;
 /// |-------------|-----------------------------------------------|
 /// | PROFILE.md  | Agent identity + user profile                  |
 /// | SOUL.md     | Core behavioral rules & knowledge management   |
-/// | WIKI.md     | Wiki tool reference & writing rules            |
 /// | MEMORY.md   | Session memory (auto-truncated, may not exist) |
 /// | BOOTSTRAP.md| First-run onboarding ritual                    |
 pub const BOOTSTRAP_FILES_FULL: &[&str] = &[
     "PROFILE.md",
     "SOUL.md",
-    "WIKI.md",
     "MEMORY.md",
     "BOOTSTRAP.md",
 ];

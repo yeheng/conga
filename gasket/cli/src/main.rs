@@ -21,7 +21,7 @@ mod workspace_downloader;
 
 use cli::{
     AuthCommands, ChannelsCommands, Cli, Commands, CronCommands, EmbeddingCommands, ToolCommands,
-    VaultCommands, WikiCommands,
+    VaultCommands,
 };
 
 #[tokio::main]
@@ -103,16 +103,6 @@ async fn main() -> Result<()> {
             VaultCommands::Export { file } => commands::cmd_vault_export(file).await,
             VaultCommands::Rekey => commands::cmd_vault_rekey().await,
         },
-        Some(Commands::Wiki { command }) => match command {
-            WikiCommands::Init => commands::cmd_wiki_init().await,
-            WikiCommands::Migrate => commands::cmd_wiki_migrate().await,
-            WikiCommands::Stats => commands::cmd_wiki_stats().await,
-            WikiCommands::Ingest { path, tier } => commands::cmd_wiki_ingest(&path, &tier).await,
-            WikiCommands::Search { query, limit } => commands::cmd_wiki_search(&query, limit).await,
-            WikiCommands::List { page_type } => commands::cmd_wiki_list(page_type.as_deref()).await,
-            WikiCommands::Lint { fix } => commands::cmd_wiki_lint(fix).await,
-            WikiCommands::Delete { path, force } => commands::cmd_wiki_delete(&path, force).await,
-        },
         Some(Commands::Tool { command }) => match command {
             ToolCommands::Execute { name, args } => commands::cmd_tool_execute(name, args).await,
         },
@@ -135,7 +125,6 @@ async fn main() -> Result<()> {
             println!("  stats     Show session token usage and cost statistics");
             println!("  tool       Execute tools directly");
             println!("  vault      Manage vault secrets");
-            println!("  wiki       Wiki knowledge system");
             println!("  embedding  Manage embedding index and history recall\n");
             println!("Run 'gasket --help' for more information.");
             Ok(())

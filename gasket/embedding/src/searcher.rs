@@ -8,7 +8,7 @@ use tracing::{debug, info};
 use crate::index::MemoryIndex;
 use crate::provider::EmbeddingProvider;
 use crate::vector_store::VectorStore;
-use gasket_storage::EventStore;
+use gasket_storage::EventStoreTrait;
 use gasket_types::EventType;
 
 /// Configuration for recall search behavior.
@@ -46,12 +46,12 @@ pub struct RecallHit {
 ///
 /// Two-tier architecture:
 /// - **Hot index** (memory): recent embeddings for fast queries.
-/// - **Cold store** (LanceDB / SQLite): full historical embeddings.
+/// - **Cold store** (LanceDB): full historical embeddings.
 pub struct RecallSearcher {
     provider: Arc<dyn EmbeddingProvider>,
     index: Arc<MemoryIndex>,
     store: Arc<dyn VectorStore>,
-    event_store: EventStore,
+    event_store: Arc<dyn EventStoreTrait>,
 }
 
 impl RecallSearcher {
@@ -59,7 +59,7 @@ impl RecallSearcher {
         provider: Arc<dyn EmbeddingProvider>,
         index: Arc<MemoryIndex>,
         store: Arc<dyn VectorStore>,
-        event_store: EventStore,
+        event_store: Arc<dyn EventStoreTrait>,
     ) -> Self {
         Self {
             provider,
@@ -185,65 +185,37 @@ fn role_str(event_type: &EventType) -> &'static str {
 mod tests {
     use super::*;
     use crate::provider::MockProvider;
-    use crate::store::EmbeddingStore;
     use crate::vector_store::VectorStore;
     use chrono::Utc;
     use gasket_types::{EventMetadata, SessionEvent};
-    use sqlx::sqlite::SqlitePoolOptions;
-    use sqlx::SqlitePool;
     use uuid::Uuid;
 
-    async fn setup_event_db() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .connect(":memory:")
-            .await
-            .expect("in-memory pool");
-        sqlx::query(
-            r#"
-            CREATE TABLE sessions_v2 (
-                key TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                last_consolidated_event TEXT,
-                total_events INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0,
-                channel TEXT NOT NULL DEFAULT '',
-                chat_id TEXT NOT NULL DEFAULT ''
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE session_events (
-                id TEXT PRIMARY KEY,
-                session_key TEXT NOT NULL,
-                channel TEXT NOT NULL DEFAULT '',
-                chat_id TEXT NOT NULL DEFAULT '',
-                event_type TEXT NOT NULL,
-                content TEXT NOT NULL,
-                tools_used TEXT DEFAULT '[]',
-                token_usage TEXT,
-                token_len INTEGER NOT NULL DEFAULT 0,
-                event_data TEXT,
-                extra TEXT DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                sequence INTEGER NOT NULL DEFAULT 0
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        pool
+    /// Build a JsonStore-backed event store in a fresh temp dir.
+    ///
+    /// The `TempDir` is returned alongside the store and must outlive the test.
+    fn make_event_store() -> (
+        Arc<dyn EventStoreTrait>,
+        Arc<gasket_storage::JsonStore>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(gasket_storage::JsonStore::new(dir.path().to_path_buf()));
+        (store.clone() as Arc<dyn EventStoreTrait>, store, dir)
     }
 
-    async fn make_store(pool: SqlitePool, dim: usize) -> Arc<dyn VectorStore> {
-        let store = EmbeddingStore::new(pool, dim);
-        store.run_migration().await.unwrap();
-        Arc::new(store)
+    /// Build a LanceDB-backed vector store in a fresh temp dir.
+    ///
+    /// The `TempDir` is returned alongside the store and must outlive the test.
+    async fn make_store(dim: usize) -> (Arc<dyn VectorStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::store::VectorStoreConfig::LanceDB {
+            path: dir.path().to_string_lossy().to_string(),
+            table: "event_embeddings".to_string(),
+        };
+        let store = crate::store::build_vector_store(&config, dim)
+            .await
+            .unwrap();
+        (store, dir)
     }
 
     fn make_event(content: &str, ty: EventType) -> SessionEvent {
@@ -296,16 +268,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_recall_returns_hits_with_content() {
-        let pool = setup_event_db().await;
-        let event_store = EventStore::new(pool.clone());
-        let store = make_store(pool, 3).await;
+        let (event_store, store_ref, _dir) = make_event_store();
+        let (store, _vector_dir) = make_store(3).await;
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider::new(3));
         let index = Arc::new(MemoryIndex::new(3));
 
         let e1 = make_event("hello rust", EventType::UserMessage);
         let e2 = make_event("python rocks", EventType::AssistantMessage);
-        event_store.append_event(&e1).await.unwrap();
-        event_store.append_event(&e2).await.unwrap();
+        store_ref.append(&e1).await.unwrap();
+        store_ref.append(&e2).await.unwrap();
 
         index
             .insert(e1.id.to_string(), vec![1.0, 0.0, 0.0])
@@ -342,7 +313,7 @@ mod tests {
         };
         let hits = searcher.recall("anything", &config).await.unwrap();
         assert!(!hits.is_empty());
-        // Both hits should have the populated content from EventStore.
+        // Both hits should have the populated content from the event store.
         for hit in &hits {
             assert!(hit.content == "hello rust" || hit.content == "python rocks");
             assert!(hit.role == "user" || hit.role == "assistant");
@@ -352,14 +323,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_recall_filters_by_min_score() {
-        let pool = setup_event_db().await;
-        let event_store = EventStore::new(pool.clone());
-        let store = make_store(pool, 3).await;
+        let (event_store, store_ref, _dir) = make_event_store();
+        let (store, _vector_dir) = make_store(3).await;
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider::new(3));
         let index = Arc::new(MemoryIndex::new(3));
 
         let e1 = make_event("anything", EventType::UserMessage);
-        event_store.append_event(&e1).await.unwrap();
+        store_ref.append(&e1).await.unwrap();
         index
             .insert(e1.id.to_string(), vec![1.0, 0.0, 0.0])
             .unwrap();
@@ -377,15 +347,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_recall_respects_top_k() {
-        let pool = setup_event_db().await;
-        let event_store = EventStore::new(pool.clone());
-        let store = make_store(pool, 3).await;
+        let (event_store, store_ref, _dir) = make_event_store();
+        let (store, _vector_dir) = make_store(3).await;
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider::new(3));
         let index = Arc::new(MemoryIndex::new(3));
 
         for i in 0..20 {
             let e = make_event(&format!("msg-{i}"), EventType::UserMessage);
-            event_store.append_event(&e).await.unwrap();
+            store_ref.append(&e).await.unwrap();
             index.insert(e.id.to_string(), vec![1.0, 0.0, 0.0]).unwrap();
         }
 

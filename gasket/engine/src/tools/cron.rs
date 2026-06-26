@@ -238,14 +238,10 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    /// Helper to create a CronService with a temp database for tests
+    /// Helper to create a CronService with a temp JSON state file for tests
     async fn create_test_cron_service(temp_dir: &std::path::Path) -> Arc<CronService> {
-        let db_path = temp_dir.join("test_cron.db");
-        let sqlite_store = gasket_storage::SqliteStore::with_path(db_path)
-            .await
-            .expect("Failed to create test SQLite store");
-        let cron_store = sqlite_store.cron_store();
-        Arc::new(CronService::new(temp_dir.to_path_buf(), cron_store).await)
+        let cron_path = temp_dir.join("state").join("cron.json");
+        Arc::new(CronService::new(temp_dir.to_path_buf(), cron_path).await)
     }
 
     #[tokio::test]

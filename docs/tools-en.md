@@ -62,11 +62,6 @@ mindmap
       ::icon(🧠)
       Query history
       Search history
-    Wiki
-      ::icon(📚)
-      Search wiki
-      Read/write pages
-      Decay and refresh
     Schedule
       ::icon(⏰)
       Create cron jobs
@@ -180,46 +175,6 @@ flowchart LR
 | `history_query` | Query conversation history by keywords | "What did I say yesterday?" |
 | `history_search` | Semantic search through history (requires `embedding` feature) | "Find discussions about DB design" |
 
-### 5.1 Wiki Tools
-
-Wiki tools provide structured knowledge management powered by Tantivy BM25 full-text search and SQLite storage:
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant AI as AI
-    participant W as Wiki Tool
-    participant Store as SQLite + Tantivy
-
-    U->>AI: Search for Rust ownership info
-
-    AI->>W: wiki_search("Rust ownership")
-    W->>Store: Tantivy BM25 search
-    Store-->>W: Matching wiki pages
-    W-->>AI: Search results list
-
-    AI->>W: wiki_read("rust/ownership")
-    W->>Store: Read page details
-    Store-->>W: Full Markdown content
-    W-->>AI: Page content
-
-    AI-->>U: Based on the wiki, Rust ownership means...
-
-    U->>AI: Save this summary to the knowledge base
-    AI->>W: wiki_write("rust/summary", ...)
-    W->>Store: Write page + update index
-    Store-->>W: Saved
-    W-->>AI: Page created
-```
-
-| Tool | Purpose | Parameters |
-|------|---------|------------|
-| `wiki_search` (`WikiSearchTool`) | Search wiki pages using Tantivy BM25 | `query` (required), `limit` (optional, default 10) |
-| `wiki_write` (`WikiWriteTool`) | Write/update a wiki page | `path`, `title`, `content` (required), `page_type` (optional, default `"topic"`), `tags` (optional array) |
-| `wiki_read` (`WikiReadTool`) | Read a wiki page by path | `path` (required). Returns full Markdown content with metadata. |
-| `wiki_decay` (`WikiDecayTool`) | Run automated frequency decay on wiki pages | No parameters required. Zero LLM cost. Returns summary of scanned/decayed/errored pages. |
-| `wiki_refresh` (`WikiRefreshTool`) | Sync on-disk Markdown files into SQLite and Tantivy | `action`: `"sync"` (incremental), `"reindex"` (full rebuild), `"stats"` (statistics) |
-
 ### 6. Schedule Tools
 
 | Tool | Purpose | Example |
@@ -267,14 +222,12 @@ flowchart TB
     Which -->|Info| WebTool["Web Search"]
     Which -->|Command| ExecTool["Execute Command"]
     Which -->|History| HistTool["Query History"]
-    Which -->|Knowledge| WikiTool["Search Wiki"]
     Which -->|Restart| SessTool["New Session"]
 
     FileTool --> Result["Tool Result"]
     WebTool --> Result
     ExecTool --> Result
     MemTool --> Result
-    WikiTool --> Result
 
     Result --> ThinkAgain["Think Again"]
     ThinkAgain --> Decision
@@ -351,11 +304,6 @@ flowchart TB
         T5["spawn"]
         T6["history_query"]
         T7["history_search"]
-        T8["wiki_search"]
-        T9["wiki_write"]
-        T10["wiki_read"]
-        T11["wiki_decay"]
-        T12["wiki_refresh"]
         T13["new_session"]
         T14["clear_session"]
         T15["message"]
@@ -438,7 +386,6 @@ The following tools require user confirmation by default:
 | `exec` | System | Execute shell commands |
 | `new_session` | Session | Clear history and create new session |
 | `clear_session` | Session | Clear current session history |
-| `wiki_delete` | Wiki | Delete wiki pages |
 
 **Remember Decision**: In WebSocket frontend, users can check "Remember this decision" to auto-approve/deny future calls of the same tool in the same session.
 
@@ -447,7 +394,7 @@ The following tools require user confirmation by default:
 The following read-only tools execute without confirmation:
 
 - `read_file`, `list_dir`, `web_search`, `web_fetch`
-- `wiki_search`, `wiki_read`, `history_query`
+- `history_query`
 - `spawn`, `spawn_parallel`
 
 ---

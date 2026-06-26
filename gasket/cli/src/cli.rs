@@ -53,12 +53,6 @@ pub enum Commands {
         command: VaultCommands,
     },
 
-    /// Wiki knowledge system commands
-    Wiki {
-        #[command(subcommand)]
-        command: WikiCommands,
-    },
-
     /// Execute a tool directly
     Tool {
         #[command(subcommand)]
@@ -254,58 +248,4 @@ pub enum EmbeddingCommands {
 
     /// Show embedding store statistics
     Stats,
-}
-
-#[derive(Subcommand)]
-pub enum WikiCommands {
-    /// Initialize wiki directory structure and SQLite tables
-    Init,
-
-    /// Migrate existing memory files to wiki pages
-    Migrate,
-
-    /// Show wiki statistics
-    Stats,
-
-    /// Ingest a file into the wiki (markdown, text, html)
-    Ingest {
-        /// Path to file to ingest
-        path: String,
-        /// Ingest tier: quick (1 page, no LLM) or deep (LLM-driven)
-        #[arg(long, default_value = "quick")]
-        tier: String,
-    },
-
-    /// Search wiki pages
-    Search {
-        /// Search query
-        query: String,
-        /// Maximum results
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-    },
-
-    /// List wiki pages
-    List {
-        /// Filter by page type (entity, topic, source)
-        #[arg(long)]
-        page_type: Option<String>,
-    },
-
-    /// Run wiki health checks
-    Lint {
-        /// Auto-fix simple issues
-        #[arg(long)]
-        fix: bool,
-    },
-
-    /// Delete a wiki page
-    Delete {
-        /// Wiki page path to delete (e.g. 'topics/rust-async')
-        path: String,
-
-        /// Skip confirmation prompt
-        #[arg(short, long)]
-        force: bool,
-    },
 }

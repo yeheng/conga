@@ -1,30 +1,31 @@
-//! History query tool for searching conversation records in SQLite.
+//! History query tool for searching conversation records.
 //!
-//! Provides a `query_history` tool that searches the `session_events` table
-//! without relying on the external `sqlite3` CLI binary (which may be blocked
-//! by macOS sandbox or enterprise policies).
+//! Provides a `query_history` tool that searches the event store
+//! (JSON-backed) without relying on an external `sqlite3` CLI binary.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::Row;
 use tracing::{debug, instrument};
 
 use super::{Tool, ToolContext, ToolError, ToolResult};
-use gasket_storage::SqlitePool;
+use gasket_storage::EventStoreTrait;
 
-/// Query conversation history from the local SQLite store.
+/// Query conversation history from the local event store.
 ///
-/// This tool bypasses the need for an external `sqlite3` binary by using
-/// `sqlx` to query the `session_events` table directly via the async pool.
+/// This tool queries recent user/assistant events via the event-store trait,
+/// filtering by keyword substring (case-insensitive). No external binary or
+/// SQL is involved.
 pub struct HistoryQueryTool {
-    pool: SqlitePool,
+    event_store: Arc<dyn EventStoreTrait>,
 }
 
 impl HistoryQueryTool {
-    /// Create a new history query tool with the given SQLite pool.
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    /// Create a new history query tool backed by an event store.
+    pub fn new(event_store: Arc<dyn EventStoreTrait>) -> Self {
+        Self { event_store }
     }
 }
 
@@ -32,7 +33,7 @@ impl HistoryQueryTool {
 
 #[derive(Deserialize)]
 struct QueryArgs {
-    /// Optional keywords to search for in message content (case-insensitive LIKE).
+    /// Optional keywords to search for in message content (case-insensitive).
     keywords: Option<String>,
 
     /// Maximum number of messages to return (default: 20).
@@ -46,9 +47,9 @@ impl Tool for HistoryQueryTool {
     }
 
     fn description(&self) -> &str {
-        "Query conversation history from the local SQLite database. \
-         Supports keyword search and filtering by session. \
-         This works even when the sqlite3 CLI is blocked by sandbox policies."
+        "Query conversation history from the local store. \
+         Supports keyword search across all sessions. \
+         Works regardless of sandbox policies."
     }
 
     fn parameters(&self) -> Value {
@@ -78,57 +79,62 @@ impl Tool for HistoryQueryTool {
         let args: QueryArgs = serde_json::from_value(params)
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
+        let limit = args.limit.unwrap_or(20).min(100);
+
         debug!(
             "History query tool invoked: keywords={:?}, limit={}",
-            args.keywords,
-            args.limit.unwrap_or(20)
+            args.keywords, limit
         );
 
-        let limit = args.limit.unwrap_or(20).min(100) as i64;
-        let pattern = args
-            .keywords
-            .map(|k| format!("%{}%", k.replace('%', "\\%").replace('_', "\\_")))
-            .unwrap_or_else(|| "%".to_string());
+        // Load all recent user/assistant events (limit == 0 returns all).
+        let all = self
+            .event_store
+            .get_recent_events(0)
+            .await
+            .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
 
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                CASE event_type
-                    WHEN 'user_message' THEN 'user'
-                    WHEN 'assistant_message' THEN 'assistant'
-                    WHEN 'tool_call' THEN 'tool'
-                    WHEN 'tool_result' THEN 'tool'
-                    WHEN 'summary' THEN 'system'
-                    ELSE 'unknown'
-                END AS role,
-                content,
-                created_at AS timestamp
-            FROM session_events
-            WHERE content LIKE ?1 ESCAPE '\'
-            ORDER BY created_at DESC
-            LIMIT ?2
-            "#,
-        )
-        .bind(&pattern)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| ToolError::ExecutionError(format!("Database query failed: {}", e)))?;
+        // Optional keyword filter (case-insensitive substring).
+        let keyword = args.keywords.map(|k| k.to_lowercase());
+        let mut hits: Vec<_> = all
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e.event_type,
+                    gasket_types::EventType::UserMessage
+                        | gasket_types::EventType::AssistantMessage
+                )
+            })
+            .filter(|e| match keyword.as_deref() {
+                Some(kw) => e.content.to_lowercase().contains(kw),
+                None => true,
+            })
+            .collect();
 
-        if rows.is_empty() {
+        // Newest first (by created_at, then sequence as tiebreaker).
+        hits.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.sequence.cmp(&a.sequence))
+        });
+        hits.truncate(limit);
+
+        if hits.is_empty() {
             return Ok("No history found.".to_string());
         }
 
-        let mut lines = vec![format!("Conversation history ({} messages):", rows.len())];
+        let mut lines = vec![format!("Conversation history ({} messages):", hits.len())];
 
-        for row in rows {
-            let role: String = row.try_get("role").unwrap_or_default();
-            let content: String = row.try_get("content").unwrap_or_default();
-            let timestamp: String = row.try_get("timestamp").unwrap_or_default();
-            let preview = if content.chars().count() > 400 {
-                format!("{}...", content.chars().take(400).collect::<String>())
+        for e in &hits {
+            let role = match e.event_type {
+                gasket_types::EventType::UserMessage => "user",
+                gasket_types::EventType::AssistantMessage => "assistant",
+                _ => "unknown",
+            };
+            let timestamp = e.created_at.to_rfc3339();
+            let preview = if e.content.chars().count() > 400 {
+                format!("{}...", e.content.chars().take(400).collect::<String>())
             } else {
-                content
+                e.content.clone()
             };
             lines.push(format!("\n[{}] {}:\n{}", timestamp, role, preview));
         }
@@ -140,39 +146,28 @@ impl Tool for HistoryQueryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gasket_storage::SqliteStore;
-
-    async fn setup_test_db() -> SqlitePool {
-        let path = std::env::temp_dir().join(format!(
-            "gasket_test_history_query_{}.db",
-            uuid::Uuid::new_v4()
-        ));
-        let store = SqliteStore::with_path(path).await.unwrap();
-        // seed a session and a message
-        sqlx::query(
-            "INSERT OR IGNORE INTO sessions_v2 (key, channel, chat_id, created_at, updated_at) VALUES ('cli:test', 'cli', 'test', datetime('now'), datetime('now'))",
-        )
-        .execute(&store.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO session_events (id, session_key, channel, chat_id, event_type, content, created_at, sequence) VALUES (?, 'cli:test', 'cli', 'test', 'user_message', 'Hello world', datetime('now'), 1)"
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .execute(&store.pool())
-        .await
-        .unwrap();
-        store.pool()
-    }
+    use gasket_storage::JsonStore;
 
     #[tokio::test]
     async fn test_history_query_by_keywords() {
-        let pool = setup_test_db().await;
-        let tool = HistoryQueryTool::new(pool);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(JsonStore::new(dir.path().to_path_buf()));
+        let mk = |content: &str| gasket_types::SessionEvent {
+            id: uuid::Uuid::now_v7(),
+            session_key: "cli:test".into(),
+            event_type: gasket_types::EventType::UserMessage,
+            content: content.to_string(),
+            metadata: gasket_types::EventMetadata::default(),
+            created_at: chrono::Utc::now(),
+            sequence: 0,
+        };
+        store.append(&mk("Hello world")).await.unwrap();
+        store.append(&mk("Another message")).await.unwrap();
+
+        let tool = HistoryQueryTool::new(store.clone() as Arc<dyn EventStoreTrait>);
         let args = serde_json::json!({
             "keywords": "Hello",
             "limit": 10,
-            "session_key": "cli:test"
         });
         let result = tool.execute(args, &ToolContext::default()).await;
         assert!(result.is_ok());
@@ -183,11 +178,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_history_query_no_results() {
-        let pool = setup_test_db().await;
-        let tool = HistoryQueryTool::new(pool);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(JsonStore::new(dir.path().to_path_buf()));
+        let mk = |content: &str| gasket_types::SessionEvent {
+            id: uuid::Uuid::now_v7(),
+            session_key: "cli:test".into(),
+            event_type: gasket_types::EventType::UserMessage,
+            content: content.to_string(),
+            metadata: gasket_types::EventMetadata::default(),
+            created_at: chrono::Utc::now(),
+            sequence: 0,
+        };
+        store.append(&mk("Hello world")).await.unwrap();
+
+        let tool = HistoryQueryTool::new(store.clone() as Arc<dyn EventStoreTrait>);
         let args = serde_json::json!({
             "keywords": "nonexistent",
-            "session_key": "cli:test"
         });
         let result = tool.execute(args, &ToolContext::default()).await;
         assert!(result.is_ok());

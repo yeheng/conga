@@ -307,30 +307,6 @@ flowchart TB
     style Tool fill:#FFD700
 ```
 
-### Wiki：知识库系统
-
-```mermaid
-flowchart TB
-    subgraph 记忆层次
-        H[历史<br/>会话历史]
-        P[Profile<br/>用户画像]
-        K[Knowledge<br/>知识]
-        A[Active<br/>当前工作]
-    end
-
-    subgraph 存储
-        S1[SQLite<br/>会话历史 + 索引]
-        S2[Wiki<br/>Markdown文件]
-    end
-
-    H --> S1
-    P --> S2
-    K --> S2
-    A --> S2
-```
-
-**注意**：Wiki 模块 (`gasket_storage::wiki`) 统一管理知识存储，支持语义搜索和三阶段 token 预算（bootstrap/scenario/on_demand）。
-
 ### Tools：工具系统
 
 ```mermaid

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "SQLite-backed storage, history processing, and semantic embedding for gasket"
+description = "JSON file-backed storage, history processing, and semantic embedding for gasket"
 
 [features]
 default = []
@@ -19,7 +19,6 @@ async-trait.workspace = true
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
 
 # Logging & Tracing
 tracing.workspace = true
@@ -34,18 +33,12 @@ chrono.workspace = true
 # UUID
 uuid.workspace = true
 
-# SQLite (async)
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json"] }
-
-# Full-text search
-tantivy = "0.25"
+# Synchronization (per-session write locks in JsonStore)
+parking_lot = "0.12"
 
 # Configuration directory
 dirs.workspace = true
 directories.workspace = true
-
-# Regex (used by wiki::types::slugify)
-regex = "1"
 
 # Token counting (from gasket-history)
 tiktoken-rs.workspace = true

@@ -52,4 +52,3 @@ Action Items:
 
 - Preserve meaning, active voice, specific numbers.
 - Do not add new information.
-- Store key summaries in wiki (`topics/`).

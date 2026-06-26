@@ -198,12 +198,12 @@ steps:
 
       1. **Skill Updates**: Transferable skill patterns discovered. For each:
          - title: short name
-         - content: step-by-step procedure with wiki-style entity links [[category/name]]
+         - content: step-by-step procedure
          - tags: relevant categories
 
       2. **Knowledge Updates**: New facts or corrected misconceptions. For each:
          - title: short name
-         - content: what is now known, with wiki links
+         - content: what is now known
          - tags: relevant categories
 
       3. **Anti-Patterns**: Common mistakes to avoid. For each:
@@ -226,20 +226,4 @@ steps:
           "cycles_used": N
         }
       }
-    tools: ["wiki_write"]
-    next: "persist"
-
-  persist:
-    prompt: |
-      Persist the distilled knowledge to the wiki system. Call wiki_write for each item.
-
-      Distilled knowledge: {{distill}}
-
-      For each skill_update, write to path "sops/{slugified_title}".
-      For each knowledge_update, write to path "topics/{slugified_title}".
-      For each anti_pattern, write to path "topics/anti-patterns/{slugified_title}".
-      Add the tag "self_refined" to all pages.
-
-      After persisting, summarize what was written.
-    tools: ["wiki_write"]
     next: "DONE"

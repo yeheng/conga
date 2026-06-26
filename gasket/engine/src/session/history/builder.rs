@@ -19,7 +19,7 @@ use crate::error::AgentError;
 use crate::hooks::{HookAction, HookBuilder, HookPoint, HookRegistry, MutableContext, VaultHook};
 use crate::vault::{VaultInjector, VaultStore};
 use gasket_storage::process_history;
-use gasket_storage::{EventStore, HistoryConfig, SessionStore};
+use gasket_storage::{EventStoreTrait, HistoryConfig, SessionStoreTrait};
 
 /// Outcome of the context building pipeline.
 ///
@@ -51,8 +51,8 @@ pub struct ChatRequest {
 /// Decouples the complex pipeline preparation logic from `AgentSession`,
 /// following the Single Responsibility Principle.
 pub struct ContextBuilder {
-    event_store: EventStore,
-    session_store: SessionStore,
+    event_store: Arc<dyn EventStoreTrait>,
+    session_store: Arc<dyn SessionStoreTrait>,
     system_prompt: String,
     skills_context: Option<String>,
     hooks: Arc<HookRegistry>,
@@ -62,8 +62,8 @@ pub struct ContextBuilder {
 impl ContextBuilder {
     /// Create a new context builder.
     pub fn new(
-        event_store: EventStore,
-        session_store: SessionStore,
+        event_store: Arc<dyn EventStoreTrait>,
+        session_store: Arc<dyn SessionStoreTrait>,
         system_prompt: String,
         skills_context: Option<String>,
         hooks: Arc<HookRegistry>,
@@ -80,12 +80,12 @@ impl ContextBuilder {
     }
 
     /// Access the event store.
-    pub fn event_store(&self) -> &EventStore {
+    pub fn event_store(&self) -> &Arc<dyn EventStoreTrait> {
         &self.event_store
     }
 
     /// Access the session store.
-    pub fn session_store(&self) -> &SessionStore {
+    pub fn session_store(&self) -> &Arc<dyn SessionStoreTrait> {
         &self.session_store
     }
 
@@ -176,12 +176,9 @@ impl ContextBuilder {
             created_at: chrono::Utc::now(),
             sequence: 0,
         };
-        self.event_store
-            .append_event(&user_event)
-            .await
-            .map_err(|e| {
-                AgentError::SessionError(format!("Failed to persist user event: {}", e))
-            })?;
+        self.event_store.append(&user_event).await.map_err(|e| {
+            AgentError::SessionError(format!("Failed to persist user event: {}", e))
+        })?;
 
         // ── 4. Load only events after the watermark ──────────────────
         let history_events = if watermark == 0 {
@@ -220,7 +217,7 @@ impl ContextBuilder {
             system_prompts.push(skills.clone());
         }
 
-        // ── 5.5. Memory loading removed — agent queries wiki via tools ─────
+        // ── 5.5. Memory loading removed ─────
 
         let mut messages = Self::assemble_prompt(
             history_snapshot,
@@ -262,13 +259,11 @@ impl ContextBuilder {
 
     /// Pure, synchronous assembly of the LLM prompt sequence.
     ///
-    /// Three-layer memory architecture:
+    /// Two-layer memory architecture:
     /// - **L0 (Identity & Rules)**: System prompts loaded from workspace PROFILE.md,
     ///   SOUL.md, and skills. Static for the session lifetime.
     /// - **L1 (Working Memory)**: Compacted summary + recent session events.
     ///   Automatically managed via ContextCompactor and watermark tracking.
-    /// - **L2 (Long-term Knowledge)**: Wiki pages. NOT auto-injected here.
-    ///   The LLM accesses L2 via tool calls (`wiki_search`, `wiki_read`).
     fn assemble_prompt(
         processed_history: Vec<SessionEvent>,
         current_message: &str,
@@ -377,7 +372,7 @@ pub fn build_default_hooks_builder() -> HookBuilder {
 /// Set up the embedding recall pipeline: provider → store → index → searcher → indexer.
 #[cfg(feature = "embedding")]
 pub async fn setup_embedding_recall(
-    event_store: &EventStore,
+    event_store: &std::sync::Arc<gasket_storage::JsonStore>,
     config: &crate::config::EmbeddingConfig,
 ) -> anyhow::Result<(
     Arc<gasket_embedding::RecallSearcher>,
@@ -390,12 +385,9 @@ pub async fn setup_embedding_recall(
     let provider = config.provider.build()?;
     let dim = provider.dim();
 
-    // Build the vector store from config (SQLite or LanceDB).
-    let store: Arc<dyn gasket_embedding::VectorStore> = {
-        let pool = event_store.pool();
-        gasket_embedding::vector_store::build_vector_store(&config.vector_store, dim, Some(&pool))
-            .await?
-    };
+    // Build the vector store from config (LanceDB sole backend).
+    let store: Arc<dyn gasket_embedding::VectorStore> =
+        gasket_embedding::vector_store::build_vector_store(&config.vector_store, dim).await?;
 
     // Create in-memory index.
     let index = Arc::new(MemoryIndex::new(dim));
@@ -442,7 +434,8 @@ pub async fn setup_embedding_recall(
         );
     }
 
-    // Build searcher.
+    // Build searcher. `event_store.clone()` is `Arc<JsonStore>` which coerces
+    // to `Arc<dyn EventStoreTrait>`.
     let searcher = Arc::new(RecallSearcher::new(
         provider_arc.clone(),
         index.clone(),
@@ -452,7 +445,7 @@ pub async fn setup_embedding_recall(
 
     // Subscribe to new events and start background indexer.
     let rx = event_store.subscribe();
-    let idx = EmbeddingIndexer::start(provider_arc, store, index, rx)?;
+    let idx = EmbeddingIndexer::start(provider_arc, store, index, event_store.clone(), rx)?;
 
     Ok((searcher, idx))
 }

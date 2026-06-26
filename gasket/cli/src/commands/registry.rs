@@ -115,15 +115,6 @@ pub fn build_agent_config(config: &Config) -> AgentConfig {
             }
         },
         evolution: defaults.evolution,
-        wiki: {
-            let wiki_root = dirs::home_dir().map(|p| p.join(".gasket/wiki"));
-            if wiki_root.as_ref().is_some_and(|p| p.exists()) {
-                use gasket_engine::session::config::WikiConfig;
-                Some(WikiConfig::default())
-            } else {
-                None
-            }
-        },
         stop_words_path: config.stop_words_path.clone(),
     }
 }

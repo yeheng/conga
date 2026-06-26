@@ -1,7 +1,7 @@
 //! Context usage statistics and watermark inspection.
 
 use anyhow::Result;
-use gasket_storage::{count_tokens, EventStore, SessionStore};
+use gasket_storage::{count_tokens, EventStoreTrait, SessionStoreTrait};
 use gasket_types::SessionKey;
 
 /// Context usage statistics for a session.
@@ -45,7 +45,7 @@ pub struct WatermarkInfo {
 /// Returns `(summary_text, covered_upto_sequence)`.
 /// If no summary exists, returns `("", 0)`.
 pub async fn load_summary_with_watermark(
-    session_store: &SessionStore,
+    session_store: &dyn SessionStoreTrait,
     session_key: &SessionKey,
 ) -> (String, i64) {
     match session_store.load_summary(session_key).await {
@@ -60,8 +60,8 @@ pub async fn load_summary_with_watermark(
 
 /// Get context usage statistics for a session.
 pub async fn get_usage_stats(
-    event_store: &EventStore,
-    session_store: &SessionStore,
+    event_store: &dyn EventStoreTrait,
+    session_store: &dyn SessionStoreTrait,
     session_key: &SessionKey,
     token_budget: usize,
     compaction_threshold: f32,
@@ -103,8 +103,8 @@ pub async fn get_usage_stats(
 
 /// Get watermark and sequence information for a session.
 pub async fn get_watermark_info(
-    event_store: &EventStore,
-    session_store: &SessionStore,
+    event_store: &dyn EventStoreTrait,
+    session_store: &dyn SessionStoreTrait,
     session_key: &SessionKey,
 ) -> Result<WatermarkInfo> {
     let (_, watermark) = load_summary_with_watermark(session_store, session_key).await;

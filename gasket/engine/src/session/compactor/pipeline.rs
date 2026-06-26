@@ -6,7 +6,7 @@ use anyhow::{bail, Result};
 use tracing::{debug, info, warn};
 
 use gasket_providers::{ChatMessage, ChatRequest, LlmProvider};
-use gasket_storage::{count_tokens, EventStore, SessionStore};
+use gasket_storage::{count_tokens, EventStoreTrait, SessionStoreTrait};
 use gasket_types::{SessionEvent, SessionKey};
 
 use crate::vault::redact_secrets;
@@ -16,8 +16,8 @@ use super::CompactionListener;
 /// Execute the full compaction pipeline: load → build context → summarize → persist.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_compaction(
-    event_store: &EventStore,
-    session_store: &SessionStore,
+    event_store: &dyn EventStoreTrait,
+    session_store: &dyn SessionStoreTrait,
     provider: &dyn LlmProvider,
     model: &str,
     summarization_prompt: &str,
@@ -131,8 +131,8 @@ pub async fn summarize_with_llm(
 /// Redact secrets, persist the summary, and garbage-collect old events.
 #[allow(clippy::too_many_arguments)]
 pub async fn persist_and_gc(
-    session_store: &SessionStore,
-    event_store: &EventStore,
+    session_store: &dyn SessionStoreTrait,
+    event_store: &dyn EventStoreTrait,
     session_key: &SessionKey,
     summary_text: &str,
     vault_values: &[String],

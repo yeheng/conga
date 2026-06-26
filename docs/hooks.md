@@ -492,7 +492,6 @@ fi
 // 通过 AgentConfig 配置钩子
 let config = AgentConfig {
     evolution: Some(EvolutionConfig::default()),  // 启用 EvolutionHook
-    wiki: Some(WikiConfig { ... }),              // 启用 Wiki 系统
     ..Default::default()
 };
 
