@@ -8,6 +8,8 @@ mod cron_store;
 mod event_store;
 pub mod fs;
 pub mod global;
+mod json_state;
+mod json_store;
 mod kv_store;
 mod maintenance_store;
 mod migrations;
@@ -25,6 +27,8 @@ use tracing::debug;
 
 pub use cron_store::CronStore;
 pub use event_store::EventStore;
+pub use json_state::{CronStateFile, KvStateFile, MaintenanceStateFile};
+pub use json_store::JsonStore;
 pub use store_trait::{EventStoreTrait, SessionStoreTrait, StoreError};
 pub use global::{get_db, init_db};
 pub use kv_store::KvStore;

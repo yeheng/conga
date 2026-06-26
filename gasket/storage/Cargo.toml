@@ -33,6 +33,9 @@ chrono.workspace = true
 # UUID
 uuid.workspace = true
 
+# Synchronization (per-session write locks in JsonStore)
+parking_lot = "0.12"
+
 # SQLite (async)
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json"] }
 
