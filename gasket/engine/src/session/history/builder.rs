@@ -390,12 +390,9 @@ pub async fn setup_embedding_recall(
     let provider = config.provider.build()?;
     let dim = provider.dim();
 
-    // Build the vector store from config (SQLite or LanceDB).
-    let store: Arc<dyn gasket_embedding::VectorStore> = {
-        let pool = event_store.pool();
-        gasket_embedding::vector_store::build_vector_store(&config.vector_store, dim, Some(&pool))
-            .await?
-    };
+    // Build the vector store from config (LanceDB sole backend).
+    let store: Arc<dyn gasket_embedding::VectorStore> =
+        gasket_embedding::vector_store::build_vector_store(&config.vector_store, dim).await?;
 
     // Create in-memory index.
     let index = Arc::new(MemoryIndex::new(dim));

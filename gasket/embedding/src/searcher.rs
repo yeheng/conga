@@ -185,7 +185,6 @@ fn role_str(event_type: &EventType) -> &'static str {
 mod tests {
     use super::*;
     use crate::provider::MockProvider;
-    use crate::store::EmbeddingStore;
     use crate::vector_store::VectorStore;
     use chrono::Utc;
     use gasket_types::{EventMetadata, SessionEvent};
@@ -240,10 +239,19 @@ mod tests {
         pool
     }
 
-    async fn make_store(pool: SqlitePool, dim: usize) -> Arc<dyn VectorStore> {
-        let store = EmbeddingStore::new(pool, dim);
-        store.run_migration().await.unwrap();
-        Arc::new(store)
+    /// Build a LanceDB-backed vector store in a fresh temp dir.
+    ///
+    /// The `TempDir` is returned alongside the store and must outlive the test.
+    async fn make_store(dim: usize) -> (Arc<dyn VectorStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::store::VectorStoreConfig::LanceDB {
+            path: dir.path().to_string_lossy().to_string(),
+            table: "event_embeddings".to_string(),
+        };
+        let store = crate::store::build_vector_store(&config, dim)
+            .await
+            .unwrap();
+        (store, dir)
     }
 
     fn make_event(content: &str, ty: EventType) -> SessionEvent {
@@ -298,7 +306,7 @@ mod tests {
     async fn test_recall_returns_hits_with_content() {
         let pool = setup_event_db().await;
         let event_store = EventStore::new(pool.clone());
-        let store = make_store(pool, 3).await;
+        let (store, _vector_dir) = make_store(3).await;
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider::new(3));
         let index = Arc::new(MemoryIndex::new(3));
 
@@ -354,7 +362,7 @@ mod tests {
     async fn test_recall_filters_by_min_score() {
         let pool = setup_event_db().await;
         let event_store = EventStore::new(pool.clone());
-        let store = make_store(pool, 3).await;
+        let (store, _vector_dir) = make_store(3).await;
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider::new(3));
         let index = Arc::new(MemoryIndex::new(3));
 
@@ -379,7 +387,7 @@ mod tests {
     async fn test_recall_respects_top_k() {
         let pool = setup_event_db().await;
         let event_store = EventStore::new(pool.clone());
-        let store = make_store(pool, 3).await;
+        let (store, _vector_dir) = make_store(3).await;
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(MockProvider::new(3));
         let index = Arc::new(MemoryIndex::new(3));
 

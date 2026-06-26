@@ -9,7 +9,6 @@ description = "Embedding-based semantic search for gasket history recall"
 [features]
 default = []
 local-onnx = ["fastembed"]
-lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
 
 [dependencies]
 tokio.workspace = true
@@ -21,7 +20,6 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json"] }
 parking_lot = "0.12"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 reqwest = { workspace = true }
@@ -30,9 +28,9 @@ futures = "0.3"
 gasket-types = { path = "../types" }
 gasket-storage = { path = "../storage" }
 fastembed = { version = "5", optional = true }
-lancedb = { version = "0.27", optional = true }
-arrow-array = { version = "57", optional = true }
-arrow-schema = { version = "57", optional = true }
+lancedb = "0.27"
+arrow-array = "57"
+arrow-schema = "57"
 dirs = "5"
 rig-core = { version = "0.36.0", default-features = false, features = ["reqwest", "rustls"] }
 
@@ -41,3 +39,7 @@ tokio-test = "0.4"
 tempfile = "3"
 mockito = "1"
 serde_yaml = "0.9"
+# RecallSearcher integration tests build a SQLite-backed EventStore for content
+# lookups. sqlx stays a dev-only dependency here; it is removed entirely in the
+# Phase 3 cleanup once EventStore no longer uses SQLite.
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json"] }

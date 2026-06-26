@@ -239,20 +239,21 @@ impl EmbeddingIndexer {
 mod tests {
     use super::*;
     use crate::provider::MockProvider;
-    use crate::store::EmbeddingStore;
     use crate::vector_store::VectorStore;
     use chrono::Utc;
-    use sqlx::sqlite::SqlitePoolOptions;
     use uuid::Uuid;
 
-    async fn test_store() -> Arc<dyn VectorStore> {
-        let pool = SqlitePoolOptions::new()
-            .connect(":memory:")
-            .await
-            .expect("in-memory pool");
-        let store = EmbeddingStore::new(pool, 3);
-        store.run_migration().await.expect("migration");
-        Arc::new(store)
+    /// Build a LanceDB-backed vector store in a fresh temp dir.
+    ///
+    /// The `TempDir` is returned alongside the store and must outlive the test.
+    async fn test_store() -> (Arc<dyn VectorStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::store::VectorStoreConfig::LanceDB {
+            path: dir.path().to_string_lossy().to_string(),
+            table: "event_embeddings".to_string(),
+        };
+        let store = crate::store::build_vector_store(&config, 3).await.unwrap();
+        (store, dir)
     }
 
     fn make_event(event_type: EventType, content: &str) -> SessionEvent {
@@ -269,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rebuild_index() {
-        let store = test_store().await;
+        let (store, _vector_dir) = test_store().await;
         let index = MemoryIndex::new(3);
 
         store
@@ -314,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_event_user_message() {
         let provider = MockProvider::new(3);
-        let store = test_store().await;
+        let (store, _vector_dir) = test_store().await;
         let index = MemoryIndex::new(3);
 
         let event = make_event(EventType::UserMessage, "Hello, this is a test message");
@@ -329,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_event_skips_tool_call() {
         let provider = MockProvider::new(3);
-        let store = test_store().await;
+        let (store, _vector_dir) = test_store().await;
         let index = MemoryIndex::new(3);
 
         let event = make_event(
@@ -350,7 +351,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_event_skips_short_content() {
         let provider = MockProvider::new(3);
-        let store = test_store().await;
+        let (store, _vector_dir) = test_store().await;
         let index = MemoryIndex::new(3);
 
         let event = make_event(EventType::UserMessage, "Hi");
@@ -365,7 +366,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_event_dedup() {
         let provider = MockProvider::new(3);
-        let store = test_store().await;
+        let (store, _vector_dir) = test_store().await;
         let index = MemoryIndex::new(3);
 
         let event = make_event(EventType::UserMessage, "Hello, this is a test message");
@@ -391,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_and_shutdown() {
         let provider = Arc::new(MockProvider::new(3));
-        let store = test_store().await;
+        let (store, _vector_dir) = test_store().await;
         let index = Arc::new(MemoryIndex::new(3));
         let (_tx, rx) = broadcast::channel::<SessionEvent>(16);
 
@@ -405,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_processes_events() {
         let provider = Arc::new(MockProvider::new(3));
-        let store = test_store().await;
+        let (store, _vector_dir) = test_store().await;
         let index = Arc::new(MemoryIndex::new(3));
         let (tx, rx) = broadcast::channel::<SessionEvent>(16);
 

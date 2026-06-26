@@ -9,8 +9,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use gasket_embedding::{
-    EmbeddingIndexer, EmbeddingProvider, EmbeddingStore, MemoryIndex, RecallConfig, RecallSearcher,
-    VectorRecord, VectorStore,
+    build_vector_store, EmbeddingIndexer, EmbeddingProvider, MemoryIndex, RecallConfig,
+    RecallSearcher, VectorRecord, VectorStore, VectorStoreConfig,
 };
 use gasket_storage::{EventStore, EventStoreTrait};
 use gasket_types::{EventMetadata, EventType, SessionEvent};
@@ -55,10 +55,18 @@ impl EmbeddingProvider for DeterministicMockProvider {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn make_embedding_store(pool: sqlx::SqlitePool, dim: usize) -> Arc<dyn VectorStore> {
-    let store = EmbeddingStore::new(pool, dim);
-    store.run_migration().await.expect("embedding migration");
-    Arc::new(store)
+/// Build a LanceDB-backed vector store rooted in a fresh temp dir.
+///
+/// The `TempDir` is returned alongside the store and must be held for the
+/// test's lifetime — dropping it removes the on-disk database.
+async fn make_vector_store(dim: usize) -> (Arc<dyn VectorStore>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = VectorStoreConfig::LanceDB {
+        path: dir.path().to_string_lossy().to_string(),
+        table: "event_embeddings".to_string(),
+    };
+    let store = build_vector_store(&config, dim).await.expect("lance store");
+    (store, dir)
 }
 
 /// Create the sessions_v2 + session_events schema needed by EventStore.
@@ -154,7 +162,7 @@ async fn test_full_recall_flow_returns_hits_with_content() {
     let pool = setup_event_db().await;
     let event_store = EventStore::new(pool.clone());
     let dim = 4;
-    let store = make_embedding_store(pool, dim).await;
+    let (store, _vector_dir) = make_vector_store(dim).await;
     let provider = Arc::new(DeterministicMockProvider::new(dim));
     let index = Arc::new(MemoryIndex::new(dim));
 
@@ -274,9 +282,8 @@ async fn test_full_recall_flow_returns_hits_with_content() {
 
 #[tokio::test]
 async fn test_cold_start_rebuild() {
-    let pool = setup_event_db().await;
     let dim = 4;
-    let store = make_embedding_store(pool, dim).await;
+    let (store, _vector_dir) = make_vector_store(dim).await;
     let provider = DeterministicMockProvider::new(dim);
 
     let items = [
@@ -337,7 +344,7 @@ async fn test_indexer_broadcast_processing() {
     let pool = setup_event_db().await;
 
     let event_store = EventStore::new(pool.clone());
-    let embedding_store = make_embedding_store(pool, 4).await;
+    let (embedding_store, _vector_dir) = make_vector_store(4).await;
 
     let provider = Arc::new(DeterministicMockProvider::new(4));
     let index = Arc::new(MemoryIndex::new(4));
@@ -395,7 +402,7 @@ async fn test_indexer_dedup() {
     let pool = setup_event_db().await;
 
     let event_store = EventStore::new(pool.clone());
-    let embedding_store = make_embedding_store(pool, 4).await;
+    let (embedding_store, _vector_dir) = make_vector_store(4).await;
 
     let provider = Arc::new(DeterministicMockProvider::new(4));
     let index = Arc::new(MemoryIndex::new(4));

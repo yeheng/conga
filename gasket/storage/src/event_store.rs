@@ -45,13 +45,6 @@ impl EventStore {
         self.tx.clone()
     }
 
-    /// Returns a reference to the underlying SQLite pool.
-    ///
-    /// Needed by embedding subsystem to share the same database connection.
-    pub fn pool(&self) -> SqlitePool {
-        self.pool.clone()
-    }
-
     /// Parse a session key string into (channel, chat_id).
     /// Falls back to ChannelType::Cli if no channel prefix.
     fn parse_session_key_str(session_key: &str) -> (String, String) {
