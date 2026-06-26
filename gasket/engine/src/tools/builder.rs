@@ -78,6 +78,8 @@ pub struct ToolRegistryConfig {
     /// Determines whether spawn tools (`spawn`, `spawn_parallel`) are registered.
     /// Worker contexts must use `AgentRole::Worker` to omit them.
     pub role: gasket_types::AgentRole,
+    /// Shared JSON store — the sole storage backend.
+    pub store: Arc<gasket_storage::JsonStore>,
 }
 
 /// Parameters needed to construct the `history_search` tool.
@@ -102,12 +104,12 @@ pub fn build_tool_registry(registry_config: ToolRegistryConfig) -> ToolRegistry 
         #[cfg(feature = "embedding")]
         history_search,
         role,
+        store,
         ..
     } = registry_config;
 
     let config = crate::config::get_config();
     let workspace = resolve_exec_workspace(config, std::path::Path::new("."));
-    let sqlite_store = gasket_storage::get_db();
 
     let mut tools = ToolRegistry::new();
 
@@ -116,8 +118,10 @@ pub fn build_tool_registry(registry_config: ToolRegistryConfig) -> ToolRegistry 
         .register_tools(&mut tools);
 
     // ── System tools (history query, session management) ──────
-    let session_store = Some(sqlite_store.session_store());
-    SystemToolProvider::new(session_store).register_tools(&mut tools);
+    let event_store: Arc<dyn gasket_storage::EventStoreTrait> = store.clone();
+    let session_store: Arc<dyn gasket_storage::SessionStoreTrait> = store.clone();
+    SystemToolProvider::new(Some(event_store), Some(session_store))
+        .register_tools(&mut tools);
 
     // Extra tools (e.g. gateway-specific MessageTool, CronTool)
     for (tool, metadata) in extra_tools {
@@ -142,8 +146,8 @@ pub fn build_tool_registry(registry_config: ToolRegistryConfig) -> ToolRegistry 
     if role.can_spawn() {
         let workflows_dir = workspace.join("workflows");
         tracing::info!("Looking for native workflows in {:?}", workflows_dir);
-        let kv_store = sqlite_store.kv_store();
-        match super::discover_workflows(workflows_dir.as_path(), Some(kv_store)) {
+        let kv_path = gasket_storage::config_dir().join("state").join("kv.json");
+        match super::discover_workflows(workflows_dir.as_path(), Some(kv_path)) {
             Ok(workflow_tools) => {
                 for tool in workflow_tools {
                     tools.register(Box::new(tool));

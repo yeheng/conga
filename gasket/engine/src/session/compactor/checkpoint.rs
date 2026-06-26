@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use gasket_providers::{ChatMessage, ChatRequest, LlmProvider};
-use gasket_storage::SessionStore;
+use gasket_storage::{EventStoreTrait, SessionStoreTrait};
 use gasket_types::SessionKey;
 use tracing::{info, warn};
 
@@ -51,8 +51,8 @@ pub async fn checkpoint(
     provider: &dyn LlmProvider,
     model: &str,
     config: &CheckpointConfig,
-    event_store: &gasket_storage::EventStore,
-    session_store: &SessionStore,
+    event_store: &dyn EventStoreTrait,
+    session_store: &dyn SessionStoreTrait,
     session_key: &SessionKey,
     current_max_sequence: i64,
 ) -> Result<Option<String>> {
@@ -119,7 +119,7 @@ pub async fn checkpoint(
     }
 
     session_store
-        .save_checkpoint(&session_key.to_string(), current_max_sequence, &summary)
+        .save_checkpoint(session_key, current_max_sequence, &summary)
         .await?;
 
     info!(
@@ -147,7 +147,7 @@ const ASK_CHECKPOINT_MAX_MESSAGES: usize = 20;
 pub async fn save_ask_checkpoint(
     provider: &dyn LlmProvider,
     model: &str,
-    session_store: &SessionStore,
+    session_store: &dyn SessionStoreTrait,
     session_key: &SessionKey,
     messages: &[ChatMessage],
     pending_question: &str,
@@ -224,7 +224,7 @@ pub async fn save_ask_checkpoint(
 
     // target_sequence = 0 distinguishes ask-checkpoints from proactive ones.
     session_store
-        .save_checkpoint(&session_key.to_string(), 0, &summary)
+        .save_checkpoint(session_key, 0, &summary)
         .await?;
 
     info!(

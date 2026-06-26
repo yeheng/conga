@@ -7,7 +7,6 @@ pub mod rig_adapter;
 pub mod searcher;
 pub mod store;
 
-#[cfg(feature = "lancedb")]
 pub mod lance_store;
 
 /// Backwards-compatible alias — the `vector_store` symbols moved into `store`
@@ -25,6 +24,5 @@ pub use indexer::EmbeddingIndexer;
 pub use provider::{EmbeddingProvider, ProviderConfig};
 pub use searcher::{RecallConfig, RecallHit, RecallSearcher};
 pub use store::{
-    build_vector_store, EmbeddingStore, SearchResult, StoredEmbedding, VectorRecord, VectorStore,
-    VectorStoreConfig,
+    build_vector_store, SearchResult, StoredEmbedding, VectorRecord, VectorStore, VectorStoreConfig,
 };

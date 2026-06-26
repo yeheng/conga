@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::SubagentSpawner;
-use gasket_storage::SessionStore;
+use gasket_storage::{EventStoreTrait, SessionStoreTrait};
 
 use super::{
     registry::ToolRegistry, AskUserTool, ClearSessionTool, EditFileTool, ExecTool, HistoryQueryTool,
@@ -197,32 +197,39 @@ impl ToolProvider for CoreToolProvider {
 // SystemToolProvider — history query, session management
 // ---------------------------------------------------------------------------
 
-/// Provides system tools backed by the session store.
+/// Provides system tools backed by the event/session stores.
 pub struct SystemToolProvider {
-    session_store: Option<SessionStore>,
+    event_store: Option<Arc<dyn EventStoreTrait>>,
+    session_store: Option<Arc<dyn SessionStoreTrait>>,
 }
 
 impl SystemToolProvider {
-    pub fn new(session_store: Option<SessionStore>) -> Self {
-        Self { session_store }
+    pub fn new(
+        event_store: Option<Arc<dyn EventStoreTrait>>,
+        session_store: Option<Arc<dyn SessionStoreTrait>>,
+    ) -> Self {
+        Self {
+            event_store,
+            session_store,
+        }
     }
 }
 
 impl ToolProvider for SystemToolProvider {
     fn register_tools(&self, registry: &mut ToolRegistry) {
-        if let Some(ref db) = self.session_store {
+        if let (Some(es), Some(ss)) = (self.event_store.clone(), self.session_store.clone()) {
             reg!(
                 registry,
-                HistoryQueryTool::new(db.pool().clone()),
+                HistoryQueryTool::new(es.clone()),
                 "Query History",
                 "history",
-                ["history", "search", "sqlite"],
+                ["history", "search"],
                 false,
                 false
             );
             reg!(
                 registry,
-                ClearSessionTool::new(db.clone()),
+                ClearSessionTool::new(es.clone(), ss.clone()),
                 "Clear Session History",
                 "system",
                 ["session", "cleanup", "history"],
@@ -231,7 +238,7 @@ impl ToolProvider for SystemToolProvider {
             );
             reg!(
                 registry,
-                NewSessionTool::new(db.clone()),
+                NewSessionTool::new(es, ss),
                 "New Session",
                 "system",
                 ["session", "new", "reset"],

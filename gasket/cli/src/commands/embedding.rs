@@ -18,13 +18,9 @@ pub async fn cmd_embedding_rebuild(limit: Option<usize>) -> Result<()> {
     let provider = embedding_config.provider.build()?;
     let dim = provider.dim();
 
-    let store = gasket_engine::SqliteStore::new().await?;
-    let pool = store.pool();
-
     let vector_store = gasket_engine::embedding::vector_store::build_vector_store(
         &embedding_config.vector_store,
         dim,
-        Some(&pool),
     )
     .await?;
 
@@ -66,13 +62,9 @@ pub async fn cmd_embedding_stats() -> Result<()> {
     let provider = embedding_config.provider.build()?;
     let dim = provider.dim();
 
-    let store = gasket_engine::SqliteStore::new().await?;
-    let pool = store.pool();
-
     let vector_store = gasket_engine::embedding::vector_store::build_vector_store(
         &embedding_config.vector_store,
         dim,
-        Some(&pool),
     )
     .await?;
 

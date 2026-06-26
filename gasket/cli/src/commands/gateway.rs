@@ -18,8 +18,6 @@ use gasket_engine::token_tracker::ModelPricing;
 use gasket_engine::tools::ContextTool;
 use gasket_engine::tools::{build_tool_registry, CronTool, Tool, ToolContext, ToolRegistryConfig};
 use gasket_engine::tools::{MessageTool, ToolMetadata, ToolRegistry};
-use gasket_engine::EventStore;
-use gasket_engine::SqliteStore;
 use gasket_engine::SubagentSpawner;
 
 use crate::commands::broker_outbound::OutboundDispatcher;
@@ -55,7 +53,7 @@ pub async fn cmd_gateway() -> Result<()> {
     let gasket_engine::bootstrap::EngineInfra {
         config,
         broker,
-        sqlite_store,
+        store,
     } = gasket_engine::bootstrap::init_engine_infra(
         gasket_engine::bootstrap::BrokerCapacity::gateway(),
     )
@@ -70,11 +68,11 @@ pub async fn cmd_gateway() -> Result<()> {
 
     let workspace =
         gasket_engine::tools::resolve_exec_workspace(&config, std::path::Path::new("."));
-    let cron_sqlite_store = SqliteStore::new()
-        .await
-        .expect("Failed to open SQLite store for cron persistence");
+    let cron_path = gasket_engine::config::config_dir()
+        .join("state")
+        .join("cron.json");
     let cron_service =
-        Arc::new(CronService::new(workspace.clone(), cron_sqlite_store.cron_store()).await);
+        Arc::new(CronService::new(workspace.clone(), cron_path).await);
 
     let inbound_sender = gasket_channels::InboundSender::new(broker.clone());
     let providers = Arc::new(gasket_channels::ImProviders::from_config(
@@ -103,7 +101,7 @@ pub async fn cmd_gateway() -> Result<()> {
         &config,
         vault,
         &workspace,
-        &sqlite_store,
+        &store,
         &cron_service,
         approval_callback,
     )
@@ -231,7 +229,7 @@ async fn setup_agent_pipeline(
     config: &gasket_engine::config::Config,
     vault: Option<Arc<gasket_engine::vault::VaultStore>>,
     workspace: &std::path::PathBuf,
-    sqlite_store: &Arc<SqliteStore>,
+    store: &Arc<gasket_storage::JsonStore>,
     cron_service: &Arc<CronService>,
     approval_callback: Option<Arc<dyn gasket_types::ApprovalCallback>>,
 ) -> Result<(
@@ -262,15 +260,11 @@ async fn setup_agent_pipeline(
 
     // Initialize embedding recall if configured.
     //
-    // `embedding_recall` carries (searcher, indexer, event_store_tx) so the
-    // channel invariant is encoded in the type: either all three are present
-    // or none are.
+    // `embedding_recall` carries (searcher, indexer).
     #[cfg(feature = "embedding")]
     let (history_search, embedding_recall) = if let Some(ref emb_cfg) = config.embedding {
-        let event_store = gasket_engine::EventStore::new(sqlite_store.pool());
-        let tx = event_store.sender();
         match gasket_engine::session::history::builder::setup_embedding_recall(
-            &event_store,
+            store,
             emb_cfg,
         )
         .await
@@ -280,7 +274,7 @@ async fn setup_agent_pipeline(
                     searcher: searcher.clone(),
                     config: emb_cfg.recall.clone(),
                 };
-                (Some(params), Some((searcher, indexer, tx)))
+                (Some(params), Some((searcher, indexer)))
             }
             Err(e) => {
                 tracing::warn!("Failed to initialize embedding recall: {}", e);
@@ -300,6 +294,7 @@ async fn setup_agent_pipeline(
         #[cfg(feature = "embedding")]
         history_search: history_search.clone(),
         role: gasket_types::AgentRole::Orchestrator,
+        store: store.clone(),
     });
 
     let worker_tools = build_tool_registry(ToolRegistryConfig {
@@ -310,6 +305,7 @@ async fn setup_agent_pipeline(
         #[cfg(feature = "embedding")]
         history_search: None, // workers don't need to search history
         role: gasket_types::AgentRole::Worker,
+        store: store.clone(),
     });
     let worker_tools = Arc::new(worker_tools);
 
@@ -320,7 +316,7 @@ async fn setup_agent_pipeline(
             .max_concurrency,
     );
 
-    let extra_tools = build_extra_tools(cron_service, &provider_info, &agent_config, sqlite_store);
+    let extra_tools = build_extra_tools(cron_service, &provider_info, &agent_config, store);
 
     let mut tools = orchestrator_tools.clone();
     for (tool, metadata) in extra_tools {
@@ -338,39 +334,38 @@ async fn setup_agent_pipeline(
 
     // 1. Create agent session first (without spawner) so we can extract pending_asks
     #[cfg(feature = "embedding")]
-    let mut agent = if let Some((searcher, indexer, event_store_tx)) = embedding_recall {
-        AgentSession::with_sqlite_store_and_embedding(
+    let mut agent = if let Some((searcher, indexer)) = embedding_recall {
+        AgentSession::with_store_and_embedding(
             provider_info.provider.clone(),
             workspace.clone(),
             agent_config.clone(),
             tools.clone(),
-            sqlite_store.clone(),
+            store.clone(),
             gasket_engine::session::builder::EmbeddingContext {
                 searcher,
                 indexer,
-                event_store_tx,
             },
         )
         .await
         .context("Failed to initialize agent (check workspace bootstrap files)")?
     } else {
-        AgentSession::with_sqlite_store(
+        AgentSession::with_store(
             provider_info.provider.clone(),
             workspace.clone(),
             agent_config.clone(),
             tools.clone(),
-            sqlite_store.clone(),
+            store.clone(),
         )
         .await
         .context("Failed to initialize agent (check workspace bootstrap files)")?
     };
     #[cfg(not(feature = "embedding"))]
-    let mut agent = AgentSession::with_sqlite_store(
+    let mut agent = AgentSession::with_store(
         provider_info.provider.clone(),
         workspace.clone(),
         agent_config.clone(),
         tools.clone(),
-        sqlite_store.clone(),
+        store.clone(),
     )
     .await
     .context("Failed to initialize agent (check workspace bootstrap files)")?;
@@ -409,7 +404,7 @@ fn build_extra_tools(
     cron_service: &Arc<CronService>,
     provider_info: &crate::provider::ProviderInfo,
     agent_config: &gasket_engine::session::AgentConfig,
-    sqlite_store: &Arc<SqliteStore>,
+    store: &Arc<gasket_storage::JsonStore>,
 ) -> Vec<(Box<dyn Tool>, ToolMetadata)> {
     let mut ext = vec![(
         Box::new(MessageTool) as Box<dyn Tool>,
@@ -433,9 +428,8 @@ fn build_extra_tools(
         },
     ));
 
-    let ctx_pool = sqlite_store.pool();
-    let ctx_event_store = EventStore::new(ctx_pool.clone());
-    let ctx_session_store = gasket_engine::SessionStore::new(ctx_pool);
+    let ctx_event_store: Arc<dyn gasket_storage::EventStoreTrait> = store.clone();
+    let ctx_session_store: Arc<dyn gasket_storage::SessionStoreTrait> = store.clone();
     let mut ctx_compactor = ContextCompactor::new(
         provider_info.provider.clone(),
         ctx_event_store,

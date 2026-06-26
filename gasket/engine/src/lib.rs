@@ -45,7 +45,7 @@ pub mod vault;
 // ── Root-level re-exports (used by external crates at crate root) ──
 
 pub use error::ConfigValidationError;
-pub use gasket_storage::{EventStore, SessionStore, SqliteStore};
+pub use gasket_storage::JsonStore;
 pub use gasket_types::SubagentSpawner;
 pub use session::AgentConfig;
 pub use subagents::ModelResolver;

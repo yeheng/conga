@@ -1,23 +1,32 @@
 //! Clear session history tool — wipe all events and summaries for a session.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
 
 use super::{simple_schema, Tool, ToolContext, ToolError, ToolResult};
-use gasket_storage::{EventStore, SessionStore};
+use gasket_storage::{EventStoreTrait, SessionStoreTrait};
 use gasket_types::SessionKey;
 
 /// Tool for clearing all conversation history (events + summaries) for a session.
 pub struct ClearSessionTool {
-    session_store: SessionStore,
+    event_store: Arc<dyn EventStoreTrait>,
+    session_store: Arc<dyn SessionStoreTrait>,
 }
 
 impl ClearSessionTool {
-    /// Create a new clear-session tool backed by the given session store.
-    pub fn new(session_store: SessionStore) -> Self {
-        Self { session_store }
+    /// Create a new clear-session tool backed by the given stores.
+    pub fn new(
+        event_store: Arc<dyn EventStoreTrait>,
+        session_store: Arc<dyn SessionStoreTrait>,
+    ) -> Self {
+        Self {
+            event_store,
+            session_store,
+        }
     }
 }
 
@@ -68,10 +77,12 @@ impl Tool for ClearSessionTool {
         info!("Clearing session history for {}", key_str);
 
         // Clear events and session row via EventStore
-        let event_store = EventStore::new(self.session_store.pool());
-        event_store.clear_session(&session_key).await.map_err(|e| {
-            ToolError::ExecutionError(format!("Failed to clear session events: {}", e))
-        })?;
+        self.event_store
+            .clear_session(&session_key)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionError(format!("Failed to clear session events: {}", e))
+            })?;
 
         // Clear summary via SessionStore
         let summary_deleted = self
