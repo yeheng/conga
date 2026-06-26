@@ -20,8 +20,6 @@ use crate::hooks::{HookAction, HookBuilder, HookPoint, HookRegistry, MutableCont
 use crate::vault::{VaultInjector, VaultStore};
 use gasket_storage::process_history;
 use gasket_storage::{EventStoreTrait, HistoryConfig, SessionStoreTrait};
-#[cfg(feature = "embedding")]
-use gasket_storage::EventStore;
 
 /// Outcome of the context building pipeline.
 ///
@@ -377,7 +375,7 @@ pub fn build_default_hooks_builder() -> HookBuilder {
 /// Set up the embedding recall pipeline: provider → store → index → searcher → indexer.
 #[cfg(feature = "embedding")]
 pub async fn setup_embedding_recall(
-    event_store: &EventStore,
+    event_store: &std::sync::Arc<gasket_storage::JsonStore>,
     config: &crate::config::EmbeddingConfig,
 ) -> anyhow::Result<(
     Arc<gasket_embedding::RecallSearcher>,
@@ -439,7 +437,8 @@ pub async fn setup_embedding_recall(
         );
     }
 
-    // Build searcher.
+    // Build searcher. `event_store.clone()` is `Arc<JsonStore>` which coerces
+    // to `Arc<dyn EventStoreTrait>`.
     let searcher = Arc::new(RecallSearcher::new(
         provider_arc.clone(),
         index.clone(),

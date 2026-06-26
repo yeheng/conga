@@ -8,12 +8,11 @@ use uuid::Uuid;
 use gasket_engine::config::config_dir;
 use gasket_engine::cron::{CronJob, CronService};
 
-/// Helper to create a CronService with database persistence
+/// Helper to create a CronService with JSON-file persistence
 async fn create_cron_service() -> Result<CronService> {
     let workspace = config_dir();
-    let sqlite_store = gasket_engine::SqliteStore::new().await?;
-    let cron_store = sqlite_store.cron_store();
-    Ok(CronService::new(workspace, cron_store).await)
+    let cron_path = config_dir().join("state").join("cron.json");
+    Ok(CronService::new(workspace, cron_path).await)
 }
 
 /// List all scheduled cron jobs

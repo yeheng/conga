@@ -524,13 +524,13 @@ struct WorkflowState {
 #[derive(Clone)]
 pub struct WorkflowTool {
     workflow: Workflow,
-    kv_store: Option<gasket_storage::KvStore>,
+    kv_path: Option<std::path::PathBuf>,
 }
 
 impl WorkflowTool {
     /// Create a new workflow tool from a validated workflow.
-    pub fn new(workflow: Workflow, kv_store: Option<gasket_storage::KvStore>) -> Self {
-        Self { workflow, kv_store }
+    pub fn new(workflow: Workflow, kv_path: Option<std::path::PathBuf>) -> Self {
+        Self { workflow, kv_path }
     }
 
     /// Execute a single step: spawn subagent, stream events, collect result.
@@ -659,8 +659,8 @@ impl Tool for WorkflowTool {
         let state_key = format!("workflow_state:{}:{}", ctx.session_key, self.workflow.name);
 
         // ── Recovery: try to load previous state from KV store ──
-        if let Some(ref kv) = self.kv_store {
-            match kv.read(&state_key).await {
+        if let Some(ref p) = self.kv_path {
+            match gasket_storage::KvStateFile::read(p, &state_key).await {
                 Ok(Some(json)) => {
                     if let Ok(state) = serde_json::from_str::<WorkflowState>(&json) {
                         current_idx = state.current_idx;
@@ -699,7 +699,7 @@ impl Tool for WorkflowTool {
             context_map.insert(step.name.clone(), result);
 
             // ── Persistence: snapshot state after each successful step ──
-            if let Some(ref kv) = self.kv_store {
+            if let Some(ref p) = self.kv_path {
                 let state = WorkflowState {
                     current_idx,
                     step_index,
@@ -707,7 +707,7 @@ impl Tool for WorkflowTool {
                     retry_counts: retry_counts.clone(),
                 };
                 if let Ok(json) = serde_json::to_string(&state) {
-                    if let Err(e) = kv.write(&state_key, &json).await {
+                    if let Err(e) = gasket_storage::KvStateFile::write(p, &state_key, &json).await {
                         warn!("[Workflow {}] KV write failed: {}", self.workflow.name, e);
                     }
                 }
@@ -754,8 +754,8 @@ impl Tool for WorkflowTool {
         }
 
         // ── Cleanup: delete KV snapshot on successful completion ──
-        if let Some(ref kv) = self.kv_store {
-            if let Err(e) = kv.delete(&state_key).await {
+        if let Some(ref p) = self.kv_path {
+            if let Err(e) = gasket_storage::KvStateFile::delete(p, &state_key).await {
                 warn!("[Workflow {}] KV delete failed: {}", self.workflow.name, e);
             }
         }
@@ -782,7 +782,7 @@ impl Tool for WorkflowTool {
 /// and wraps each in a `WorkflowTool`.
 pub fn discover_workflows(
     workflows_dir: &Path,
-    kv_store: Option<gasket_storage::KvStore>,
+    kv_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<Vec<WorkflowTool>> {
     let mut tools = Vec::new();
 
@@ -823,7 +823,7 @@ pub fn discover_workflows(
                 match Workflow::from_manifest(&manifest) {
                     Ok(workflow) => {
                         info!("Discovered workflow '{}' from {:?}", workflow.name, path);
-                        tools.push(WorkflowTool::new(workflow, kv_store.clone()));
+                        tools.push(WorkflowTool::new(workflow, kv_path.clone()));
                     }
                     Err(e) => {
                         warn!("Failed to validate workflow from {:?}: {}", path, e);

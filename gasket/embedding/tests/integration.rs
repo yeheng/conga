@@ -12,9 +12,8 @@ use gasket_embedding::{
     build_vector_store, EmbeddingIndexer, EmbeddingProvider, MemoryIndex, RecallConfig,
     RecallSearcher, VectorRecord, VectorStore, VectorStoreConfig,
 };
-use gasket_storage::{EventStore, EventStoreTrait};
+use gasket_storage::{EventStoreTrait, JsonStore};
 use gasket_types::{EventMetadata, EventType, SessionEvent};
-use sqlx::sqlite::SqlitePoolOptions;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -69,76 +68,11 @@ async fn make_vector_store(dim: usize) -> (Arc<dyn VectorStore>, tempfile::TempD
     (store, dir)
 }
 
-/// Create the sessions_v2 + session_events schema needed by EventStore.
-async fn setup_event_db() -> sqlx::SqlitePool {
-    let pool = SqlitePoolOptions::new()
-        .connect(":memory:")
-        .await
-        .expect("in-memory pool");
-
-    sqlx::query(
-        r#"
-        CREATE TABLE sessions_v2 (
-            key TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            last_consolidated_event TEXT,
-            total_events INTEGER NOT NULL DEFAULT 0,
-            total_tokens INTEGER NOT NULL DEFAULT 0,
-            channel TEXT NOT NULL DEFAULT '',
-            chat_id TEXT NOT NULL DEFAULT ''
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE session_events (
-            id TEXT PRIMARY KEY,
-            session_key TEXT NOT NULL,
-            channel TEXT NOT NULL DEFAULT '',
-            chat_id TEXT NOT NULL DEFAULT '',
-            event_type TEXT NOT NULL,
-            content TEXT NOT NULL,
-            tools_used TEXT DEFAULT '[]',
-            token_usage TEXT,
-            token_len INTEGER NOT NULL DEFAULT 0,
-            event_data TEXT,
-            extra TEXT DEFAULT '{}',
-            created_at TEXT NOT NULL,
-            sequence INTEGER NOT NULL DEFAULT 0
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_events_channel_chat ON session_events(channel, chat_id)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_events_channel_chat_sequence ON session_events(channel, chat_id, sequence)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_sessions_v2_channel_chat ON sessions_v2(channel, chat_id)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    pool
+/// Build a `JsonStore` (the sole event backend) rooted in a fresh temp dir.
+fn make_event_store() -> (Arc<JsonStore>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Arc::new(JsonStore::new(dir.path().to_path_buf()));
+    (store, dir)
 }
 
 fn make_event(event_type: EventType, content: &str) -> SessionEvent {
@@ -159,14 +93,13 @@ fn make_event(event_type: EventType, content: &str) -> SessionEvent {
 
 #[tokio::test]
 async fn test_full_recall_flow_returns_hits_with_content() {
-    let pool = setup_event_db().await;
-    let event_store = EventStore::new(pool.clone());
+    let (event_store, _event_dir) = make_event_store();
     let dim = 4;
     let (store, _vector_dir) = make_vector_store(dim).await;
     let provider = Arc::new(DeterministicMockProvider::new(dim));
     let index = Arc::new(MemoryIndex::new(dim));
 
-    // Insert events into BOTH the EventStore (for content lookup) and the
+    // Insert events into BOTH the event store (for content lookup) and the
     // embedding stores.
     let contents = [
         "Rust error handling is done with Result and Option types",
@@ -186,7 +119,7 @@ async fn test_full_recall_flow_returns_hits_with_content() {
         };
         let event = make_event(event_type.clone(), content);
         let event_id = event.id.to_string();
-        event_store.append_event(&event).await.unwrap();
+        event_store.append(&event).await.unwrap();
 
         let embedding = provider.embed(content).await.unwrap();
         let event_type_str = match event_type {
@@ -213,7 +146,12 @@ async fn test_full_recall_flow_returns_hits_with_content() {
         .unwrap();
     assert_eq!(rebuilt, 5);
 
-    let searcher = RecallSearcher::new(provider.clone(), index.clone(), store, event_store);
+    let searcher = RecallSearcher::new(
+        provider.clone(),
+        index.clone(),
+        store,
+        event_store.clone() as Arc<dyn EventStoreTrait>,
+    );
 
     let config = RecallConfig {
         top_k: 10,
@@ -341,9 +279,7 @@ async fn test_cold_start_rebuild() {
 
 #[tokio::test]
 async fn test_indexer_broadcast_processing() {
-    let pool = setup_event_db().await;
-
-    let event_store = EventStore::new(pool.clone());
+    let (event_store, _event_dir) = make_event_store();
     let (embedding_store, _vector_dir) = make_vector_store(4).await;
 
     let provider = Arc::new(DeterministicMockProvider::new(4));
@@ -351,8 +287,9 @@ async fn test_indexer_broadcast_processing() {
 
     let rx = event_store.subscribe();
 
-    let mut indexer = EmbeddingIndexer::start(provider.clone(), embedding_store, index.clone(), rx)
-        .expect("start indexer");
+    let mut indexer =
+        EmbeddingIndexer::start(provider.clone(), embedding_store, index.clone(), rx)
+            .expect("start indexer");
 
     let e1 = make_event(EventType::UserMessage, "First user message via broadcast");
     let e2 = make_event(
@@ -367,11 +304,13 @@ async fn test_indexer_broadcast_processing() {
         "tool call content here",
     );
 
-    event_store.append_event(&e1).await.unwrap();
-    event_store.append_event(&e2).await.unwrap();
-    event_store.append_event(&e3).await.unwrap();
+    event_store.append(&e1).await.unwrap();
+    event_store.append(&e2).await.unwrap();
+    event_store.append(&e3).await.unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // The indexer batches events with a 500ms flush interval; wait long
+    // enough for the batch to be processed.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
     assert_eq!(
         index.len(),
@@ -399,9 +338,7 @@ async fn test_indexer_broadcast_processing() {
 
 #[tokio::test]
 async fn test_indexer_dedup() {
-    let pool = setup_event_db().await;
-
-    let event_store = EventStore::new(pool.clone());
+    let (event_store, _event_dir) = make_event_store();
     let (embedding_store, _vector_dir) = make_vector_store(4).await;
 
     let provider = Arc::new(DeterministicMockProvider::new(4));
@@ -425,12 +362,14 @@ async fn test_indexer_dedup() {
     assert_eq!(index.len(), 0);
 
     let rx = event_store.subscribe();
-    let mut indexer = EmbeddingIndexer::start(provider.clone(), embedding_store, index.clone(), rx)
-        .expect("start indexer");
+    let mut indexer =
+        EmbeddingIndexer::start(provider.clone(), embedding_store, index.clone(), rx)
+            .expect("start indexer");
 
-    event_store.append_event(&event).await.unwrap();
+    event_store.append(&event).await.unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Wait for the indexer's 500ms batch flush.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
     assert_eq!(
         index.len(),

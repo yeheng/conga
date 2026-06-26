@@ -39,7 +39,3 @@ tokio-test = "0.4"
 tempfile = "3"
 mockito = "1"
 serde_yaml = "0.9"
-# RecallSearcher integration tests build a SQLite-backed EventStore for content
-# lookups. sqlx stays a dev-only dependency here; it is removed entirely in the
-# Phase 3 cleanup once EventStore no longer uses SQLite.
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json"] }

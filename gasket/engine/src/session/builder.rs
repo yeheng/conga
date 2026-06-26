@@ -17,19 +17,12 @@ use crate::session::config::AgentConfigExt;
 use crate::session::finalizer::ResponseFinalizer;
 use crate::session::{prompt, AgentConfig, AgentSession};
 use gasket_providers::LlmProvider;
-use gasket_storage::{EventStore, SessionStore};
 
 /// Bundle of embedding-specific dependencies for session construction.
-///
-/// All three fields are required: the broadcast sender is **not** optional —
-/// it is the channel the indexer listens on, so omitting it would silently
-/// detach the indexer from event flow. Callers that don't want embedding
-/// indexing simply don't build a session with embedding at all.
 #[cfg(feature = "embedding")]
 pub struct EmbeddingContext {
     pub searcher: Arc<gasket_embedding::RecallSearcher>,
     pub indexer: gasket_embedding::EmbeddingIndexer,
-    pub event_store_tx: tokio::sync::broadcast::Sender<gasket_types::SessionEvent>,
 }
 
 /// Builder for constructing an `AgentSession`.
@@ -41,17 +34,13 @@ pub struct SessionBuilder {
     workspace: PathBuf,
     config: AgentConfig,
     tools: Arc<crate::tools::ToolRegistry>,
-    sqlite_store: Arc<gasket_storage::SqliteStore>,
+    store: Arc<gasket_storage::JsonStore>,
     /// Optional semantic recall searcher + indexer (embedding feature).
     #[cfg(feature = "embedding")]
     embedding_recall: Option<(
         Arc<gasket_embedding::RecallSearcher>,
         gasket_embedding::EmbeddingIndexer,
     )>,
-    /// Optional shared broadcast sender so the AgentSession's EventStore
-    /// shares the same channel as the embedding infrastructure.
-    #[cfg(feature = "embedding")]
-    event_store_tx: Option<tokio::sync::broadcast::Sender<gasket_types::SessionEvent>>,
 }
 
 impl SessionBuilder {
@@ -61,18 +50,16 @@ impl SessionBuilder {
         workspace: PathBuf,
         config: AgentConfig,
         tools: Arc<crate::tools::ToolRegistry>,
-        sqlite_store: Arc<gasket_storage::SqliteStore>,
+        store: Arc<gasket_storage::JsonStore>,
     ) -> Self {
         Self {
             provider,
             workspace,
             config,
             tools,
-            sqlite_store,
+            store,
             #[cfg(feature = "embedding")]
             embedding_recall: None,
-            #[cfg(feature = "embedding")]
-            event_store_tx: None,
         }
     }
 
@@ -88,37 +75,14 @@ impl SessionBuilder {
         self
     }
 
-    /// Share the broadcast sender from an external EventStore so that
-    /// the AgentSession's EventStore and the embedding indexer listen
-    /// on the same channel.
-    #[cfg(feature = "embedding")]
-    pub fn with_event_store_tx(
-        mut self,
-        tx: tokio::sync::broadcast::Sender<gasket_types::SessionEvent>,
-    ) -> Self {
-        self.event_store_tx = Some(tx);
-        self
-    }
-
     /// Build the complete `AgentSession`.
     ///
     /// All services are constructed in dependency order as local variables —
     /// the compiler guarantees every value is initialized before use.
     pub async fn build(self) -> Result<AgentSession, AgentError> {
-        // ── 1. Storage layer ─────────────────────────────────────────
-        let pool = self.sqlite_store.pool();
-        let session_store: Arc<dyn gasket_storage::SessionStoreTrait> =
-            Arc::new(SessionStore::new(pool.clone()));
-        #[cfg(feature = "embedding")]
-        let event_store: Arc<dyn gasket_storage::EventStoreTrait> = if let Some(tx) = self.event_store_tx {
-            Arc::new(EventStore::with_pool_and_sender(pool.clone(), tx))
-                as Arc<dyn gasket_storage::EventStoreTrait>
-        } else {
-            Arc::new(EventStore::new(pool.clone())) as Arc<dyn gasket_storage::EventStoreTrait>
-        };
-        #[cfg(not(feature = "embedding"))]
-        let event_store: Arc<dyn gasket_storage::EventStoreTrait> =
-            Arc::new(EventStore::new(pool.clone())) as Arc<dyn gasket_storage::EventStoreTrait>;
+        // ── 1. Storage layer (JsonStore is the sole backend) ────────
+        let session_store: Arc<dyn gasket_storage::SessionStoreTrait> = self.store.clone();
+        let event_store: Arc<dyn gasket_storage::EventStoreTrait> = self.store.clone();
 
         // ── 2. Query provider for real model limits ──────────────────
         let model_limits = self
@@ -273,9 +237,9 @@ pub async fn build_session(
     workspace: PathBuf,
     config: AgentConfig,
     tools: Arc<crate::tools::ToolRegistry>,
-    sqlite_store: Arc<gasket_storage::SqliteStore>,
+    store: Arc<gasket_storage::JsonStore>,
 ) -> Result<AgentSession, AgentError> {
-    SessionBuilder::new(provider, workspace, config, tools, sqlite_store)
+    SessionBuilder::new(provider, workspace, config, tools, store)
         .build()
         .await
 }
@@ -287,12 +251,11 @@ pub async fn build_session_with_embedding(
     workspace: PathBuf,
     config: AgentConfig,
     tools: Arc<crate::tools::ToolRegistry>,
-    sqlite_store: Arc<gasket_storage::SqliteStore>,
+    store: Arc<gasket_storage::JsonStore>,
     embedding: EmbeddingContext,
 ) -> Result<AgentSession, AgentError> {
-    SessionBuilder::new(provider, workspace, config, tools, sqlite_store)
+    SessionBuilder::new(provider, workspace, config, tools, store)
         .with_embedding_recall(embedding.searcher, embedding.indexer)
-        .with_event_store_tx(embedding.event_store_tx)
         .build()
         .await
 }

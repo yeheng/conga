@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::SubagentSpawner;
-use gasket_storage::{EventStoreTrait, SessionStoreTrait, SqlitePool};
+use gasket_storage::{EventStoreTrait, SessionStoreTrait};
 
 use super::{
     registry::ToolRegistry, AskUserTool, ClearSessionTool, EditFileTool, ExecTool, HistoryQueryTool,
@@ -197,39 +197,33 @@ impl ToolProvider for CoreToolProvider {
 // SystemToolProvider — history query, session management
 // ---------------------------------------------------------------------------
 
-/// Provides system tools backed by the session store.
+/// Provides system tools backed by the event/session stores.
 pub struct SystemToolProvider {
     event_store: Option<Arc<dyn EventStoreTrait>>,
     session_store: Option<Arc<dyn SessionStoreTrait>>,
-    /// Raw pool for `HistoryQueryTool` (direct SQL queries).
-    pool: Option<SqlitePool>,
 }
 
 impl SystemToolProvider {
     pub fn new(
         event_store: Option<Arc<dyn EventStoreTrait>>,
         session_store: Option<Arc<dyn SessionStoreTrait>>,
-        pool: Option<SqlitePool>,
     ) -> Self {
         Self {
             event_store,
             session_store,
-            pool,
         }
     }
 }
 
 impl ToolProvider for SystemToolProvider {
     fn register_tools(&self, registry: &mut ToolRegistry) {
-        if let (Some(es), Some(ss), Some(pool)) =
-            (self.event_store.clone(), self.session_store.clone(), self.pool.clone())
-        {
+        if let (Some(es), Some(ss)) = (self.event_store.clone(), self.session_store.clone()) {
             reg!(
                 registry,
-                HistoryQueryTool::new(pool),
+                HistoryQueryTool::new(es.clone()),
                 "Query History",
                 "history",
-                ["history", "search", "sqlite"],
+                ["history", "search"],
                 false,
                 false
             );

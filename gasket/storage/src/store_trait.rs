@@ -1,8 +1,7 @@
 //! Storage traits — the real, backend-agnostic interface.
 //!
 //! Engine / embedding / tools program against these traits, never against a
-//! concrete backend. Two backends implement them: SQLite (legacy, removed in
-//! Phase 3) and JSON ([`crate::JsonStore`]).
+//! concrete backend. The sole backend is JSON ([`crate::JsonStore`]).
 //!
 //! The previous `EventStoreTrait` exposed only 4 methods while consumers called
 //! ~15 inherent methods on the concrete `EventStore` struct directly — a
@@ -17,9 +16,6 @@ use uuid::Uuid;
 /// Storage error type shared across all backends.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
-
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

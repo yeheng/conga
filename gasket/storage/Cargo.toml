@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "SQLite-backed storage, history processing, and semantic embedding for gasket"
+description = "JSON file-backed storage, history processing, and semantic embedding for gasket"
 
 [features]
 default = []
@@ -35,9 +35,6 @@ uuid.workspace = true
 
 # Synchronization (per-session write locks in JsonStore)
 parking_lot = "0.12"
-
-# SQLite (async)
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json"] }
 
 # Configuration directory
 dirs.workspace = true

@@ -1,7 +1,7 @@
 //! Bootstrap helpers for embedding the engine in a host process.
 //!
 //! Per Linus review: the CLI was copy-pasting 6× the same six-line
-//! "create broker → open sqlite → init globals" dance. Extracted here so the
+//! "create broker → open store → init globals" dance. Extracted here so the
 //! call site shrinks to one line, and any future host (GUI, daemon, RPC)
 //! gets the same initialization order for free.
 //!
@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use gasket_broker::MemoryBroker;
-use gasket_storage::SqliteStore;
+use gasket_storage::JsonStore;
 
 use crate::config::{app_config::Config, init_config, load_config};
 
@@ -22,22 +22,22 @@ use crate::config::{app_config::Config, init_config, load_config};
 /// Owns:
 /// - the parsed config (already pushed into the global slot via `init_config`);
 /// - a topic broker;
-/// - a SQLite store wrapped in an `Arc`, ready for repository accessors.
+/// - a `JsonStore` wrapped in an `Arc`, the sole storage backend.
 pub struct EngineInfra {
     pub config: Config,
     pub broker: Arc<MemoryBroker>,
-    pub sqlite_store: Arc<SqliteStore>,
+    pub store: Arc<JsonStore>,
 }
 
 impl EngineInfra {
-    /// Build a fresh `Arc<dyn EventStoreTrait>` backed by the shared SQLite pool.
+    /// Build a fresh `Arc<dyn EventStoreTrait>` backed by the shared store.
     pub fn event_store(&self) -> Arc<dyn gasket_storage::EventStoreTrait> {
-        Arc::new(gasket_storage::EventStore::new(self.sqlite_store.pool()))
+        self.store.clone()
     }
 
-    /// Build a fresh `Arc<dyn SessionStoreTrait>` backed by the shared SQLite pool.
+    /// Build a fresh `Arc<dyn SessionStoreTrait>` backed by the shared store.
     pub fn session_store(&self) -> Arc<dyn gasket_storage::SessionStoreTrait> {
-        Arc::new(gasket_storage::SessionStore::new(self.sqlite_store.pool()))
+        self.store.clone()
     }
 }
 
@@ -71,24 +71,21 @@ impl BrokerCapacity {
 }
 
 /// Initialize the shared infrastructure: load config → init globals →
-/// create broker → open SQLite → wrap in `Arc`. Returns [`EngineInfra`].
+/// create broker → open JsonStore → wrap in `Arc`. Returns [`EngineInfra`].
 ///
-/// Fails fast if config cannot be loaded or the SQLite store cannot be
-/// opened. The caller is expected to handle vault unlock and provider
-/// resolution on top of the returned handle.
+/// Fails fast if config cannot be loaded. The caller is expected to handle
+/// vault unlock and provider resolution on top of the returned handle.
 pub async fn init_engine_infra(capacity: BrokerCapacity) -> Result<EngineInfra> {
     let config = load_config().await?;
     init_config(config.clone());
 
     let broker = Arc::new(MemoryBroker::new(capacity.p2p, capacity.broadcast));
 
-    let sqlite_store = SqliteStore::new().await?;
-    gasket_storage::init_db(sqlite_store);
-    let sqlite_store = Arc::new(gasket_storage::get_db().clone());
+    let store = Arc::new(JsonStore::new(gasket_storage::config_dir()));
 
     Ok(EngineInfra {
         config,
         broker,
-        sqlite_store,
+        store,
     })
 }

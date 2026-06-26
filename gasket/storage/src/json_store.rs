@@ -162,10 +162,28 @@ impl JsonStore {
             .unwrap_or_default()
     }
 
-    /// Rebuild `next_sequence = max(seq in file) + 1` and cache it.
+    /// Rebuild `next_sequence` and cache it.
+    ///
+    /// `next_sequence = max(seq in file) + 1`, but never below the summary
+    /// watermark. Including the watermark is essential after a full compaction
+    /// GC: the event file is then empty (all events at or below the watermark
+    /// were discarded), but the watermark still records how far the sequence
+    /// counter has progressed. Without it, a fresh append would restart from 0
+    /// and violate monotonicity (and confuse `get_events_after_sequence`).
+    ///
+    /// A `watermark == 0` means "no summary yet" (the default) and does not
+    /// raise the floor — otherwise a brand-new session's first event would
+    /// start at sequence 1 instead of 0.
     fn rebuild_next_seq(&self, key: &SessionKey) -> i64 {
         let events = Self::read_events(&self.events_path(key));
-        let next = events.iter().map(|e| e.sequence).max().unwrap_or(-1) + 1;
+        let file_max = events.iter().map(|e| e.sequence).max().unwrap_or(-1);
+        let meta = self.read_meta(key);
+        let wm_floor = if meta.watermark > 0 {
+            meta.watermark
+        } else {
+            -1
+        };
+        let next = file_max.max(wm_floor) + 1;
         self.next_seq.lock().insert(Self::lock_key(key), next);
         next
     }

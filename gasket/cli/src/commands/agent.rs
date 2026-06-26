@@ -39,7 +39,7 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
     let gasket_engine::bootstrap::EngineInfra {
         config,
         broker,
-        sqlite_store,
+        store,
     } = gasket_engine::bootstrap::init_engine_infra(
         gasket_engine::bootstrap::BrokerCapacity::agent_repl(),
     )
@@ -98,15 +98,12 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
 
     // Initialize embedding recall if configured.
     //
-    // `embedding_recall` carries (searcher, indexer, event_store_tx) as a
-    // single bundle so the channel invariant is encoded in the type: either
-    // all three are present, or none are.
+    // `embedding_recall` carries (searcher, indexer) as a single bundle.
     #[cfg(feature = "embedding")]
     let (history_search, embedding_recall) = if let Some(ref emb_cfg) = config.embedding {
-        let event_store = gasket_engine::EventStore::new(sqlite_store.pool());
-        let tx = event_store.sender();
+        let store_for_emb = store.clone();
         match gasket_engine::session::history::builder::setup_embedding_recall(
-            &event_store,
+            &store_for_emb,
             emb_cfg,
         )
         .await
@@ -116,7 +113,7 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
                     searcher: searcher.clone(),
                     config: emb_cfg.recall.clone(),
                 };
-                (Some(params), Some((searcher, indexer, tx)))
+                (Some(params), Some((searcher, indexer)))
             }
             Err(e) => {
                 tracing::warn!("Failed to initialize embedding recall: {}", e);
@@ -138,6 +135,7 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
             #[cfg(feature = "embedding")]
             history_search: history_search.clone(),
             role: gasket_types::AgentRole::Orchestrator,
+            store: store.clone(),
         });
     let tools = Arc::new(orchestrator_tools);
 
@@ -151,6 +149,7 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
             #[cfg(feature = "embedding")]
             history_search: None, // workers don't need to search history
             role: gasket_types::AgentRole::Worker,
+            store: store.clone(),
         });
     let worker_tools = Arc::new(worker_tools);
 
@@ -179,39 +178,38 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
 
     // 1. Create agent session first (without spawner) so we can extract pending_asks
     #[cfg(feature = "embedding")]
-    let mut agent = if let Some((searcher, indexer, event_store_tx)) = embedding_recall {
-        AgentSession::with_sqlite_store_and_embedding(
+    let mut agent = if let Some((searcher, indexer)) = embedding_recall {
+        AgentSession::with_store_and_embedding(
             provider_info.provider.clone(),
             workspace.clone(),
             agent_config.clone(),
             tools.clone(),
-            sqlite_store.clone(),
+            store.clone(),
             gasket_engine::session::builder::EmbeddingContext {
                 searcher,
                 indexer,
-                event_store_tx,
             },
         )
         .await
         .context("Failed to initialize agent (check workspace bootstrap files)")?
     } else {
-        AgentSession::with_sqlite_store(
+        AgentSession::with_store(
             provider_info.provider.clone(),
             workspace.clone(),
             agent_config.clone(),
             tools.clone(),
-            sqlite_store.clone(),
+            store.clone(),
         )
         .await
         .context("Failed to initialize agent (check workspace bootstrap files)")?
     };
     #[cfg(not(feature = "embedding"))]
-    let mut agent = AgentSession::with_sqlite_store(
+    let mut agent = AgentSession::with_store(
         provider_info.provider.clone(),
         workspace.clone(),
         agent_config.clone(),
         tools.clone(),
-        sqlite_store.clone(),
+        store.clone(),
     )
     .await
     .context("Failed to initialize agent (check workspace bootstrap files)")?;

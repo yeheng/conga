@@ -685,98 +685,26 @@ mod tests {
         }
     }
 
-    async fn setup_compaction_db() -> (
-        sqlx::SqlitePool,
-        gasket_storage::EventStore,
-        gasket_storage::SessionStore,
+    /// Build a `JsonStore` (the sole backend) in a fresh temp dir and return
+    /// both role views (`Arc<dyn EventStoreTrait>`, `Arc<dyn SessionStoreTrait>`).
+    async fn setup_compaction_store() -> (
+        Arc<dyn gasket_storage::EventStoreTrait>,
+        Arc<dyn gasket_storage::SessionStoreTrait>,
     ) {
-        use sqlx::sqlite::SqlitePoolOptions;
-
-        let pool = SqlitePoolOptions::new().connect(":memory:").await.unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE sessions_v2 (
-                key TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                last_consolidated_event TEXT,
-                total_events INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0,
-                channel TEXT NOT NULL DEFAULT '',
-                chat_id TEXT NOT NULL DEFAULT ''
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE session_events (
-                id TEXT PRIMARY KEY,
-                session_key TEXT NOT NULL,
-                channel TEXT NOT NULL DEFAULT '',
-                chat_id TEXT NOT NULL DEFAULT '',
-                event_type TEXT NOT NULL,
-                content TEXT NOT NULL,
-                tools_used TEXT DEFAULT '[]',
-                token_usage TEXT,
-                token_len INTEGER NOT NULL DEFAULT 0,
-                event_data TEXT,
-                extra TEXT DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                sequence INTEGER NOT NULL DEFAULT 0
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query("CREATE INDEX idx_events_channel_chat ON session_events(channel, chat_id)")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        sqlx::query(
-            "CREATE INDEX idx_events_channel_chat_sequence ON session_events(channel, chat_id, sequence)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query("CREATE INDEX idx_sessions_v2_channel_chat ON sessions_v2(channel, chat_id)")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS session_summaries (
-                session_key TEXT PRIMARY KEY,
-                content TEXT NOT NULL DEFAULT '',
-                covered_upto_sequence INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                compaction_in_progress INTEGER NOT NULL DEFAULT 0,
-                compaction_started_at TEXT
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(gasket_storage::JsonStore::new(dir.path().to_path_buf()));
+        // Keep the tempdir alive for the test by leaking it — tests are
+        // short-lived processes, so the leak is acceptable and avoids threading
+        // the TempDir through every assertion.
+        std::mem::forget(dir);
         (
-            pool.clone(),
-            gasket_storage::EventStore::new(pool.clone()),
-            gasket_storage::SessionStore::new(pool),
+            store.clone() as Arc<dyn gasket_storage::EventStoreTrait>,
+            store.clone() as Arc<dyn gasket_storage::SessionStoreTrait>,
         )
     }
 
     async fn append_messages(
-        event_store: &gasket_storage::EventStore,
+        event_store: &dyn gasket_storage::EventStoreTrait,
         session_key: &SessionKey,
         messages: &[&str],
     ) {
@@ -790,7 +718,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 sequence: 0,
             };
-            event_store.append_event(&event).await.unwrap();
+            event_store.append(&event).await.unwrap();
         }
     }
 
@@ -798,7 +726,7 @@ mod tests {
     /// invariant holds and no data is lost.
     #[tokio::test]
     async fn test_crash_recovery_watermark() {
-        let (_pool, event_store, session_store) = setup_compaction_db().await;
+        let (event_store, session_store) = setup_compaction_store().await;
         let session_key = SessionKey::new(gasket_types::ChannelType::Cli, "crash-test");
         let provider = Arc::new(MockProvider::new("Summary of the conversation."));
         let model = "mock-model";
@@ -806,7 +734,7 @@ mod tests {
 
         // Phase 1: Create initial events (seq 0-5)
         append_messages(
-            &event_store,
+            &*event_store,
             &session_key,
             &["msg0", "msg1", "msg2", "msg3", "msg4", "msg5"],
         )
@@ -815,8 +743,8 @@ mod tests {
 
         // Phase 2: Successful compaction → watermark = 5
         pipeline::run_compaction(
-            &event_store,
-            &session_store,
+            &*event_store,
+            &*session_store,
             &*provider,
             model,
             prompt,
@@ -843,7 +771,7 @@ mod tests {
 
         // Phase 3: Add 4 more events (seq 6-9)
         append_messages(
-            &event_store,
+            &*event_store,
             &session_key,
             &["msg6", "msg7", "msg8", "msg9"],
         )
@@ -860,8 +788,8 @@ mod tests {
         // Phase 4: Simulate crash — LLM fails mid-compaction
         provider.set_fail(true);
         let result = pipeline::run_compaction(
-            &event_store,
-            &session_store,
+            &*event_store,
+            &*session_store,
             &*provider,
             model,
             prompt,
@@ -898,8 +826,8 @@ mod tests {
 
         // Phase 6: Retry compaction successfully
         pipeline::run_compaction(
-            &event_store,
-            &session_store,
+            &*event_store,
+            &*session_store,
             &*provider,
             model,
             prompt,
