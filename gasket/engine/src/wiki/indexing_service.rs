@@ -5,10 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use gasket_broker::{BrokerError, Subscriber};
-use gasket_storage::wiki::{PageIndex, PageStore, WikiRelationStore};
+use gasket_storage::wiki::{PageIndex, PageStore};
 use tracing::{debug, info, warn};
-
-use super::lint::extract_page_references;
 
 /// Trait for computing embeddings (injected from engine/embedding layer).
 #[async_trait::async_trait]
@@ -37,25 +35,19 @@ pub struct WikiVectorHit {
 }
 
 /// Background actor that subscribes to `Topic::WikiChanged` and syncs
-/// the Tantivy index, relation store, and optionally the vector index.
+/// the Tantivy index and optionally the vector index.
 pub struct WikiIndexingService {
     page_store: PageStore,
     page_index: Arc<PageIndex>,
-    relation_store: WikiRelationStore,
     embedding_provider: Option<Arc<dyn WikiEmbeddingProvider>>,
     vector_store: Option<Arc<dyn WikiVectorStore>>,
 }
 
 impl WikiIndexingService {
-    pub fn new(
-        page_store: PageStore,
-        page_index: Arc<PageIndex>,
-        relation_store: WikiRelationStore,
-    ) -> Self {
+    pub fn new(page_store: PageStore, page_index: Arc<PageIndex>) -> Self {
         Self {
             page_store,
             page_index,
-            relation_store,
             embedding_provider: None,
             vector_store: None,
         }
@@ -137,29 +129,6 @@ impl WikiIndexingService {
                     debug!("WikiIndexingService: upserted {}", path);
                 }
 
-                // Extract [[...]] entity links and persist as relations.
-                let refs = extract_page_references(&page.content);
-                if !refs.is_empty() {
-                    // First clear old outgoing relations for this page.
-                    if let Err(e) = self.relation_store.delete_all_outgoing(path).await {
-                        debug!(
-                            "WikiIndexingService: failed to clear old relations for {}: {}",
-                            path, e
-                        );
-                    }
-                    if let Err(e) = self.relation_store.add_many(path, &refs, "mentions").await {
-                        debug!(
-                            "WikiIndexingService: failed to add relations for {}: {}",
-                            path, e
-                        );
-                    }
-                    debug!(
-                        "WikiIndexingService: indexed {} outgoing relation(s) for {}",
-                        refs.len(),
-                        path
-                    );
-                }
-
                 // Compute embedding and upsert to vector store.
                 if let (Some(provider), Some(vstore)) =
                     (&self.embedding_provider, &self.vector_store)
@@ -184,7 +153,7 @@ impl WikiIndexingService {
                 }
             }
             Err(_) => {
-                // Page doesn't exist anymore — delete from index and relations.
+                // Page doesn't exist anymore — delete from index.
                 if let Err(e) = self.page_index.delete(path).await {
                     warn!(
                         "WikiIndexingService: failed to delete {} from index: {}",
@@ -192,14 +161,6 @@ impl WikiIndexingService {
                     );
                 } else {
                     debug!("WikiIndexingService: deleted {} from index", path);
-                }
-                if let Err(e) = self.relation_store.delete_all_for_page(path).await {
-                    warn!(
-                        "WikiIndexingService: failed to delete relations for {}: {}",
-                        path, e
-                    );
-                } else {
-                    debug!("WikiIndexingService: deleted relations for {}", path);
                 }
                 // Remove vector if semantic indexing is enabled.
                 if let Some(vstore) = &self.vector_store {

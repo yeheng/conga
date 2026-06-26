@@ -172,10 +172,8 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
 
     // Spawn wiki indexing service for auto Tantivy + vector updates
     if let (Some(ref ps), Some(ref pi)) = (&page_store, &page_index) {
-        let relation_store = gasket_storage::wiki::WikiRelationStore::new(pool.clone());
         #[allow(unused_mut)]
-        let mut svc =
-            gasket_engine::wiki::WikiIndexingService::new(ps.clone(), pi.clone(), relation_store);
+        let mut svc = gasket_engine::wiki::WikiIndexingService::new(ps.clone(), pi.clone());
 
         // Attach semantic search if embedding is configured.
         #[cfg(feature = "embedding")]

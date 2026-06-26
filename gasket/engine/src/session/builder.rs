@@ -298,7 +298,7 @@ impl SessionBuilder {
 /// Check if wiki is configured and minimally available.
 ///
 /// Returns true if wiki config is enabled and the base path exists.
-/// Does NOT initialize PageStore/PageIndex/WikiLog — that happens
+/// Does NOT initialize PageStore/PageIndex — that happens
 /// during tool registration in `tools/builder.rs`.
 fn is_wiki_available(config: &AgentConfig) -> bool {
     config

@@ -30,8 +30,11 @@ pub struct WikiPageInput<'a> {
     pub file_mtime: i64,
 }
 
-/// SQLite-backed wiki page store. Single source of truth.
-/// Content lives here. Disk files are optional cache.
+/// SQLite projection of wiki pages — derived runtime/index state.
+///
+/// Disk markdown files are the content SSOT; this table mirrors content for
+/// query/index staging and holds runtime-only fields (frequency, access_count,
+/// last_accessed). See `PageStore` for the two-layer contract.
 #[derive(Clone)]
 pub struct WikiPageStore {
     pool: SqlitePool,

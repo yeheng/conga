@@ -383,12 +383,7 @@ pub async fn cmd_wiki_delete(path: &str, force: bool) -> Result<()> {
         }
     }
 
-    // CLI has no background WikiIndexingService, so do synchronous cleanup here.
-    let relation_store = gasket_storage::wiki::WikiRelationStore::new(store.pool().clone());
-    if let Err(e) = relation_store.delete_all_for_page(path).await {
-        tracing::warn!("Failed to clean up wiki relations for '{}': {}", path, e);
-    }
-
+    // CLI has no background WikiIndexingService, so do synchronous Tantivy cleanup here.
     let tantivy_dir = wiki_root.join(".tantivy");
     if tantivy_dir.exists() {
         match gasket_storage::wiki::TantivyPageIndex::open(tantivy_dir) {

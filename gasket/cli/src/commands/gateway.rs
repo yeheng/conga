@@ -149,11 +149,8 @@ pub async fn cmd_gateway() -> Result<()> {
     start_heartbeat_service(broker.clone(), &workspace, &mut tasks);
     // Spawn wiki indexing service to auto-update Tantivy + vectors on WikiChanged events
     if let (Some(ref ps), Some(ref pi)) = (&page_store, &page_index) {
-        let relation_store =
-            gasket_storage::wiki::WikiRelationStore::new(sqlite_store.pool().clone());
         #[allow(unused_mut)]
-        let mut svc =
-            gasket_engine::wiki::WikiIndexingService::new(ps.clone(), pi.clone(), relation_store);
+        let mut svc = gasket_engine::wiki::WikiIndexingService::new(ps.clone(), pi.clone());
 
         // Attach semantic search if embedding is configured.
         #[cfg(feature = "embedding")]

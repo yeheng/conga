@@ -1,8 +1,11 @@
 use sqlx::SqlitePool;
 
-/// Create all wiki-related tables.
-/// Key design: wiki_pages.path is PK, content lives in SQLite (single truth).
-/// No wiki_page_locks table — SQLite WAL handles concurrency.
+/// Create wiki runtime/index tables.
+///
+/// Disk markdown files are the content SSOT (title/type/category/tags/summary/body).
+/// `wiki_pages` is a derived projection holding runtime state (frequency,
+/// access_count, last_accessed) and search-index staging. See `PageStore` for
+/// the two-layer contract.
 pub async fn create_wiki_tables(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         r#"
@@ -30,52 +33,6 @@ pub async fn create_wiki_tables(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS raw_sources (
-            id          TEXT PRIMARY KEY,
-            path        TEXT NOT NULL,
-            format      TEXT NOT NULL,
-            ingested    INTEGER DEFAULT 0,
-            ingested_at TEXT,
-            title       TEXT,
-            metadata    TEXT,
-            created     TEXT NOT NULL
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS wiki_relations (
-            from_page   TEXT NOT NULL,
-            to_page     TEXT NOT NULL,
-            relation    TEXT NOT NULL,
-            confidence  REAL DEFAULT 1.0,
-            created     TEXT NOT NULL,
-            PRIMARY KEY (from_page, to_page, relation)
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS wiki_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            action      TEXT NOT NULL,
-            target      TEXT,
-            detail      TEXT,
-            created     TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
     // Indexes
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_pages_type ON wiki_pages(type)")
         .execute(pool)
@@ -91,23 +48,6 @@ pub async fn create_wiki_tables(pool: &SqlitePool) -> anyhow::Result<()> {
         .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_wiki_pages_last_accessed ON wiki_pages(last_accessed)",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_raw_sources_ingested ON raw_sources(ingested)")
-        .execute(pool)
-        .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_log_action ON wiki_log(action)")
-        .execute(pool)
-        .await?;
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS wiki_sync_state (
-            key   TEXT PRIMARY KEY,
-            value INTEGER NOT NULL DEFAULT 0
-        )
-        "#,
     )
     .execute(pool)
     .await?;
