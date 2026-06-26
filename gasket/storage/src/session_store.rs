@@ -1,7 +1,10 @@
 //! Session storage repository — summaries, checkpoints, and embeddings.
 
+use async_trait::async_trait;
 use gasket_types::SessionKey;
 use tracing::debug;
+
+use crate::store_trait::{SessionStoreTrait, StoreError};
 
 /// Repository for session-related SQLite operations.
 ///
@@ -220,5 +223,91 @@ impl SessionStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(v,)| v != 0).unwrap_or(false))
+    }
+}
+
+#[async_trait]
+impl SessionStoreTrait for SessionStore {
+    async fn save_summary(
+        &self,
+        key: &SessionKey,
+        content: &str,
+        watermark: i64,
+    ) -> Result<(), StoreError> {
+        SessionStore::save_summary(self, key, content, watermark)
+            .await
+            .map_err(StoreError::from)
+    }
+
+    async fn load_summary(&self, key: &SessionKey) -> Result<Option<(String, i64)>, StoreError> {
+        SessionStore::load_summary(self, key).await.map_err(StoreError::from)
+    }
+
+    async fn delete_summary(&self, key: &SessionKey) -> Result<bool, StoreError> {
+        SessionStore::delete_summary(self, key).await.map_err(StoreError::from)
+    }
+
+    async fn load_summary_with_checkpoint(
+        &self,
+        key: &SessionKey,
+    ) -> Result<(String, String, i64), StoreError> {
+        SessionStore::load_summary_with_checkpoint(self, key)
+            .await
+            .map_err(StoreError::from)
+    }
+
+    async fn save_checkpoint(
+        &self,
+        key: &str,
+        target: i64,
+        summary: &str,
+    ) -> Result<(), StoreError> {
+        SessionStore::save_checkpoint(self, key, target, summary)
+            .await
+            .map_err(StoreError::from)
+    }
+
+    async fn load_checkpoint(
+        &self,
+        key: &str,
+        target: i64,
+    ) -> Result<Option<(String, i64)>, StoreError> {
+        SessionStore::load_checkpoint(self, key, target)
+            .await
+            .map_err(StoreError::from)
+    }
+
+    async fn scan_active_sessions(&self) -> Result<Vec<(String, i64, String)>, StoreError> {
+        SessionStore::scan_active_sessions(self)
+            .await
+            .map_err(StoreError::from)
+    }
+
+    async fn get_sessions_needing_evolution(
+        &self,
+        task: &str,
+        threshold: i64,
+    ) -> Result<Vec<(String, i64, i64)>, StoreError> {
+        SessionStore::get_sessions_needing_evolution(self, task, threshold)
+            .await
+            .map_err(StoreError::from)
+    }
+
+    async fn mark_compaction_started(&self, key: &SessionKey) -> Result<(), StoreError> {
+        SessionStore::mark_compaction_started(self, key)
+            .await
+            .map_err(StoreError::from)
+    }
+
+    async fn mark_compaction_finished(&self, key: &SessionKey) -> Result<(), StoreError> {
+        SessionStore::mark_compaction_finished(self, key)
+            .await
+            .map_err(StoreError::from)
+    }
+
+    async fn is_compaction_in_progress(&self, key: &SessionKey) -> Result<bool, StoreError> {
+        SessionStore::is_compaction_in_progress(self, key)
+            .await
+            .map_err(StoreError::from)
     }
 }

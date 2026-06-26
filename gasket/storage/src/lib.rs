@@ -11,6 +11,7 @@ pub mod global;
 mod kv_store;
 mod maintenance_store;
 mod migrations;
+mod store_trait;
 pub mod session_store;
 
 // ── Merged from gasket-history ──
@@ -23,7 +24,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use tracing::debug;
 
 pub use cron_store::CronStore;
-pub use event_store::{EventFilter, EventStore, EventStoreTrait, StoreError};
+pub use event_store::EventStore;
+pub use store_trait::{EventStoreTrait, SessionStoreTrait, StoreError};
 pub use global::{get_db, init_db};
 pub use kv_store::KvStore;
 pub use maintenance_store::MaintenanceStore;
