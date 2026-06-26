@@ -19,7 +19,6 @@ async-trait.workspace = true
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
 
 # Logging & Tracing
 tracing.workspace = true
@@ -37,15 +36,9 @@ uuid.workspace = true
 # SQLite (async)
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json"] }
 
-# Full-text search
-tantivy = "0.25"
-
 # Configuration directory
 dirs.workspace = true
 directories.workspace = true
-
-# Regex (used by wiki::types::slugify)
-regex = "1"
 
 # Token counting (from gasket-history)
 tiktoken-rs.workspace = true

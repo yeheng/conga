@@ -198,50 +198,11 @@ impl IndexLock {
 
 ---
 
-## 8. Integration with Wiki Module
-
-The wiki module (`engine/src/wiki/`) uses Tantivy differently from the CLI tool:
-
-### Wiki's TantivyIndex (`engine/src/wiki/query/tantivy_adapter.rs`)
-
-The wiki has its **own separate** `TantivyIndex` implementation optimized for wiki pages:
-
-**Schema fields:**
-- `path` (STRING) - Document identity
-- `title` (TEXT) - BM25 tokenized
-- `content` (TEXT) - BM25 tokenized
-- `page_type` (STRING) - Filter by Entity/Topic/Source
-- `category` (STRING) - Optional category filter
-- `tags` (STRING, multi-value) - Tag filtering
-- `confidence` (F64) - Relevance boosting metadata
-
-### Wiki vs CLI Comparison
-
-| Aspect | CLI (`gasket-tantivy`) | Wiki (`engine/wiki`) |
-|--------|------------------------|---------------------|
-| Purpose | General-purpose multi-index CLI tool | Wiki-specific BM25 search |
-| Schema | User-defined field schemas | Fixed wiki page schema |
-| Thread safety | File locking (CLI processes) | `parking_lot::Mutex` for writer |
-| TTL | Supported | Not supported |
-| Batch operations | Full batch with parallel option | Single upsert |
-| Query types | BM25 + filters + highlighting | BM25 + type filter + tag filter |
-
-### Wiki Three-Phase Query Pipeline
-
-```
-Phase 1: Tantivy BM25 → top-50 candidates
-Phase 2: Reranker → combined score (BM25 + confidence + recency)
-Phase 3: Budget-aware → load full pages from SQLite
-```
-
----
-
-## 9. Configuration & Usage
+## 8. Configuration & Usage
 
 **Default Index Directories:**
 ```
 ~/.gasket/tantivy/           # CLI indexes
-~/.gasket/wiki/.tantivy/     # Wiki search index
 ```
 
 **Usage Examples:**
@@ -265,7 +226,7 @@ cargo run -- index rebuild --name myIndex \
 
 ---
 
-## 10. File Index
+## 9. File Index
 
 | Feature | File Path |
 |---------|----------|
@@ -278,4 +239,3 @@ cargo run -- index rebuild --name myIndex \
 | Search types | `tantivy/src/index/search.rs` |
 | File locking | `tantivy/src/index/lock.rs` |
 | Maintenance operations | `tantivy/src/maintenance/*.rs` |
-| Wiki Tantivy adapter | `engine/src/wiki/query/tantivy_adapter.rs` |

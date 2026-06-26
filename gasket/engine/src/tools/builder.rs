@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::SubagentSpawner;
 
-use super::{CoreToolProvider, SystemToolProvider, ToolProvider, WikiToolProvider};
+use super::{CoreToolProvider, SystemToolProvider, ToolProvider};
 use super::{Tool, ToolMetadata, ToolRegistry};
 
 /// Resolve a potentially relative path to an absolute path.
@@ -68,11 +68,7 @@ pub struct ToolRegistryConfig {
     pub subagent_spawner: Option<Arc<dyn SubagentSpawner>>,
     /// Extra tools to register (e.g. gateway-specific `MessageTool`, `CronTool`).
     pub extra_tools: Vec<(Box<dyn Tool>, ToolMetadata)>,
-    /// Optional wiki PageStore for unified knowledge management.
-    pub page_store: Option<crate::wiki::PageStore>,
-    /// Optional wiki PageIndex for semantic search.
-    pub page_index: Option<Arc<crate::wiki::PageIndex>>,
-    /// Optional LLM provider for plan-generation tools.
+    /// Optional LLM provider for external tool discovery.
     pub provider: Option<Arc<dyn gasket_providers::LlmProvider>>,
     /// Model identifier for plan-generation tools.
     pub model: Option<String>,
@@ -102,13 +98,11 @@ pub fn build_tool_registry(registry_config: ToolRegistryConfig) -> ToolRegistry 
     let ToolRegistryConfig {
         subagent_spawner,
         extra_tools,
-        page_store,
-        page_index,
         provider,
-        model,
         #[cfg(feature = "embedding")]
         history_search,
         role,
+        ..
     } = registry_config;
 
     let config = crate::config::get_config();
@@ -121,32 +115,9 @@ pub fn build_tool_registry(registry_config: ToolRegistryConfig) -> ToolRegistry 
     CoreToolProvider::new(config, &workspace, subagent_spawner.clone(), role)
         .register_tools(&mut tools);
 
-    // ── Wiki + memory tools (conditional on page_store) ───────
-    let prompts = &config.agents.defaults.prompts;
-    WikiToolProvider::new(
-        page_store.clone(),
-        page_index.clone(),
-        provider.clone(),
-        model.clone(),
-        prompts.planning.clone(),
-    )
-    .register_tools(&mut tools);
-
-    // ── System/maintenance tools ─
+    // ── System tools (history query, session management) ──────
     let session_store = Some(sqlite_store.session_store());
-    let maintenance_store = Some(sqlite_store.maintenance_store());
-    let event_store = Some(gasket_storage::EventStore::new(sqlite_store.pool()));
-    SystemToolProvider::new(
-        session_store,
-        maintenance_store,
-        page_store,
-        provider.clone(),
-        model,
-        prompts.evolution.clone(),
-        prompts.distill.clone(),
-        event_store,
-    )
-    .register_tools(&mut tools);
+    SystemToolProvider::new(session_store).register_tools(&mut tools);
 
     // Extra tools (e.g. gateway-specific MessageTool, CronTool)
     for (tool, metadata) in extra_tools {

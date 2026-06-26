@@ -31,7 +31,6 @@ pub struct ResponseFinalizer {
     pricing: Option<ModelPricing>,
     max_tokens: u32,
     after_response_hook_timeout_secs: u64,
-    page_store: Option<crate::wiki::PageStore>,
 }
 
 impl ResponseFinalizer {
@@ -42,7 +41,6 @@ impl ResponseFinalizer {
         pricing: Option<ModelPricing>,
         max_tokens: u32,
         after_response_hook_timeout_secs: u64,
-        page_store: Option<crate::wiki::PageStore>,
     ) -> Self {
         Self {
             hooks,
@@ -51,7 +49,6 @@ impl ResponseFinalizer {
             pricing,
             max_tokens,
             after_response_hook_timeout_secs,
-            page_store,
         }
     }
 
@@ -76,15 +73,6 @@ impl ResponseFinalizer {
 
         let cost = calculate_cost(&result.token_usage, self.pricing.as_ref());
         log_token_stats(&result.token_usage, cost, self.max_tokens);
-
-        // Async rebuild of wiki/index.md if wiki pages changed this turn.
-        if let Some(ref ps) = self.page_store {
-            match ps.maybe_rebuild_index_md().await {
-                Ok(true) => tracing::info!("Rebuilt wiki/index.md after session turn"),
-                Ok(false) => {}
-                Err(e) => tracing::warn!("Failed to rebuild wiki/index.md: {}", e),
-            }
-        }
 
         AgentResponse {
             content: result.content,

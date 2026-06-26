@@ -285,30 +285,6 @@ flowchart TB
     style Tool fill:#FFD700
 ```
 
-### Wiki: Knowledge Base System
-
-```mermaid
-flowchart TB
-    subgraph Memory_Hierarchy["Memory Hierarchy"]
-        H[History<br/>Session History]
-        P[Profile<br/>User Profile]
-        K[Knowledge<br/>Knowledge]
-        A[Active<br/>Current Work]
-    end
-
-    subgraph Storage["Storage"]
-        S1[SQLite<br/>Session History + Index]
-        S2[Wiki<br/>Markdown Files]
-    end
-
-    H --> S1
-    P --> S2
-    K --> S2
-    A --> S2
-```
-
-**Note**: The Wiki module (`gasket_storage::wiki`) unifies knowledge storage with semantic search and three-phase token budget (bootstrap/scenario/on_demand).
-
 ### Tools: Tool System
 
 ```mermaid

@@ -32,22 +32,6 @@ pub struct EmbeddingContext {
     pub event_store_tx: tokio::sync::broadcast::Sender<gasket_types::SessionEvent>,
 }
 
-/// Wiki preparation prompt appended to system prompt when wiki is enabled.
-///
-/// Instructs the agent to proactively query wiki via tools before responding,
-/// replacing the old automatic context injection mechanism.
-const WIKI_PREPARATION_PROMPT: &str = "\
-## Wiki Knowledge System
-
-You have access to a personal wiki knowledge base via these tools:
-- `wiki_search(query)`: Search wiki pages by keyword
-- `wiki_read(path)`: Read a specific wiki page by path
-- `wiki_write(path, title, content)`: Create or update a wiki page
-
-**Preparation Protocol**: Before responding to any user query, always use `wiki_search` \
-to check if relevant knowledge already exists in the wiki. This ensures your responses \
-build upon accumulated knowledge rather than starting from scratch.";
-
 /// Builder for constructing an `AgentSession`.
 ///
 /// Holds only the external inputs; all internal services are built locally
@@ -233,12 +217,6 @@ impl SessionBuilder {
             system_prompt.push_str(&skills);
         }
 
-        // ── 7. Wiki availability check (prompt only) ──────────────
-        if is_wiki_available(&self.config) {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(WIKI_PREPARATION_PROMPT);
-        }
-
         // ── 8. Hook registry ─────────────────────────────────────────
         let hooks = crate::session::history::builder::build_default_hooks_builder().build_shared();
 
@@ -255,14 +233,6 @@ impl SessionBuilder {
             history_config,
         );
 
-        // ── 10. Wiki PageStore for finalizer (index.md rebuild) ──
-        let wiki_root = self.workspace.join("wiki");
-        let page_store = if wiki_root.exists() {
-            Some(crate::wiki::PageStore::new(pool.clone(), wiki_root))
-        } else {
-            None
-        };
-
         let finalizer = ResponseFinalizer::new(
             context_builder.hooks().clone(),
             context_builder.event_store().clone(),
@@ -270,7 +240,6 @@ impl SessionBuilder {
             None,
             effective_max_tokens,
             self.config.after_response_hook_timeout_secs,
-            page_store,
         );
 
         let mut config = self.config;
@@ -294,18 +263,6 @@ impl SessionBuilder {
 // ---------------------------------------------------------------------------
 // Internal helpers — pure functions, no builder state
 // ---------------------------------------------------------------------------
-
-/// Check if wiki is configured and minimally available.
-///
-/// Returns true if wiki config is enabled and the base path exists.
-/// Does NOT initialize PageStore/PageIndex — that happens
-/// during tool registration in `tools/builder.rs`.
-fn is_wiki_available(config: &AgentConfig) -> bool {
-    config
-        .wiki
-        .as_ref()
-        .is_some_and(|cfg| cfg.enabled && std::path::Path::new(&cfg.base_path).exists())
-}
 
 /// Build an AgentSession with all services initialized.
 pub async fn build_session(

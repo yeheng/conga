@@ -19,14 +19,13 @@
 | [三、与 AI 对话](#三与-ai-对话agent-模式) | 最核心的功能 | 和 AI 聊天、提问、让它帮你做事 |
 | [四、配置 AI 大脑](#四配置-ai-大脑providers) | 选择不同的 AI 模型 | 用最合适的 AI 模型做最合适的事 |
 | [五、多模型切换](#五多模型切换model-profiles) | 定义多套模型方案 | 一句话让 AI 切换"大脑" |
-| [六、Wiki 知识库](#六wiki-知识库ai-的长期记忆) | AI 的长期记忆 | 让 AI 记住你的项目、文档、知识 |
-| [七、定时任务 (Cron)](#七定时任务cronai-的闹钟) | AI 的闹钟 | 让 AI 定时自动执行任务 |
-| [八、加密保险箱 (Vault)](#八加密保险箱vault) | 安全存储敏感信息 | 安全管理密码、API Key 等 |
-| [九、多渠道网关 (Gateway)](#九多渠道网关gateway) | 让 AI 登上各种聊天平台 | Telegram、Discord、Slack 上使用 AI |
-| [十、工具系统](#十工具系统ai-的双手) | AI 如何操作电脑 | 文件读写、网页搜索、代码执行 |
-| [十一、插件系统](#十一插件系统扩展-ai-的能力) | 扩展 AI 能力 | 给 AI 添加新技能 |
-| [十二、常用命令速查表](#十二常用命令速查表) | 随用随查 | 所有命令一目了然 |
-| [十三、常见问题 (FAQ)](#十三常见问题-faq) | 遇到问题怎么办 | 快速解决常见问题 |
+| [六、定时任务 (Cron)](#六定时任务cronai-的闹钟) | AI 的闹钟 | 让 AI 定时自动执行任务 |
+| [七、加密保险箱 (Vault)](#七加密保险箱vault) | 安全存储敏感信息 | 安全管理密码、API Key 等 |
+| [八、多渠道网关 (Gateway)](#八多渠道网关gateway) | 让 AI 登上各种聊天平台 | Telegram、Discord、Slack 上使用 AI |
+| [九、工具系统](#九工具系统ai-的双手) | AI 如何操作电脑 | 文件读写、网页搜索、代码执行 |
+| [十、插件系统](#十插件系统扩展-ai-的能力) | 扩展 AI 能力 | 给 AI 添加新技能 |
+| [十一、常用命令速查表](#十一常用命令速查表) | 随用随查 | 所有命令一目了然 |
+| [十二、常见问题 (FAQ)](#十二常见问题-faq) | 遇到问题怎么办 | 快速解决常见问题 |
 
 ---
 
@@ -473,201 +472,9 @@ AI 会在对话中根据任务类型自动选择合适的模型。你也可以�
 
 ---
 
-## 六、Wiki 知识库（AI 的长期记忆）
+## 六、定时任务（Cron）—— AI 的闹钟
 
-### 6.1 为什么 AI 需要记忆？
-
-普通 AI 有一个致命问题：**它记不住你之前说过的话**。每次新对话，它就像失忆了一样。
-
-```
-没有 Wiki：
-你: 我的项目用的是 React 框架
-AI: 好的，我记住了。
-
-[新对话]
-
-你: 我的项目用什么框架？
-AI: 我不知道，你还没告诉过我。
-
-───────────────────
-
-有 Wiki：
-你: 我的项目用的是 React 框架
-AI: 好的，我把它记到 Wiki 里了。
-
-[新对话]
-
-你: 我的项目用什么框架？
-AI: 根据记录，你的项目使用 React 框架。
-```
-
-### 6.2 Wiki 的三层存储
-
-```
-第一层：Markdown 文件       你可以随时编辑的文本文件
-   ↓
-第二层：SQLite 数据库       快速查询的结构化索引
-   ↓
-第三层：Tantivy 搜索引擎    毫秒级全文搜索
-```
-
-### 6.3 Wiki 页面的四种类型
-
-| 类型 | 用途 | 存储目录 | 举例 |
-|------|------|----------|------|
-| **Entity（实体）** | 具体的人、项目、产品 | `entities/` | 项目介绍、团队成员 |
-| **Topic（主题）** | 抽象概念、讨论、决策 | `topics/` | 架构方案、技术选型 |
-| **Source（来源）** | 外部参考资料 | `sources/` | API 文档链接、论文 |
-| **SOP（流程）** | 标准操作步骤 | `sops/` | 部署流程、故障排查步骤 |
-
-### 6.4 初始化 Wiki
-
-```bash
-# 首次使用，创建 Wiki 目录和数据库
-gasket wiki init
-```
-
-### 6.5 创建你的第一个 Wiki 页面
-
-**方式一：手动创建文件**
-
-```bash
-# 创建一个项目介绍页面
-cat > ~/.gasket/wiki/pages/entities/projects/my-project.md << 'EOF'
----
-title: MyProject 项目
-type: entity
-category: projects
-tags: [rust, ai, assistant]
-created: 2026-04-23
----
-
-# MyProject 项目
-
-## 项目简介
-这是一个个人 AI 助手项目。
-
-## 技术栈
-- 前端：React + TypeScript
-- 后端：Rust + Tokio
-- 数据库：SQLite
-
-## 部署地址
-- 测试环境：https://test.example.com
-- 正式环境：https://app.example.com
-EOF
-```
-
-**方式二：让 AI 帮你创建**
-
-在对话中告诉 AI：
-
-```
-你: 记住：我的项目叫 MyProject，使用 React + Rust 技术栈，部署在 example.com
-🤖 Gasket: 好的，我已经把项目信息保存到 Wiki 中了。
-```
-
-AI 会自动调用 `wiki_write` 工具创建 Wiki 页面。
-
-### 6.6 同步到数据库和搜索索引
-
-```bash
-# 修改了 Markdown 文件后，运行同步（通过 Wiki 工具）
-# AI 会在对话中自动调用 wiki_refresh 工具同步
-# 或手动导入文件：
-gasket wiki ingest <文件路径>
-```
-
-### 6.7 搜索 Wiki
-
-```bash
-# 关键词搜索
-gasket wiki search "部署"
-
-# 限制搜索结果数量
-gasket wiki search "React" --limit 5
-
-# 列出所有实体类页面
-gasket wiki list --page-type entity
-
-# 列出所有流程类页面
-gasket wiki list --page-type sop
-```
-
-### 6.8 导入外部文件
-
-```bash
-# 导入一个 Markdown 文件到 Wiki
-gasket wiki ingest ./my-document.md
-
-# 导入一个文本文件
-gasket wiki ingest ./notes.txt
-```
-
-### 6.9 Wiki 健康检查
-
-```bash
-# 检查 Wiki 结构是否健康
-gasket wiki lint
-
-# 自动修复发现的问题
-gasket wiki lint --fix
-```
-
-检查项目包括：
-- 孤立页面（没有被任何页面引用的页面）
-- 残缺页面（引用了不存在的页面）
-- 命名不规范
-- 过期内容
-
-### 6.10 查看 Wiki 统计
-
-```bash
-gasket wiki stats
-```
-
-输出示例：
-```
-Wiki Statistics:
-  Total pages:     42
-  Entities:        15
-  Topics:          18
-  Sources:         6
-  SOPs:            3
-  Index size:      1.2 MB
-```
-
-### 6.11 从旧版迁移
-
-如果你之前使用过旧版 Memory 功能：
-
-```bash
-gasket wiki migrate
-```
-
-### 6.12 页面访问频率
-
-Wiki 页面会根据访问频率自动调整"温度"：
-
-| 状态 | 条件 | 说明 |
-|------|------|------|
-| Hot（热门） | 7 天内访问 3+ 次 | 常用知识，优先加载 |
-| Warm（温热） | 7 天内访问过 | 正常保留 |
-| Cold（冷门） | 30 天未访问 | 可能被清理 |
-| Archived（归档） | 90 天未访问 | 已归档 |
-
-```bash
-# 手动触发频率衰减（通过 Wiki 工具）
-# AI 会在对话中自动调用 wiki_decay 工具
-```
-
-> **特殊豁免**：用户配置文件、人物信息、SOP 流程、决策记录永远不会被归档。
-
----
-
-## 七、定时任务（Cron）—— AI 的闹钟
-
-### 7.1 什么是定时任务？
+### 6.1 什么是定时任务？
 
 就像手机上的闹钟和日历提醒，你可以设定时间和任务，让 AI 自动执行。
 
@@ -680,7 +487,7 @@ Gasket：好的，已设置定时任务
 Gasket：提醒：现在是站会时间！
 ```
 
-### 7.2 Cron 表达式（时间格式）
+### 6.2 Cron 表达式（时间格式）
 
 Cron 表达式由 5 个数字组成，分别代表：**分 时 日 月 周**
 
@@ -693,7 +500,7 @@ Cron 表达式由 5 个数字组成，分别代表：**分 时 日 月 周**
 | `*/5 * * * *` | 每 5 分钟 | 每 5 分钟检查服务状态 |
 | `30 14 25 12 *` | 12 月 25 日 14:30 | 圣诞节下午提醒 |
 
-### 7.3 管理定时任务
+### 6.3 管理定时任务
 
 ```bash
 # 添加一个定时任务：每天早上 9 点发送天气预报
@@ -734,7 +541,7 @@ gasket cron enable a3f1b2c4
 gasket cron remove a3f1b2c4
 ```
 
-### 7.4 更多定时任务示例
+### 6.4 更多定时任务示例
 
 ```bash
 # 每周一早上 9 点提醒写周报
@@ -756,7 +563,7 @@ gasket cron add \
   --message "生成本月的数据统计报告"
 ```
 
-### 7.5 定时任务文件
+### 6.5 定时任务文件
 
 定时任务也可以直接编辑 Markdown 文件来管理，文件位于：
 
@@ -1023,8 +830,6 @@ AI: 文件内容如下：...
 | `list_dir` | 列出目录内容 | "看看这个文件夹里有什么文件" |
 | `web_fetch` | 获取网页内容 | "帮我读一下这个网页的内容" |
 | `web_search` | 搜索网页 | "搜索一下 Rust 语言的最新版本" |
-| `wiki_search` | 全文搜索 Wiki | "查一下 Wiki 里关于 Rust 的内容" |
-| `wiki_read` | 读取 Wiki 页面 | "读一下 Wiki 里的 rust/ownership 页面" |
 | `history_query` | 查询对话历史 | "我昨天说了什么？" |
 
 #### 需要确认的写入工具
@@ -1036,7 +841,6 @@ AI: 文件内容如下：...
 | `exec` | 执行系统命令 | "运行 python script.py" |
 | `new_session` | 开启新会话 | "清空历史，重新开始" |
 | `clear_session` | 清空当前会话 | "删除这段对话的历史" |
-| `wiki_delete` | 删除 Wiki 页面 | "删掉 Wiki 里的旧页面" |
 
 #### 子代理工具
 
@@ -1044,16 +848,6 @@ AI: 文件内容如下：...
 |------|------|---------|
 | `spawn` | 创建单个子代理 | 让 AI 处理一个独立子任务，支持选择模型 |
 | `spawn_parallel` | 并行创建多个子代理 | 同时让多个 AI 做不同的事（最多 10 个任务，5 个并发） |
-
-#### Wiki 知识工具
-
-| 工具 | 功能 |
-|------|------|
-| `wiki_search` | 使用 Tantivy BM25 搜索 Wiki 页面 |
-| `wiki_read` | 按路径读取 Wiki 页面 |
-| `wiki_write` | 写入/更新 Wiki 页面 |
-| `wiki_decay` | 运行 Wiki 页面频率衰减 |
-| `wiki_refresh` | 同步磁盘 Markdown 到 Wiki 索引 |
 
 ### 10.3 工具使用示例
 
@@ -1266,23 +1060,6 @@ parameters:
 | `gasket agent --no-stream` | 关闭流式输出 |
 | `gasket agent --no-markdown` | 纯文本输出 |
 
-### Wiki（知识库）
-
-| 命令 | 功能 |
-|------|------|
-| `gasket wiki init` | 初始化 Wiki |
-| `gasket wiki ingest <文件>` | 导入文件到 Wiki |
-| `gasket wiki search "关键词"` | 搜索 Wiki |
-| `gasket wiki list` | 列出所有页面 |
-| `gasket wiki list --page-type sop` | 只列出流程类页面 |
-| `gasket wiki lint` | 健康检查 |
-| `gasket wiki lint --fix` | 自动修复问题 |
-| `gasket wiki stats` | 查看统计 |
-| `gasket wiki migrate` | 从旧版迁移 |
-| `gasket wiki ingest <文件>` | 导入文件到 Wiki |
-| `gasket wiki lint` | Wiki 健康检查 |
-| `gasket wiki lint --fix` | 自动修复问题 |
-
 ### Cron（定时任务）
 
 | 命令 | 功能 |
@@ -1415,27 +1192,12 @@ gasket vault set openai_api_key
 
 这是 AI 上下文窗口的限制。解决方法：
 1. 输入 `/new` 开始新对话
-2. 重要信息存入 Wiki（让 AI 能搜索到）
 
 **Q: 如何查看使用了多少 Token？**
 
 ```bash
 gasket stats
 ```
-
-### Wiki 相关
-
-**Q: 我可以直接编辑 Markdown 文件吗？**
-
-可以！编辑后让 AI 调用 `wiki_refresh` 工具同步，或使用 `gasket wiki ingest <文件路径>` 重新导入。
-
-**Q: Wiki 和普通对话有什么区别？**
-
-| Wiki | 普通对话 |
-|------|---------|
-| 长期记忆（永久保存） | 短期记忆（可能被压缩） |
-| 手动写入或 AI 自动保存 | 自动记录 |
-| 跨对话共享 | 仅限当前对话 |
 
 ### Gateway 相关
 

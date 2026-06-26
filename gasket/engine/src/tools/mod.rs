@@ -5,10 +5,6 @@
 //! - `filesystem`: File read/write/edit operations
 //! - `web_fetch`: Web content fetching
 //! - `web_search`: Web search
-//! - `wiki_search`: Wiki search
-//! - `wiki_write`: Write wiki pages
-//! - `wiki_decay`: Run wiki frequency decay
-//! - `wiki_refresh`: Refresh wiki index from disk
 //! - `message`: Send messages to users
 //! - `cron`: Scheduled tasks
 //! - `spawn`: Spawn sub-agents
@@ -20,9 +16,7 @@ mod ask_user;
 mod builder;
 mod clear_session;
 mod context;
-mod create_plan;
 mod cron;
-mod evolution;
 mod filesystem;
 mod format;
 mod history_query;
@@ -33,18 +27,12 @@ mod message;
 mod new_session;
 mod provider;
 mod registry;
-mod search_sops;
 mod shell;
 mod spawn;
 pub(crate) mod spawn_common;
 mod spawn_parallel;
 mod web_fetch;
 mod web_search;
-mod wiki_decay;
-mod wiki_refresh;
-#[cfg(feature = "embedding")]
-mod wiki_semantic;
-mod wiki_tools;
 pub(crate) mod workflow;
 
 // Re-export tool trait and base types from gasket-types
@@ -60,9 +48,7 @@ pub use builder::HistorySearchParams;
 pub use builder::{build_tool_registry, resolve_exec_workspace, ToolRegistryConfig};
 pub use clear_session::ClearSessionTool;
 pub use context::ContextTool;
-pub use create_plan::CreatePlanTool;
 pub use cron::CronTool;
-pub use evolution::{EvolutionConfig, EvolutionTool};
 pub use filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use format::{
     extract_json_array, extract_json_object, format_subagent_response, truncate_for_display,
@@ -73,19 +59,13 @@ pub use history_search::HistorySearchTool;
 pub use http::build_client_with_proxy;
 pub use message::MessageTool;
 pub use new_session::NewSessionTool;
-pub use provider::{CoreToolProvider, SystemToolProvider, ToolProvider, WikiToolProvider};
+pub use provider::{CoreToolProvider, SystemToolProvider, ToolProvider};
 pub use registry::ToolRegistry;
-pub use search_sops::{search_sops, SearchSopsTool};
 pub use shell::ExecTool;
 pub use spawn::SpawnTool;
 pub use spawn_parallel::SpawnParallelTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
-pub use wiki_decay::WikiDecayTool;
-pub use wiki_refresh::WikiRefreshTool;
-#[cfg(feature = "embedding")]
-pub use wiki_semantic::{WikiEmbeddingAdapter, WikiVectorAdapter};
-pub use wiki_tools::{WikiDeleteTool, WikiReadTool, WikiSearchTool, WikiWriteTool};
 pub use workflow::{
     discover_workflows, Workflow, WorkflowManifest, WorkflowMode, WorkflowStepDef, WorkflowTool,
 };

@@ -220,7 +220,7 @@ impl ContextBuilder {
             system_prompts.push(skills.clone());
         }
 
-        // ── 5.5. Memory loading removed — agent queries wiki via tools ─────
+        // ── 5.5. Memory loading removed ─────
 
         let mut messages = Self::assemble_prompt(
             history_snapshot,
@@ -262,13 +262,11 @@ impl ContextBuilder {
 
     /// Pure, synchronous assembly of the LLM prompt sequence.
     ///
-    /// Three-layer memory architecture:
+    /// Two-layer memory architecture:
     /// - **L0 (Identity & Rules)**: System prompts loaded from workspace PROFILE.md,
     ///   SOUL.md, and skills. Static for the session lifetime.
     /// - **L1 (Working Memory)**: Compacted summary + recent session events.
     ///   Automatically managed via ContextCompactor and watermark tracking.
-    /// - **L2 (Long-term Knowledge)**: Wiki pages. NOT auto-injected here.
-    ///   The LLM accesses L2 via tool calls (`wiki_search`, `wiki_read`).
     fn assemble_prompt(
         processed_history: Vec<SessionEvent>,
         current_message: &str,

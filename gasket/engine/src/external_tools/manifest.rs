@@ -115,15 +115,6 @@ pub enum Permission {
     /// Permission to call LLM chat API
     LlmChat,
 
-    /// Permission to search wiki pages
-    WikiSearch,
-
-    /// Permission to write wiki pages
-    WikiWrite,
-
-    /// Permission to run wiki decay
-    WikiDecay,
-
     /// Permission to spawn subagents
     SubagentSpawn,
 
@@ -142,9 +133,6 @@ impl Permission {
     pub fn method_name(&self) -> &'static str {
         match self {
             Permission::LlmChat => "llm/chat",
-            Permission::WikiSearch => "wiki/search",
-            Permission::WikiWrite => "wiki/write",
-            Permission::WikiDecay => "wiki/decay",
             Permission::SubagentSpawn => "subagent/spawn",
             Permission::MessageSend => "message/send",
             Permission::UserAsk => "user/ask",
@@ -211,8 +199,8 @@ parameters:
   required: ["query"]
 permissions:
   - llm_chat
-  - wiki_search
-  - wiki_write
+  - subagent_spawn
+  - message_send
 "#;
 
         let manifest: PluginManifest =
@@ -236,8 +224,8 @@ permissions:
         );
         assert_eq!(manifest.permissions.len(), 3);
         assert!(manifest.permissions.contains(&Permission::LlmChat));
-        assert!(manifest.permissions.contains(&Permission::WikiSearch));
-        assert!(manifest.permissions.contains(&Permission::WikiWrite));
+        assert!(manifest.permissions.contains(&Permission::SubagentSpawn));
+        assert!(manifest.permissions.contains(&Permission::MessageSend));
     }
 
     #[test]
@@ -269,33 +257,21 @@ parameters:
 
     #[test]
     fn test_permission_serde_roundtrip() {
-        let permissions = vec![
-            Permission::LlmChat,
-            Permission::WikiSearch,
-            Permission::WikiWrite,
-            Permission::WikiDecay,
-            Permission::SubagentSpawn,
-        ];
+        let permissions = vec![Permission::LlmChat, Permission::SubagentSpawn];
 
         // Test serialization
         let yaml = serde_yaml::to_string(&permissions).expect("Failed to serialize");
         let parsed: Vec<Permission> = serde_yaml::from_str(&yaml).expect("Failed to deserialize");
 
         // Verify all permissions survived roundtrip
-        assert_eq!(parsed.len(), 5);
+        assert_eq!(parsed.len(), 2);
         assert!(parsed.contains(&Permission::LlmChat));
-        assert!(parsed.contains(&Permission::WikiSearch));
-        assert!(parsed.contains(&Permission::WikiWrite));
-        assert!(parsed.contains(&Permission::WikiDecay));
         assert!(parsed.contains(&Permission::SubagentSpawn));
     }
 
     #[test]
     fn test_permission_method_names() {
         assert_eq!(Permission::LlmChat.method_name(), "llm/chat");
-        assert_eq!(Permission::WikiSearch.method_name(), "wiki/search");
-        assert_eq!(Permission::WikiWrite.method_name(), "wiki/write");
-        assert_eq!(Permission::WikiDecay.method_name(), "wiki/decay");
         assert_eq!(Permission::SubagentSpawn.method_name(), "subagent/spawn");
         assert_eq!(Permission::UserAsk.method_name(), "user/ask");
     }

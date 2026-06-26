@@ -17,8 +17,6 @@ pub enum Topic {
     Stream(String),
     CronTrigger,
     Heartbeat,
-    /// Wiki page changed (created, updated, or deleted).
-    WikiChanged,
     Custom(String),
 }
 
@@ -65,10 +63,6 @@ pub enum DeliveryMode {
 pub enum BrokerPayload {
     Inbound(InboundMessage),
     Outbound(OutboundMessage),
-    /// Wiki page was written or deleted.
-    WikiChanged {
-        path: String,
-    },
     /// Subagent started executing a task.
     SubagentStarted {
         id: String,

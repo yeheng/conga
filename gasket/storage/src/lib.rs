@@ -1,9 +1,8 @@
-//! SQLite-backed storage, history processing, and wiki search for gasket.
+//! SQLite-backed storage and history processing for gasket.
 //!
 //! This crate provides:
 //! - **Persistence:** Sessions, conversation messages, summaries, cron jobs
 //! - **History:** Token-budget-aware history truncation and multi-dimensional retrieval
-//! - **Wiki Search:** Tantivy BM25 full-text search with `PageSearchIndex` trait
 
 mod cron_store;
 mod event_store;
@@ -13,7 +12,6 @@ mod kv_store;
 mod maintenance_store;
 mod migrations;
 pub mod session_store;
-pub mod wiki;
 
 // ── Merged from gasket-history ──
 pub mod processor;

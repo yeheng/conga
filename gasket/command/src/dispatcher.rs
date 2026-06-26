@@ -336,7 +336,7 @@ mod tests {
             aliases: vec![],
             kind: CommandKind::Yaml {
                 prompt_template: "Translate to Mandarin: {{user_input}}".into(),
-                allowed_tools: Some(vec!["wiki_search".into()]),
+                allowed_tools: Some(vec!["example_tool".into()]),
             },
         };
         let d = make_dispatcher_with(vec![cmd]);
@@ -348,7 +348,7 @@ mod tests {
             outcome,
             RouteOutcome::Rewrite {
                 prompt: "Translate to Mandarin: Hello world".into(),
-                tool_filter: Some(vec!["wiki_search".into()]),
+                tool_filter: Some(vec!["example_tool".into()]),
             }
         );
     }

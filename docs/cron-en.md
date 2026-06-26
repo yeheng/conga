@@ -267,19 +267,13 @@ send to user in a friendly tone.
 ```mermaid
 flowchart TB
     subgraph System Maintenance Tasks
-        T1[Every 6 hours<br/>Refresh memory index]
-        T2[Every 6 hours<br/>Clean expired memory]
         T3[Every hour<br/>Check cron config updates]
     end
 
-    T1 --> M[Memory System]
-    T2 --> M
     T3 --> C[Cron Service]
 ```
 
 These tasks **execute tools directly**, bypassing AI, zero cost:
-- `system-wiki-decay`: Clean expired wiki knowledge
-- `system-wiki-refresh`: Refresh wiki index
 - `system-cron-refresh`: Reload task configuration
 
 ### Scenario 3: Missed Task Catch-up

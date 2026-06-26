@@ -70,7 +70,6 @@ pub async fn cmd_gateway() -> Result<()> {
 
     let workspace =
         gasket_engine::tools::resolve_exec_workspace(&config, std::path::Path::new("."));
-    let (page_store, page_index) = setup_wiki(&sqlite_store, &workspace, broker.clone()).await;
     let cron_sqlite_store = SqliteStore::new()
         .await
         .expect("Failed to open SQLite store for cron persistence");
@@ -105,8 +104,6 @@ pub async fn cmd_gateway() -> Result<()> {
         vault,
         &workspace,
         &sqlite_store,
-        page_store.clone(),
-        page_index.clone(),
         &cron_service,
         approval_callback,
     )
@@ -147,46 +144,6 @@ pub async fn cmd_gateway() -> Result<()> {
     setup_http_server(&providers, &agent, &dispatcher, &mut tasks).await;
     setup_broker_pipeline(broker.clone(), &providers, &agent, &dispatcher, &mut tasks);
     start_heartbeat_service(broker.clone(), &workspace, &mut tasks);
-    // Spawn wiki indexing service to auto-update Tantivy + vectors on WikiChanged events
-    if let (Some(ref ps), Some(ref pi)) = (&page_store, &page_index) {
-        #[allow(unused_mut)]
-        let mut svc = gasket_engine::wiki::WikiIndexingService::new(ps.clone(), pi.clone());
-
-        // Attach semantic search if embedding is configured.
-        #[cfg(feature = "embedding")]
-        if let Some(ref emb_cfg) = config.embedding {
-            if let Ok(provider) = emb_cfg.provider.build() {
-                let dim = provider.dim();
-                let provider: Arc<dyn gasket_engine::embedding::EmbeddingProvider> =
-                    Arc::from(provider);
-                match gasket_engine::embedding::vector_store::build_vector_store(
-                    &emb_cfg.vector_store,
-                    dim,
-                    Some(&sqlite_store.pool()),
-                )
-                .await
-                {
-                    Ok(vstore) => {
-                        use gasket_engine::tools::{WikiEmbeddingAdapter, WikiVectorAdapter};
-                        svc = svc.with_semantic(
-                            Arc::new(WikiEmbeddingAdapter::new(provider)),
-                            Arc::new(WikiVectorAdapter::new(vstore)),
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to build wiki vector store: {}", e);
-                    }
-                }
-            }
-        }
-
-        if let Ok(sub) = broker
-            .subscribe(&gasket_engine::broker::Topic::WikiChanged)
-            .await
-        {
-            tasks.push(svc.spawn(sub));
-        }
-    }
     cron_service.ensure_system_cron_jobs().await;
     start_cron_checker(
         broker.clone(),
@@ -270,55 +227,11 @@ fn warn_disabled_features(channels: &gasket_types::channel_config::ChannelsConfi
     }
 }
 
-async fn setup_wiki(
-    sqlite_store: &Arc<SqliteStore>,
-    workspace: &std::path::PathBuf,
-    broker: Arc<gasket_engine::broker::MemoryBroker>,
-) -> (
-    Option<gasket_engine::wiki::PageStore>,
-    Option<Arc<gasket_engine::wiki::PageIndex>>,
-) {
-    let pool = sqlite_store.pool();
-    let wiki_root = workspace.join("wiki");
-    if !wiki_root.exists() {
-        return (None, None);
-    }
-    let (wiki_changed_tx, mut wiki_changed_rx) = tokio::sync::mpsc::channel(64);
-    let ps = gasket_engine::wiki::PageStore::new(pool.clone(), wiki_root.clone())
-        .with_wiki_changed_tx(wiki_changed_tx);
-    tokio::spawn(async move {
-        while let Some(path) = wiki_changed_rx.recv().await {
-            let envelope = gasket_engine::broker::Envelope::new(
-                gasket_engine::broker::Topic::WikiChanged,
-                gasket_engine::broker::BrokerPayload::WikiChanged { path },
-            );
-            let _ = broker.try_publish(envelope);
-        }
-    });
-    if let Err(e) = ps.init_dirs().await {
-        tracing::warn!("Failed to init wiki dirs: {}", e);
-    }
-    if let Err(e) = gasket_engine::create_wiki_tables(&pool).await {
-        tracing::warn!("Failed to create wiki tables: {}", e);
-    }
-    let tantivy_dir = wiki_root.join(".tantivy");
-    let pi = match gasket_storage::wiki::TantivyPageIndex::open(tantivy_dir) {
-        Ok(idx) => Some(Arc::new(gasket_engine::wiki::PageIndex::new(Arc::new(idx)))),
-        Err(e) => {
-            tracing::warn!("Tantivy index open failed, search disabled: {}", e);
-            None
-        }
-    };
-    (Some(ps), pi)
-}
-
 async fn setup_agent_pipeline(
     config: &gasket_engine::config::Config,
     vault: Option<Arc<gasket_engine::vault::VaultStore>>,
     workspace: &std::path::PathBuf,
     sqlite_store: &Arc<SqliteStore>,
-    page_store: Option<gasket_engine::wiki::PageStore>,
-    page_index: Option<Arc<gasket_engine::wiki::PageIndex>>,
     cron_service: &Arc<CronService>,
     approval_callback: Option<Arc<dyn gasket_types::ApprovalCallback>>,
 ) -> Result<(
@@ -382,8 +295,6 @@ async fn setup_agent_pipeline(
     let orchestrator_tools = build_tool_registry(ToolRegistryConfig {
         subagent_spawner: None,
         extra_tools: vec![],
-        page_store: page_store.clone(),
-        page_index: page_index.clone(),
         provider: Some(provider_info.provider.clone()),
         model: Some(provider_info.model.clone()),
         #[cfg(feature = "embedding")]
@@ -394,8 +305,6 @@ async fn setup_agent_pipeline(
     let worker_tools = build_tool_registry(ToolRegistryConfig {
         subagent_spawner: None,
         extra_tools: vec![],
-        page_store: page_store.clone(),
-        page_index: page_index.clone(),
         provider: Some(provider_info.provider.clone()),
         model: Some(provider_info.model.clone()),
         #[cfg(feature = "embedding")]

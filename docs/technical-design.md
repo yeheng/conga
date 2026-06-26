@@ -36,7 +36,7 @@ flowchart TB
 
     subgraph Engine["核心引擎层 (Engine)"]
         SESS["Session<br/>状态管理"] --> KERN["Kernel<br/>LLM 循环"] --> TOOL["Tools<br/>工具执行"]
-        HOOK["Hooks<br/>生命周期"] ~~~ WIKI["Wiki<br/>知识系统"] ~~~ SKILL["Skills<br/>技能系统"]
+        HOOK["Hooks<br/>生命周期"] ~~~ SKILL["Skills<br/>技能系统"]
     end
 
     subgraph Infra["基础设施层"]
@@ -59,7 +59,7 @@ flowchart TB
 | Crate | 职责 | 关键模块 |
 |-------|------|----------|
 | `gasket-types` | 核心类型定义 | `SessionKey`, `SessionEvent`, `EventType` |
-| `gasket-storage` | 持久化层 | `EventStore`, `SqliteStore`, `processor`, `query`, `wiki` |
+| `gasket-storage` | 持久化层 | `EventStore`, `SqliteStore`, `processor`, `query` |
 | `gasket-providers` | LLM  Provider 抽象 | `LlmProvider`, `OpenAICompatibleProvider` |
 | `gasket-channels` | 渠道适配器 | `Channel`, `InboundMessage`, `OutboundMessage` |
 | `gasket-broker` | 消息总线 | `Router`, `Session`, `Outbound` Actors |
@@ -554,11 +554,7 @@ pub trait PipelineHook: Send + Sync {
 }
 ```
 
-### 5.2 Memory 系统
-
-> **⚠️ 已废弃**: Memory 系统已被 Wiki 知识系统取代。见 [architecture.md](architecture.md) 和 [modules.md](modules.md) 中的 Wiki 部分。
-
-### 5.3 Cron 系统
+### 5.2 Cron 系统
 
 ```rust
 /// Cron 任务定义（文件存储）
@@ -848,7 +844,6 @@ pub struct AgentSession {
     hooks: Arc<HookRegistry>,              // 共享
     compactor: Option<Arc<ContextCompactor>>, // 共享
     indexing_service: Option<Arc<IndexingService>>, // 共享
-    wiki: Option<WikiComponents>,         // Wiki 知识系统
 }
 
 /// 2. 流式处理避免内存拷贝

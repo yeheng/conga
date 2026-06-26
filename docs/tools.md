@@ -72,11 +72,6 @@ mindmap
       网页获取
     系统命令
       执行Shell
-    知识库 (Wiki)
-      搜索Wiki
-      读写Wiki
-      衰减与刷新
-      搜索SOP
     历史查询
       关键词搜索
       语义搜索
@@ -250,48 +245,6 @@ sequenceDiagram
 - `history_query` - 按关键词查询当前会话的对话历史（SQLite 本地搜索）
 - `history_search` - 语义搜索历史对话（需要 `embedding` 特性）
 
-### 4.1 Wiki 知识工具
-
-让 AI 能读写和检索结构化知识库（基于 Tantivy BM25 全文搜索 + SQLite 存储）：
-
-```mermaid
-sequenceDiagram
-    participant U as 用户
-    participant AI as AI
-    participant W as Wiki工具
-    participant Store as SQLite + Tantivy
-
-    U->>AI: 查一下关于Rust所有权的信息
-
-    AI->>W: wiki_search("Rust所有权")
-    W->>Store: Tantivy BM25 搜索
-    Store-->>W: 匹配的Wiki页面
-    W-->>AI: 搜索结果列表
-
-    AI->>W: wiki_read("rust/ownership")
-    W->>Store: 读取页面详情
-    Store-->>W: 完整Markdown内容
-    W-->>AI: 页面内容
-
-    AI-->>U: 根据Wiki知识库，Rust所有权的核心概念是...
-
-    U->>AI: 把这个总结写到知识库里
-    AI->>W: wiki_write("rust/summary", ...)
-    W->>Store: 写入页面 + 更新索引
-    Store-->>W: 保存成功
-    W-->>AI: 页面已创建
-```
-
-**包含的工具：**
-
-- `wiki_search` (`WikiSearchTool`) - 使用 Tantivy BM25 搜索 Wiki 页面。参数：`query`（必填，搜索关键词），`limit`（可选，默认 10）。返回格式化的搜索结果。
-- `wiki_write` (`WikiWriteTool`) - 写入/更新 Wiki 页面。参数：`path`、`title`、`content`（必填），`page_type`（可选，默认 `"topic"`），`tags`（可选，数组）。
-- `wiki_read` (`WikiReadTool`) - 按路径读取 Wiki 页面。参数：`path`（必填）。返回完整 Markdown 内容及元数据。
-- `wiki_decay` (`WikiDecayTool`) - 运行自动化频率衰减，零 LLM 消耗。返回扫描/衰减/错误的页面统计。
-- `wiki_refresh` (`WikiRefreshTool`) - 将磁盘 Markdown 文件同步到 SQLite 和 Tantivy。参数：`action` - `"sync"`（增量同步）、`"reindex"`（完全重建）、`"stats"`（统计信息）。
-- `wiki_delete` (`WikiDeleteTool`) - 删除 Wiki 页面。参数：`path`（必填）。**需要审批**。
-- `search_sops` (`SearchSopsTool`) - 搜索 SOP（标准操作流程）页面。参数：`query`（必填）。
-
 ### 5. 子代理工具
 
 让 AI 能创建"分身"处理复杂任务，支持**实时流式事件**和**模型选择**：
@@ -361,7 +314,6 @@ sequenceDiagram
 ### 8. 系统工具
 
 - `create_plan` (`CreatePlanTool`) - 创建执行计划。需要 LLM provider。参数：`goal`（必填）。
-- `evolution` (`EvolutionTool`) - 从对话中提取记忆并保存到 Wiki。自动触发，零用户干预。
 
 ### 工具执行签名
 
@@ -414,21 +366,19 @@ flowchart TB
         R --> T2[网络工具]
         R --> T3[Shell工具]
         R --> T4[记忆工具]
-        R --> T4a[Wiki知识工具]
         R --> T5[子代理工具]
         R --> T6[定时任务]
         R --> T7[历史查询]
         R --> T8[外部脚本]
     end
-    
+
     AI[AI大脑] --> R
-    
+
     AI -->|需要查资料| T2
     AI -->|需要改文件| T1
     AI -->|需要执行命令| T3
     AI -->|需要查历史| T7
     AI -->|需要扩展功能| T8
-    AI -->|需要查知识库| T4a
 ```
 
 ### 语义路由
@@ -444,7 +394,6 @@ flowchart TB
     Understand -->|运行测试| Shell[命令执行]
     Understand -->|查历史| History[历史查询]
     Understand -->|任务太复杂| Subagent[创建子代理]
-    Understand -->|查知识库| Wiki[Wiki搜索]
     Understand -->|重新开始| Session[新会话]
     
     style Understand fill:#FFD700
@@ -620,7 +569,6 @@ sequenceDiagram
 | `exec` | 系统 | 执行 Shell 命令 |
 | `new_session` | 会话 | 清空历史并新建会话 |
 | `clear_session` | 会话 | 清空当前会话历史 |
-| `wiki_delete` | Wiki | 删除 Wiki 页面 |
 
 **记住决策**：在 WebSocket 前端可以勾选"记住此决定"，同一会话中再次调用相同工具时将自动通过/拒绝。
 
@@ -629,11 +577,10 @@ sequenceDiagram
 以下只读工具无需确认，直接执行：
 
 - `read_file`, `list_dir`, `web_search`, `web_fetch`
-- `wiki_search`, `wiki_read`, `wiki_write`, `wiki_decay`, `wiki_refresh`, `search_sops`
 - `history_query`, `history_search`（需 embedding 特性）
 - `spawn`, `spawn_parallel`
 - `ask_user`, `message`
-- `create_plan`, `evolution`
+- `create_plan`
 
 ---
 

@@ -15,7 +15,6 @@ pub mod registry;
 mod status;
 mod tool;
 pub mod vault;
-mod wiki;
 
 pub use agent::cmd_agent;
 pub use auth::cmd_auth_copilot;
@@ -32,10 +31,6 @@ pub use tool::cmd_tool_execute;
 pub use vault::{
     cmd_vault_delete, cmd_vault_export, cmd_vault_get, cmd_vault_import, cmd_vault_list,
     cmd_vault_rekey, cmd_vault_set, cmd_vault_show,
-};
-pub use wiki::{
-    cmd_wiki_delete, cmd_wiki_ingest, cmd_wiki_init, cmd_wiki_lint, cmd_wiki_list,
-    cmd_wiki_migrate, cmd_wiki_search, cmd_wiki_stats,
 };
 
 /// Show session token usage and cost statistics

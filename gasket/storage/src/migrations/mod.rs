@@ -104,8 +104,6 @@ const INCREMENTAL_SCHEMA: &[&str] = &[
     "ALTER TABLE session_events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE session_summaries ADD COLUMN compaction_in_progress INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE session_summaries ADD COLUMN compaction_started_at TEXT",
-    "ALTER TABLE wiki_pages ADD COLUMN sync_sequence INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE wiki_pages ADD COLUMN summary TEXT",
 ];
 
 /// Run all migrations on an existing pool.

@@ -198,50 +198,11 @@ impl IndexLock {
 
 ---
 
-## 8. 与 Wiki 模块的集成
-
-Wiki 模块 (`engine/src/wiki/`) 使用 Tantivy 的方式与 CLI 工具不同：
-
-### Wiki 的 TantivyIndex (`engine/src/wiki/query/tantivy_adapter.rs`)
-
-Wiki 有自己独立的 `TantivyIndex` 实现，针对 wiki 页面优化：
-
-**Schema 字段：**
-- `path` (STRING) - 文档标识
-- `title` (TEXT) - BM25 分词
-- `content` (TEXT) - BM25 分词
-- `page_type` (STRING) - 按 Entity/Topic/Source 过滤
-- `category` (STRING) - 可选类别过滤
-- `tags` (STRING, 多值) - 标签过滤
-- `confidence` (F64) - 相关性提升元数据
-
-### Wiki vs CLI 对比
-
-| 方面 | CLI (`gasket-tantivy`) | Wiki (`engine/wiki`) |
-|------|------------------------|---------------------|
-| 用途 | 通用多索引 CLI 工具 | Wiki 专用 BM25 搜索 |
-| Schema | 用户定义字段 schema | 固定 wiki page schema |
-| 线程安全 | 文件锁 (CLI 进程) | `parking_lot::Mutex` (写锁) |
-| TTL | 支持 | 不支持 |
-| 批量操作 | 全量批量 + 并行选项 | 单次 upsert |
-| 查询类型 | BM25 + 过滤 + 高亮 | BM25 + 类型过滤 + 标签过滤 |
-
-### Wiki 三阶段查询管道
-
-```
-Phase 1: Tantivy BM25 → top-50 候选
-Phase 2: Reranker → 组合分数 (BM25 + confidence + recency)
-Phase 3: Budget-aware → 从 SQLite 加载完整页面
-```
-
----
-
-## 9. 配置与使用
+## 8. 配置与使用
 
 **默认索引目录：**
 ```
 ~/.gasket/tantivy/           # CLI 索引
-~/.gasket/wiki/.tantivy/     # Wiki 搜索索引
 ```
 
 **使用示例：**
@@ -265,7 +226,7 @@ cargo run -- index rebuild --name myIndex \
 
 ---
 
-## 10. 文件索引
+## 9. 文件索引
 
 | 功能 | 文件路径 |
 |------|----------|
@@ -278,4 +239,3 @@ cargo run -- index rebuild --name myIndex \
 | 搜索类型 | `tantivy/src/index/search.rs` |
 | 文件锁 | `tantivy/src/index/lock.rs` |
 | 维护操作 | `tantivy/src/maintenance/*.rs` |
-| Wiki Tantivy 适配器 | `engine/src/wiki/query/tantivy_adapter.rs` |

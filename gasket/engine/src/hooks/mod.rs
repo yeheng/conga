@@ -26,7 +26,6 @@ mod external;
 mod registry;
 mod types;
 mod vault;
-pub mod wiki_lint;
 
 pub use external::{ExternalHookInput, ExternalHookOutput, ExternalHookRunner, ExternalShellHook};
 pub use registry::{HookBuilder, HookRegistry, PipelineHook};

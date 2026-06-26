@@ -252,19 +252,13 @@ to: "用户ID"
 ```mermaid
 flowchart TB
     subgraph 系统维护任务
-        T1[每3小时<br/>刷新记忆索引]
-        T2[每6小时<br/>清理过期记忆]
         T3[每小时<br/>检查cron配置更新]
     end
-    
-    T1 --> M[记忆系统]
-    T2 --> M
+
     T3 --> C[Cron服务]
 ```
 
 这些任务**直接执行工具**，不经过 AI，零成本：
-- `wiki_refresh`：刷新知识库索引
-- `wiki_decay`：清理过期知识
 - `cron refresh`：重新加载任务配置
 
 ### 场景3：错过的任务补执行

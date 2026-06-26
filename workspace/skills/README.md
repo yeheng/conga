@@ -37,4 +37,3 @@ When adding a new skill, follow these steps:
 | [summarize](summarize/SKILL.md) | Text summarization |
 | [tmux](tmux/SKILL.md) | Terminal multiplexer management |
 | [weather](weather/SKILL.md) | Weather information |
-| [wiki](wiki/SKILL.md) | Wiki knowledge management |

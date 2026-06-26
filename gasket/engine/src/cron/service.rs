@@ -307,20 +307,6 @@ impl CronService {
     pub async fn ensure_system_cron_jobs(&self) {
         let system_jobs = [
             (
-                "system-wiki-decay",
-                "Wiki Decay",
-                "0 0 */6 * * * *",
-                Some("wiki_decay".to_string()),
-                None,
-            ),
-            (
-                "system-wiki-refresh",
-                "Wiki Refresh",
-                "0 0 */3 * * * *",
-                Some("wiki_refresh".to_string()),
-                Some(serde_json::json!({"action": "sync"})),
-            ),
-            (
                 "system-cron-refresh",
                 "Cron Reload",
                 "0 0 * * * * *",

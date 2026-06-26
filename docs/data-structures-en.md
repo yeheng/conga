@@ -475,99 +475,7 @@ ProcessedHistory {
 
 ---
 
-## 5. Wiki Data Structures
-
-> **Note**: The following structures are defined in the `gasket-storage::wiki` module.
-
-### 5.1 WikiPageInput
-
-> **Source**: `gasket-storage::wiki::page_store`
-
-Input structure for creating or updating Wiki pages.
-
-```rust
-WikiPageInput<'a> {
-    path: &'a Path,                       // Page path
-    title: String,                        // Page title
-    page_type: PageType,                 // Page type
-    content: String,                      // Markdown content
-    source: Option<WikiSourceInput>,      // Source information
-}
-```
-
-### 5.2 TokenBudget
-
-> **Source**: `gasket-storage::wiki::types`
-
-Token budget configuration for wiki context injection. Defines the maximum token budget for different phases of context loading.
-
-```rust
-TokenBudget {
-    bootstrap: usize,                     // Phase 1 budget (profile + hot pages, default 1500)
-    scenario: usize,                      // Phase 2 budget (scenario search results, default 1500)
-    on_demand: usize,                     // Phase 3 budget (on-demand semantic search fill, default 1000)
-    total_cap: usize,                     // Total cap (default 4000)
-}
-// Total budget = min(total_cap, bootstrap + scenario + on_demand)
-```
-
-### 5.3 Frequency
-
-> **Source**: `gasket-storage::wiki::types`
-
-Wiki page access frequency classification. Tracks how recently and often a page is accessed, influencing retention decisions and retrieval ordering. Higher frequency pages are prioritized in search results and protected from cleanup.
-
-```rust
-enum Frequency {
-    Hot,       // Frequently accessed (within 24 hours), rank = 3
-    Warm,      // Moderately accessed (within 7 days), rank = 2
-    Cold,      // Rarely accessed (within 30 days), rank = 1
-    Archived,  // Not accessed recently (older than 30 days), rank = 0, default
-}
-// Implements: Display, FromStr, Ord, Default (defaults to Archived)
-```
-
-### 5.4 DecayCandidate
-
-> **Source**: `gasket-storage::wiki::page_store`
-
-Candidate page for frequency decay. Used in wiki page lifecycle management for automatic decay operations.
-
-```rust
-DecayCandidate {
-    path: String,                         // Wiki page path (primary key)
-    frequency: Frequency,                 // Current frequency tier
-    last_accessed: String,                // Last access timestamp (RFC 3339)
-}
-```
-
-### 5.8 WikiPageInput
-
-> **Source**: `gasket-storage::wiki::page_store`
-
-Input struct for upserting a wiki page. Used for atomic SQLite UPSERT operations.
-
-```rust
-WikiPageInput<'a> {
-    path: &'a str,                        // Page path (primary key)
-    title: &'a str,                       // Page title
-    page_type: &'a str,                   // Page type
-    category: Option<&'a str>,            // Optional category
-    tags: &'a str,                        // Tags (JSON array string)
-    content: &'a str,                     // Markdown body
-    source_count: u32,                    // Source document count
-    confidence: f64,                      // Confidence score (0.0–1.0)
-    checksum: Option<&'a str>,            // Content checksum
-    frequency: Frequency,                 // Access frequency tier
-    access_count: u64,                    // Cumulative access count
-    last_accessed: Option<String>,        // Last access timestamp (RFC 3339)
-    file_mtime: i64,                      // Disk file modification time (Unix epoch seconds)
-}
-```
-
----
-
-## 6. Vault Data Structures
+## 5. Vault Data Structures
 
 ### 6.1 VaultEntryV2
 
@@ -609,7 +517,7 @@ InjectionReport {
 
 ---
 
-## 7. SQLite Database Structure
+## 6. SQLite Database Structure
 
 ```
 ~/.gasket/gasket.db  (SqliteStore — sqlx::SqlitePool)
@@ -664,55 +572,6 @@ InjectionReport {
 │   ├── embedding BLOB       f32 vector
 │   └── created_at TEXT
 │
-│  ─── Wiki Knowledge System ───
-│
-├── wiki_pages               Wiki pages (single source of truth, content in SQLite)
-│   ├── path TEXT PK         Page path (primary key)
-│   ├── title TEXT NOT NULL  Page title
-│   ├── type TEXT NOT NULL   Page type
-│   ├── category TEXT        Optional category
-│   ├── tags TEXT            Tags (JSON array)
-│   ├── content TEXT         Markdown body
-│   ├── created TEXT NOT NULL
-│   ├── updated TEXT NOT NULL
-│   ├── source_count INTEGER DEFAULT 0   Source document count
-│   ├── confidence REAL DEFAULT 1.0      Confidence score
-│   ├── checksum TEXT        Content checksum
-│   ├── frequency TEXT DEFAULT 'warm'     "hot" | "warm" | "cold" | "archived"
-│   ├── access_count INTEGER DEFAULT 0   Access count
-│   ├── last_accessed TEXT   Last access timestamp
-│   └── file_mtime INTEGER   Disk file modification time (Unix epoch seconds)
-│   Indexes: idx_wiki_pages_type, idx_wiki_pages_category,
-│            idx_wiki_pages_updated, idx_wiki_pages_frequency,
-│            idx_wiki_pages_last_accessed
-│
-├── raw_sources              Raw source documents
-│   ├── id TEXT PK           Source ID
-│   ├── path TEXT NOT NULL   File path
-│   ├── format TEXT NOT NULL File format
-│   ├── ingested INTEGER DEFAULT 0       Whether ingested
-│   ├── ingested_at TEXT     Ingestion timestamp
-│   ├── title TEXT           Title
-│   ├── metadata TEXT        Metadata (JSON)
-│   └── created TEXT NOT NULL
-│   Index: idx_raw_sources_ingested
-│
-├── wiki_relations           Wiki page relations
-│   ├── from_page TEXT NOT NULL
-│   ├── to_page TEXT NOT NULL
-│   ├── relation TEXT NOT NULL           Relation type
-│   ├── confidence REAL DEFAULT 1.0      Confidence score
-│   ├── created TEXT NOT NULL
-│   └── PRIMARY KEY (from_page, to_page, relation)
-│
-├── wiki_log                 Wiki operation log
-│   ├── id INTEGER PK AUTOINCREMENT
-│   ├── action TEXT NOT NULL             Action type
-│   ├── target TEXT          Action target
-│   ├── detail TEXT          Action details
-│   └── created TEXT NOT NULL DEFAULT (datetime('now'))
-│   Index: idx_wiki_log_action
-│
 │  ─── General Storage ───
 │
 ├── kv_store                 Key-value pairs
@@ -754,7 +613,7 @@ Compaction path:
 
 ---
 
-## 8. File System Storage Structure
+## 7. File System Storage Structure
 
 ```
 ~/.gasket/                 Workspace root directory

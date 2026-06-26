@@ -6,35 +6,28 @@
 
 ## 目录
 
-1. [Memory 模块](#1-memory-模块)
-2. [History 模块](#2-history-模块)
-3. [Cron 模块](#3-cron-模块)
-4. [Kernel 模块](#4-kernel-模块)
-5. [Session 模块](#5-session-模块)
-6. [Bus 模块](#6-bus-模块)
-7. [Types 模块](#7-types-模块)
-8. [Storage 模块](#8-storage-模块)
-9. [Providers 模块](#9-providers-模块)
-10. [CLI 模块](#10-cli-模块)
-11. [Sandbox 模块](#11-sandbox-模块)
-12. [Subagent 模块](#12-subagent-模块)
-13. [Skills 模块](#13-skills-模块)
-14. [Vault 模块](#14-vault-模块)
-15. [Tools 模块](#15-tools-模块)
-16. [Hooks 模块](#16-hooks-模块)
-17. [Heartbeat 模块](#17-heartbeat-模块)
+1. [History 模块](#1-history-模块)
+2. [Cron 模块](#2-cron-模块)
+3. [Kernel 模块](#3-kernel-模块)
+4. [Session 模块](#4-session-模块)
+5. [Bus 模块](#5-bus-模块)
+6. [Types 模块](#6-types-模块)
+7. [Storage 模块](#7-storage-模块)
+8. [Providers 模块](#8-providers-模块)
+9. [CLI 模块](#9-cli-模块)
+10. [Sandbox 模块](#10-sandbox-模块)
+11. [Subagent 模块](#11-subagent-模块)
+12. [Skills 模块](#12-skills-模块)
+13. [Vault 模块](#13-vault-模块)
+14. [Tools 模块](#14-tools-模块)
+15. [Hooks 模块](#15-hooks-模块)
+16. [Heartbeat 模块](#16-heartbeat-模块)
 
 ---
 
-## 1. Memory 模块
+## 1. History 模块
 
-> **⚠️ 已废弃**: Memory 模块已被 Wiki 知识系统取代。详细说明见 [architecture.md](architecture.md) 和 [modules.md](modules.md) 中的 Wiki 部分。
-
----
-
-## 2. History 模块
-
-### 2.1 事件溯源架构
+### 1.1 事件溯源架构
 
 History 模块基于**事件溯源（Event Sourcing）**模式：
 
@@ -63,7 +56,7 @@ History 模块基于**事件溯源（Event Sourcing）**模式：
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 事件类型
+### 1.2 事件类型
 
 ```rust
 pub enum EventType {
@@ -102,7 +95,7 @@ pub struct EventMetadata {
 }
 ```
 
-### 2.3 上下文构建流程
+### 1.3 上下文构建流程
 
 ```rust
 pub struct ContextBuilder {
@@ -156,7 +149,7 @@ impl ContextBuilder {
 }
 ```
 
-### 2.4 Token 感知历史处理
+### 1.4 Token 感知历史处理
 
 ```rust
 pub fn process_history(events: Vec<SessionEvent>, config: &HistoryConfig) -> ProcessedHistory {
@@ -193,7 +186,7 @@ pub fn process_history(events: Vec<SessionEvent>, config: &HistoryConfig) -> Pro
 }
 ```
 
-### 2.5 摘要机制
+### 1.5 摘要机制
 
 ```rust
 pub struct ContextCompactor {
@@ -251,9 +244,9 @@ impl ContextCompactor {
 
 ---
 
-## 3. Cron 模块
+## 2. Cron 模块
 
-### 3.1 混合架构设计
+### 2.1 混合架构设计
 
 Cron 采用**文件 + 数据库**的混合架构：
 
@@ -277,7 +270,7 @@ Cron 采用**文件 + 数据库**的混合架构：
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 核心数据结构
+### 2.2 核心数据结构
 
 ```rust
 /// Cron 任务定义
@@ -310,7 +303,7 @@ struct CronJobFrontmatter {
 }
 ```
 
-### 3.3 任务执行流程
+### 2.3 任务执行流程
 
 ```rust
 impl CronService {
@@ -378,7 +371,7 @@ impl CronService {
 }
 ```
 
-### 3.4 热重载机制
+### 2.4 热重载机制
 
 ```rust
 impl CronService {
@@ -438,27 +431,13 @@ impl CronService {
 }
 ```
 
-### 3.5 系统任务
+### 2.5 系统任务
 
 ```rust
 impl CronService {
     /// 确保系统维护任务存在
     pub async fn ensure_system_cron_jobs(&self) {
         let system_jobs = [
-            (
-                "system-wiki-decay",
-                "Wiki Decay",
-                "0 0 */6 * * * *", // 每 6 小时
-                Some("wiki_decay".to_string()),
-                None,
-            ),
-            (
-                "system-wiki-refresh",
-                "Wiki Refresh",
-                "0 0 */3 * * * *", // 每 3 小时
-                Some("wiki_refresh".to_string()),
-                Some(json!({"action": "sync"})),
-            ),
             (
                 "system-cron-refresh",
                 "Cron Reload",
@@ -485,9 +464,9 @@ impl CronService {
 
 ---
 
-## 4. Kernel 模块
+## 3. Kernel 模块
 
-### 4.1 纯函数设计
+### 3.1 纯函数设计
 
 Kernel 是**纯函数式**的 LLM 执行核心：
 
@@ -515,7 +494,7 @@ Kernel 是**纯函数式**的 LLM 执行核心：
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 核心数据结构
+### 3.2 核心数据结构
 
 ```rust
 /// 运行时上下文
@@ -550,7 +529,7 @@ pub struct ExecutionResult {
 }
 ```
 
-### 4.3 执行循环
+### 3.3 执行循环
 
 ```rust
 pub struct AgentExecutor<'a> {
@@ -606,7 +585,7 @@ impl<'a> AgentExecutor<'a> {
 }
 ```
 
-### 4.4 单轮处理
+### 3.4 单轮处理
 
 ```rust
 async fn process_iteration(
@@ -650,7 +629,7 @@ async fn process_iteration(
 }
 ```
 
-### 4.5 工具并行执行
+### 3.5 工具并行执行
 
 ```rust
 async fn handle_tool_calls(
@@ -718,7 +697,7 @@ async fn handle_tool_calls(
 }
 ```
 
-### 4.6 指数退避重试
+### 3.6 指数退避重试
 
 ```rust
 impl RequestHandler<'_> {
@@ -749,9 +728,9 @@ impl RequestHandler<'_> {
 
 ---
 
-## 5. Session 模块
+## 4. Session 模块
 
-### 5.1 职责分离
+### 4.1 职责分离
 
 Session 是**有状态**的 orchestration 层，Kernel 是**纯函数**的执行层：
 
@@ -777,7 +756,7 @@ Session 是**有状态**的 orchestration 层，Kernel 是**纯函数**的执行
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 核心数据结构
+### 4.2 核心数据结构
 
 ```rust
 pub struct AgentSession {
@@ -803,7 +782,7 @@ pub struct AgentResponse {
 }
 ```
 
-### 5.3 请求处理流程
+### 4.3 请求处理流程
 
 ```rust
 impl AgentSession {
@@ -852,7 +831,7 @@ impl AgentSession {
 }
 ```
 
-### 5.4 后处理流程
+### 4.4 后处理流程
 
 ```rust
 async fn finalize_response(
@@ -895,7 +874,7 @@ async fn finalize_response(
 }
 ```
 
-### 5.5 优雅关闭
+### 4.5 优雅关闭
 
 ```rust
 impl AgentSession {
@@ -918,11 +897,11 @@ impl AgentSession {
 
 ---
 
-## 6. Broker 模块
+## 5. Broker 模块
 
 > **注意**: 原 `bus/` crate 已重命名为 `broker/`
 
-### 6.1 Actor 模型架构
+### 5.1 Actor 模型架构
 
 Bus 模块实现三 Actor 管道，**零锁设计**：
 
@@ -957,7 +936,7 @@ InboundMessage
 └─────────────────┘
 ```
 
-### 6.2 核心 Actor 实现
+### 5.2 核心 Actor 实现
 
 ```rust
 // ── Router Actor ─────────────────────────────────────────
@@ -1079,7 +1058,7 @@ pub async fn run_outbound_actor(
 }
 ```
 
-### 6.3 流式消息处理
+### 5.3 流式消息处理
 
 ```rust
 async fn process_streaming_message<H>(
@@ -1138,9 +1117,9 @@ fn stream_event_to_ws_message(event: StreamEvent) -> Option<WebSocketMessage> {
 
 ---
 
-## 7. Types 模块
+## 6. Types 模块
 
-### 7.1 架构概述
+### 6.1 架构概述
 
 Types 是整个 Gasket 系统的**基础类型层**，提供跨 Crate 共享的核心类型定义，避免循环依赖：
 
@@ -1162,7 +1141,7 @@ Types 是整个 Gasket 系统的**基础类型层**，提供跨 Crate 共享的�
 
 **设计决策**: Types 不依赖任何业务 Crate，仅依赖通用库（serde, uuid, chrono, tokio）。
 
-### 7.2 会话标识
+### 6.2 会话标识
 
 ```rust
 /// 强类型会话标识 (channel:chat_id 格式)
@@ -1188,7 +1167,7 @@ pub enum ChannelType {
 }
 ```
 
-### 7.3 事件溯源类型
+### 6.3 事件溯源类型
 
 ```rust
 /// 不可变事件记录
@@ -1225,7 +1204,7 @@ pub enum EventType {
 }
 ```
 
-### 7.4 流式事件类型
+### 6.4 流式事件类型
 
 ```rust
 /// 统一流式事件 - 处理所有实时通信
@@ -1256,7 +1235,7 @@ pub enum StreamEvent {
 
 **设计决策**: `agent_id: Option<String>` 字段统一区分主 Agent 和子 Agent 的事件，避免类型爆炸。
 
-### 7.5 Token 追踪
+### 6.5 Token 追踪
 
 ```rust
 /// Token 使用量
@@ -1277,7 +1256,7 @@ pub struct TokenTracker {
 }
 ```
 
-### 7.6 工具上下文
+### 6.6 工具上下文
 
 ```rust
 /// 工具执行上下文 - 传递运行时依赖
@@ -1302,9 +1281,9 @@ pub trait SubagentSpawner: Send + Sync {
 
 ---
 
-## 8. Storage 模块
+## 7. Storage 模块
 
-### 8.1 架构概述
+### 7.1 架构概述
 
 Storage 是 Gasket 的**持久化层**，采用 SQLite + 文件系统混合架构：
 
@@ -1313,23 +1292,18 @@ Storage 是 Gasket 的**持久化层**，采用 SQLite + 文件系统混合架�
 │                        Storage Crate                             │
 │                                                                  │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────────────────┐ │
-│  │ SqliteStore  │ │ EventStore   │ │ Wiki Module              │ │
-│  │ (连接池管理)  │ │ (事件溯源)   │ │ (wiki/page_store/tables/ │ │
-│  └──────┬───────┘ └──────┬───────┘ │  types)                  │ │
-│         │                │         └──────────┬───────────────┘ │
-│  ┌──────┴───────┐                  │          │                 │
-│  │ MetadataStore│                  │          │                 │
-│  │ (记忆元数据)  │                  │          │                 │
-│  └──────────────┘                  │          │                 │
-│                                    │          │                 │
-│  ┌──────────────┐ ┌──────────────┐ │ ┌────────┴───────────────┐ │
-│  │ query.rs     │ │ processor.rs │ │ │  search/               │ │
-│  │ (多维查询)    │ │ (历史处理)   │ │ │  (全文检索)            │ │
-│  └──────────────┘ └──────────────┘ │ └────────────────────────┘ │
+│  │ SqliteStore  │ │ EventStore   │ │  MetadataStore           │ │
+│  │ (连接池管理)  │ │ (事件溯源)   │ │  (记忆元数据)            │ │
+│  └──────┬───────┘ └──────┬───────┘ └──────────────────────────┘ │
+│         │                │                                        │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────────────────┐ │
+│  │ query.rs     │ │ processor.rs │ │  search/                 │ │
+│  │ (多维查询)    │ │ (历史处理)   │ │  (全文检索)              │ │
+│  └──────────────┘ └──────────────┘ └──────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.2 SQLite Schema
+### 7.2 SQLite Schema
 
 ```sql
 -- 会话表 (v2 多分支支持)
@@ -1412,7 +1386,7 @@ CREATE TABLE kv_store (
 | `idx_events_session_sequence` | `(session_key, sequence)` | 水位线 GC |
 | `idx_meta_scenario_freq` | `(scenario, frequency)` | 生命周期管理 |
 
-### 8.3 连接池配置
+### 7.3 连接池配置
 
 ```rust
 pub fn create_pool(db_path: &str) -> Result<SqlitePool> {
@@ -1429,7 +1403,7 @@ pub fn create_pool(db_path: &str) -> Result<SqlitePool> {
 }
 ```
 
-### 8.4 事件查询模式
+### 7.4 事件查询模式
 
 ```rust
 /// 多维历史查询
@@ -1451,7 +1425,7 @@ pub enum SemanticQuery {
 }
 ```
 
-### 8.5 全文检索
+### 7.5 全文检索
 
 ```rust
 /// 搜索查询参数
@@ -1478,9 +1452,9 @@ pub struct SearchResult {
 
 ---
 
-## 9. Providers 模块
+## 8. Providers 模块
 
-### 9.1 架构概述
+### 8.1 架构概述
 
 Providers 是 LLM API 的**统一抽象层**，通过 Trait 屏蔽各 Provider 差异：
 
@@ -1511,7 +1485,7 @@ Providers 是 LLM API 的**统一抽象层**，通过 Trait 屏蔽各 Provider �
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 9.2 核心 Trait
+### 8.2 核心 Trait
 
 ```rust
 #[async_trait]
@@ -1534,7 +1508,7 @@ pub type ChatStream = Pin<Box<
 >>;
 ```
 
-### 9.3 请求/响应类型
+### 8.3 请求/响应类型
 
 ```rust
 /// 聊天请求
@@ -1572,7 +1546,7 @@ pub struct ChatStreamChunk {
 }
 ```
 
-### 9.4 OpenAI 兼容 Provider
+### 8.4 OpenAI 兼容 Provider
 
 ```rust
 pub struct OpenAICompatibleProvider {
@@ -1598,7 +1572,7 @@ pub struct OpenAICompatibleProvider {
 | Ollama | `localhost:11434/v1` | 本地部署 |
 | LiteLLM | `localhost:4000/v1` | 代理网关 |
 
-### 9.5 模型规格解析
+### 8.5 模型规格解析
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1613,7 +1587,7 @@ pub struct ModelSpec {
 // "openrouter/anthropic/claude-4" → provider=openrouter, model=anthropic/claude-4
 ```
 
-### 9.6 SSE 流式解析
+### 8.6 SSE 流式解析
 
 ```rust
 /// SSE 流解析器 - 处理 Server-Sent Events
@@ -1629,7 +1603,7 @@ pub fn parse_sse_stream(
 }
 ```
 
-### 9.7 错误处理
+### 8.7 错误处理
 
 ```rust
 pub enum ProviderError {
@@ -1655,9 +1629,9 @@ impl ProviderError {
 
 ---
 
-## 10. CLI 模块
+## 9. CLI 模块
 
-### 10.1 架构概述
+### 9.1 架构概述
 
 CLI 是用户与 Gasket 交互的**入口层**，支持单命令和常驻守护两种模式：
 
@@ -1678,13 +1652,9 @@ CLI 是用户与 Gasket 交互的**入口层**，支持单命令和常驻守护�
 │  │  │ (状态)   │ │(定时任务)│ │   (记忆管理)     │   │      │
 │  │  └──────────┘ └──────────┘ └──────────────────┘   │      │
 │  │  ┌──────────┐ ┌──────────┐ ┌──────────────────┐   │      │
-│  │  │  Wiki    │ │  Vault   │ │    Auth          │   │      │
-│  │  │(知识系统)│ │(密钥)    │ │   (认证)          │   │      │
+│  │  │  Vault   │ │  Auth    │ │    Channels      │   │      │
+│  │  │(密钥)    │ │(认证)    │ │   (渠道管理)      │   │      │
 │  │  └──────────┘ └──────────┘ └──────────────────┘   │      │
-│  │  ┌──────────────────┐                                      │   │
-│  │  │    Channels      │                                      │   │
-│  │  │   (渠道管理)     │                                      │   │
-│  │  └──────────────────┘                                      │   │
 │  └────────────────────────────────────────────────────┘      │
 │                                                              │
 │  ┌──────────────────────────────────────────────────────┐   │
@@ -1695,7 +1665,7 @@ CLI 是用户与 Gasket 交互的**入口层**，支持单命令和常驻守护�
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 10.2 命令树
+### 9.2 命令树
 
 ```rust
 // 顶层命令
@@ -1710,7 +1680,6 @@ enum Commands {
     Stats,                      // Token 使用统计
     Vault { command },          // 密钥管理
     Memory { command },         // 记忆管理（兼容）
-    Wiki { command },           // Wiki 知识系统
 }
 
 // Agent 选项
@@ -1723,7 +1692,7 @@ struct AgentOptions {
 }
 ```
 
-### 10.3 Gateway 启动流程
+### 9.3 Gateway 启动流程
 
 ```
                     Gateway 启动序列
@@ -1760,7 +1729,7 @@ HeartbeatService    CronService         渠道初始化
               └─────────────────────┘
 ```
 
-### 10.4 Provider 发现
+### 9.4 Provider 发现
 
 ```rust
 /// 默认 Provider 解析顺序
@@ -1776,7 +1745,7 @@ const DEFAULT_PROVIDER_ORDER: &[&str] = &[
 // 3. 裸 Provider: "minimax" → 使用默认模型
 ```
 
-### 10.5 工具注册表构建
+### 9.5 工具注册表构建
 
 ```rust
 pub struct ToolRegistryConfig {
@@ -1792,15 +1761,14 @@ pub struct ToolRegistryConfig {
 // 工具分类:
 // - 安全只读: ReadFileTool, ListDirTool, WebFetchTool, WebSearchTool
 // - 危险可变: WriteFileTool, EditFileTool, ExecTool (需审批)
-// - Wiki 管理: WikiSearchTool, WikiWriteTool, WikiReadTool, WikiDecayTool, WikiRefreshTool
 // - 网关专用: MessageTool, CronTool, SpawnTool, SpawnParallelTool
 ```
 
 ---
 
-## 11. Sandbox 模块
+## 10. Sandbox 模块
 
-### 11.1 架构概述
+### 10.1 架构概述
 
 Sandbox 是 Gasket 的**代码执行安全层**，采用纵深防御策略：
 
@@ -1840,7 +1808,7 @@ Sandbox 是 Gasket 的**代码执行安全层**，采用纵深防御策略：
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 11.2 核心配置
+### 10.2 核心配置
 
 ```rust
 /// 沙箱配置
@@ -1872,7 +1840,7 @@ pub struct CommandPolicy {
 }
 ```
 
-### 11.3 审批系统
+### 10.3 审批系统
 
 ```rust
 /// 权限级别
@@ -1894,7 +1862,7 @@ pub enum OperationType {
 }
 ```
 
-### 11.4 平台实现
+### 10.4 平台实现
 
 #### Linux (bwrap)
 
@@ -1937,7 +1905,7 @@ let profile = r#"
 // 适用于沙箱禁用或不可用的场景
 ```
 
-### 11.5 执行结果
+### 10.5 执行结果
 
 ```rust
 pub struct ExecutionResult {
@@ -1952,9 +1920,9 @@ pub struct ExecutionResult {
 
 ---
 
-## 12. Subagent 模块
+## 11. Subagent 模块
 
-### 12.1 架构概述
+### 11.1 架构概述
 
 Subagent 是 Gasket 的**多 Agent 协作系统**，支持将任务委托给独立子 Agent 执行：
 
@@ -1987,7 +1955,7 @@ Subagent 是 Gasket 的**多 Agent 协作系统**，支持将任务委托给独�
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 12.2 核心数据结构
+### 11.2 核心数据结构
 
 ```rust
 /// 任务规格
@@ -2016,7 +1984,7 @@ pub struct SubagentResult {
 }
 ```
 
-### 12.3 生成流程
+### 11.3 生成流程
 
 ```rust
 /// spawn_subagent - 纯函数，最小开销
@@ -2037,7 +2005,7 @@ async fn spawn_subagent(
 }
 ```
 
-### 12.4 并行协调
+### 11.4 并行协调
 
 ```rust
 /// 子 Agent 追踪器
@@ -2054,7 +2022,7 @@ pub struct SubagentTracker {
 // 事件区分: agent_id 字段区分主 Agent 和子 Agent
 ```
 
-### 12.5 模型解析
+### 11.5 模型解析
 
 ```rust
 /// 模型解析器 trait
@@ -2079,9 +2047,9 @@ pub trait ModelResolver: Send + Sync {
 
 ---
 
-## 13. Skills 模块
+## 12. Skills 模块
 
-### 13.1 架构概述
+### 12.1 架构概述
 
 Skills 是 Gasket 的**技能系统**，支持动态加载和语义路由：
 
@@ -2111,7 +2079,7 @@ Skills 是 Gasket 的**技能系统**，支持动态加载和语义路由：
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 13.2 核心数据结构
+### 12.2 核心数据结构
 
 ```rust
 /// 技能注册表
@@ -2140,7 +2108,7 @@ pub struct SkillMetadata {
 }
 ```
 
-### 13.3 加载策略
+### 12.3 加载策略
 
 ```rust
 impl SkillsLoader {
@@ -2172,7 +2140,7 @@ impl SkillsRegistry {
 }
 ```
 
-### 13.4 技能文件格式
+### 12.4 技能文件格式
 
 ```markdown
 ---
@@ -2192,9 +2160,9 @@ You can query weather information by...
 
 ---
 
-## 14. Vault 模块
+## 13. Vault 模块
 
-### 14.1 架构概述
+### 13.1 架构概述
 
 Vault 是 Gasket 的**密钥管理系统**，提供加密存储和运行时注入：
 
@@ -2219,7 +2187,7 @@ Vault 是 Gasket 的**密钥管理系统**，提供加密存储和运行时注�
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 14.2 核心数据结构
+### 13.2 核心数据结构
 
 ```rust
 /// 密钥存储
@@ -2252,7 +2220,7 @@ pub struct InjectionReport {
 }
 ```
 
-### 14.3 运行时注入流程
+### 13.3 运行时注入流程
 
 ```rust
 impl VaultInjector {
@@ -2287,7 +2255,7 @@ impl VaultInjector {
 }
 ```
 
-### 14.4 配置集成
+### 13.4 配置集成
 
 ```yaml
 # config.yaml 中的使用
@@ -2304,9 +2272,9 @@ channels:
 
 ---
 
-## 15. Tools 模块
+## 14. Tools 模块
 
-### 15.1 架构概述
+### 14.1 架构概述
 
 Tools 是 Gasket 的**工具执行系统**，支持内置工具和 MCP 外部工具：
 
@@ -2333,17 +2301,16 @@ Tools 是 Gasket 的**工具执行系统**，支持内置工具和 MCP 外部工
 │  │  │(沙箱执行) │ │Read/Write │ │Fetch/Search           │ │  │
 │  │  │           │ │Edit/List  │ │                       │ │  │
 │  │  └───────────┘ └───────────┘ └───────────────────────┘ │  │
-│  │  ┌───────────┐ ┌───────────┐ ┌───────────────────────┐ │  │
-│  │  │Wiki Tools │ │Agent Tools│ │   MCP Tools           │ │  │
-│  │  │Search/Write│ │Spawn/Cron │ │(JSON-RPC 2.0 over     │ │  │
-│  │  │Read/Decay │ │Message   │ │ stdio)                │ │  │
-│  │  │Refresh    │ │           │ │                       │ │  │
-│  │  └───────────┘ └───────────┘ └───────────────────────┘ │  │
+│  │  ┌───────────┐ ┌───────────────────────┐               │  │
+│  │  │Agent Tools│ │   MCP Tools           │               │  │
+│  │  │Spawn/Cron │ │(JSON-RPC 2.0 over     │               │  │
+│  │  │Message   │ │ stdio)                │               │  │
+│  │  └───────────┘ └───────────────────────┘               │  │
 │  └─────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 15.2 核心 Trait
+### 14.2 核心 Trait
 
 ```rust
 #[async_trait]
@@ -2355,7 +2322,7 @@ pub trait Tool: Send + Sync {
 }
 ```
 
-### 15.3 ExecTool 安全模型
+### 14.3 ExecTool 安全模型
 
 ```rust
 pub struct ExecTool {
@@ -2374,7 +2341,7 @@ pub struct ExecTool {
 // 5. 审批系统 (AskAlways/AskOnce/Allowed)
 ```
 
-### 15.4 工具注册
+### 14.4 工具注册
 
 ```rust
 pub struct RegisteredTool {
@@ -2383,7 +2350,7 @@ pub struct RegisteredTool {
 }
 
 pub struct ToolMetadata {
-    pub category: String,           // fs, web, wiki, agent, mcp
+    pub category: String,           // fs, web, agent, mcp
     pub requires_approval: bool,    // 是否需要用户审批
     pub dangerous: bool,            // 是否标记为危险操作
 }
@@ -2400,7 +2367,7 @@ impl ToolRegistry {
 }
 ```
 
-### 15.5 MCP 集成
+### 14.5 MCP 集成
 
 ```rust
 /// MCP 工具通过 JSON-RPC 2.0 over stdio 通信
@@ -2426,9 +2393,9 @@ impl McpTool {
 
 ---
 
-## 16. Hooks 模块
+## 15. Hooks 模块
 
-### 16.1 架构概述
+### 15.1 架构概述
 
 Hooks 是 Gasket 的**生命周期钩子系统**，支持在请求处理管道的各阶段插入自定义逻辑：
 
@@ -2453,7 +2420,7 @@ Hooks 是 Gasket 的**生命周期钩子系统**，支持在请求处理管道�
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 16.2 核心 Trait 和类型
+### 15.2 核心 Trait 和类型
 
 ```rust
 /// Hook 执行点
@@ -2500,7 +2467,7 @@ pub trait PipelineHook: Send + Sync {
 }
 ```
 
-### 16.3 内置 Hooks
+### 15.3 内置 Hooks
 
 ```rust
 /// Vault Hook - 自动注入密钥到消息
@@ -2518,7 +2485,7 @@ pub struct ExternalShellHook {
 }
 ```
 
-### 16.4 执行策略
+### 15.4 执行策略
 
 ```rust
 impl HookRegistry {
@@ -2554,9 +2521,9 @@ impl HookRegistry {
 
 ---
 
-## 17. Heartbeat 模块
+## 16. Heartbeat 模块
 
-### 17.1 架构概述
+### 16.1 架构概述
 
 Heartbeat 是 Gasket 的**主动唤醒系统**，通过解析 `HEARTBEAT.md` 文件中的待办任务实现定期自驱：
 
@@ -2575,7 +2542,7 @@ Heartbeat 是 Gasket 的**主动唤醒系统**，通过解析 `HEARTBEAT.md` 文
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 17.2 核心实现
+### 16.2 核心实现
 
 ```rust
 /// 心跳服务
@@ -2631,7 +2598,7 @@ impl HeartbeatService {
 }
 ```
 
-### 17.3 Gateway 集成
+### 16.3 Gateway 集成
 
 ```rust
 // 在 Gateway 启动时注册心跳服务

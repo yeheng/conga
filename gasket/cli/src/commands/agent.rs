@@ -79,47 +79,6 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
         agent_config.streaming = false;
     }
 
-    // Build tool registry (CLI mode: no bus/cron)
-    let pool = sqlite_store.pool();
-
-    // Initialize wiki stores if wiki config is enabled or wiki directory exists
-    let wiki_root = workspace.join("wiki");
-    let (page_store, page_index) =
-        if wiki_root.exists() || agent_config.wiki.as_ref().is_some_and(|w| w.enabled) {
-            use gasket_engine::wiki::{PageIndex, PageStore};
-            use gasket_storage::wiki::TantivyPageIndex;
-            let (wiki_changed_tx, mut wiki_changed_rx) = tokio::sync::mpsc::channel(64);
-            let ps = PageStore::new(pool.clone(), wiki_root.clone())
-                .with_wiki_changed_tx(wiki_changed_tx);
-            let broker2 = broker.clone();
-            tokio::spawn(async move {
-                while let Some(path) = wiki_changed_rx.recv().await {
-                    let envelope = gasket_engine::broker::Envelope::new(
-                        gasket_engine::broker::Topic::WikiChanged,
-                        gasket_engine::broker::BrokerPayload::WikiChanged { path },
-                    );
-                    let _ = broker2.try_publish(envelope);
-                }
-            });
-            if let Err(e) = ps.init_dirs().await {
-                tracing::warn!("Failed to init wiki dirs: {}", e);
-            }
-            if let Err(e) = gasket_engine::create_wiki_tables(&pool).await {
-                tracing::warn!("Failed to create wiki tables: {}", e);
-            }
-            let tantivy_dir = wiki_root.join(".tantivy");
-            let pi = match TantivyPageIndex::open(tantivy_dir) {
-                Ok(idx) => Some(Arc::new(PageIndex::new(Arc::new(idx)))),
-                Err(e) => {
-                    tracing::warn!("Tantivy index open failed, search disabled: {}", e);
-                    None
-                }
-            };
-            (Some(ps), pi)
-        } else {
-            (None, None)
-        };
-
     // Build model registry and provider registry for switch_model tool
     let model_registry = Arc::new(ModelRegistry::from_config(&config.agents));
     let mut provider_registry = ProviderRegistry::from_config(&config);
@@ -137,8 +96,7 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
         );
     }
 
-    // Initialize embedding recall if configured (before wiki indexing so
-    // the provider can be shared with wiki semantic search).
+    // Initialize embedding recall if configured.
     //
     // `embedding_recall` carries (searcher, indexer, event_store_tx) as a
     // single bundle so the channel invariant is encoded in the type: either
@@ -170,38 +128,11 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
     };
     // (non-embedding builds skip semantic recall initialization)
 
-    // Spawn wiki indexing service for auto Tantivy + vector updates
-    if let (Some(ref ps), Some(ref pi)) = (&page_store, &page_index) {
-        #[allow(unused_mut)]
-        let mut svc = gasket_engine::wiki::WikiIndexingService::new(ps.clone(), pi.clone());
-
-        // Attach semantic search if embedding is configured.
-        #[cfg(feature = "embedding")]
-        if let Some(ref searcher) = history_search {
-            use gasket_engine::tools::{WikiEmbeddingAdapter, WikiVectorAdapter};
-            svc = svc.with_semantic(
-                Arc::new(WikiEmbeddingAdapter::new(
-                    searcher.searcher.provider().clone(),
-                )),
-                Arc::new(WikiVectorAdapter::new(searcher.searcher.store().clone())),
-            );
-        }
-
-        if let Ok(sub) = broker
-            .subscribe(&gasket_engine::broker::Topic::WikiChanged)
-            .await
-        {
-            let _ = svc.spawn(sub);
-        }
-    }
-
     // Build Orchestrator (main agent) tool registry — includes spawn tools.
     let orchestrator_tools =
         gasket_engine::tools::build_tool_registry(gasket_engine::tools::ToolRegistryConfig {
             subagent_spawner: None,
             extra_tools: vec![],
-            page_store: page_store.clone(),
-            page_index: page_index.clone(),
             provider: Some(provider_info.provider.clone()),
             model: Some(provider_info.model.clone()),
             #[cfg(feature = "embedding")]
@@ -215,8 +146,6 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
         gasket_engine::tools::build_tool_registry(gasket_engine::tools::ToolRegistryConfig {
             subagent_spawner: None,
             extra_tools: vec![],
-            page_store,
-            page_index,
             provider: Some(provider_info.provider.clone()),
             model: Some(provider_info.model.clone()),
             #[cfg(feature = "embedding")]

@@ -1,22 +1,19 @@
 //! Tool providers — decouple tool registration from `build_tool_registry`.
 //!
-//! Each subsystem (filesystem, wiki, system) implements `ToolProvider` and
+//! Each subsystem (filesystem, system) implements `ToolProvider` and
 //! registers its own tools. `build_tool_registry` only orchestrates.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::wiki::{PageIndex, PageStore};
 use crate::SubagentSpawner;
-use gasket_storage::{MaintenanceStore, SessionStore};
+use gasket_storage::SessionStore;
 
 use super::{
-    registry::ToolRegistry, AskUserTool, ClearSessionTool, CreatePlanTool, EditFileTool,
-    EvolutionConfig, EvolutionTool, ExecTool, HistoryQueryTool, ListDirTool, NewSessionTool,
-    ReadFileTool, SearchSopsTool, SpawnParallelTool, SpawnTool, ToolMetadata, WebFetchTool,
-    WebSearchTool, WikiDecayTool, WikiDeleteTool, WikiReadTool, WikiRefreshTool, WikiSearchTool,
-    WikiWriteTool, WriteFileTool,
+    registry::ToolRegistry, AskUserTool, ClearSessionTool, EditFileTool, ExecTool, HistoryQueryTool,
+    ListDirTool, NewSessionTool, ReadFileTool, SpawnParallelTool, SpawnTool, ToolMetadata,
+    WebFetchTool, WebSearchTool, WriteFileTool,
 };
 
 /// Trait for subsystems that provide tools to the registry.
@@ -197,205 +194,28 @@ impl ToolProvider for CoreToolProvider {
 }
 
 // ---------------------------------------------------------------------------
-// WikiToolProvider — wiki + memory tools
+// SystemToolProvider — history query, session management
 // ---------------------------------------------------------------------------
 
-/// Provides wiki and memory tools (conditional on page_store).
-pub struct WikiToolProvider {
-    page_store: Option<PageStore>,
-    page_index: Option<Arc<PageIndex>>,
-    provider: Option<Arc<dyn gasket_providers::LlmProvider>>,
-    model: Option<String>,
-    planning_prompt: Option<String>,
-}
-
-impl WikiToolProvider {
-    pub fn new(
-        page_store: Option<PageStore>,
-        page_index: Option<Arc<PageIndex>>,
-        provider: Option<Arc<dyn gasket_providers::LlmProvider>>,
-        model: Option<String>,
-        planning_prompt: Option<String>,
-    ) -> Self {
-        Self {
-            page_store,
-            page_index,
-            provider,
-            model,
-            planning_prompt,
-        }
-    }
-}
-
-impl ToolProvider for WikiToolProvider {
-    fn register_tools(&self, registry: &mut ToolRegistry) {
-        let Some(ref store) = self.page_store else {
-            return;
-        };
-
-        if let Some(ref index) = self.page_index {
-            reg!(
-                registry,
-                WikiSearchTool::new(store.clone(), index.clone()),
-                "Wiki Search",
-                "wiki",
-                ["search", "wiki"],
-                false,
-                false
-            );
-            reg!(
-                registry,
-                WikiWriteTool::new(store.clone()),
-                "Wiki Write",
-                "wiki",
-                ["write", "wiki"],
-                false,
-                true
-            );
-            reg!(
-                registry,
-                WikiRefreshTool::new(store.clone(), index.clone()),
-                "Wiki Refresh",
-                "wiki",
-                ["refresh", "wiki"],
-                false,
-                false
-            );
-            reg!(
-                registry,
-                SearchSopsTool::new(index.clone()),
-                "Search SOPs",
-                "wiki",
-                ["search", "sop", "wiki"],
-                false,
-                false
-            );
-        }
-
-        reg!(
-            registry,
-            WikiReadTool::new(store.clone()),
-            "Wiki Read",
-            "wiki",
-            ["read", "wiki"],
-            false,
-            false
-        );
-        reg!(
-            registry,
-            WikiDecayTool::new(store.clone()),
-            "Wiki Decay",
-            "wiki",
-            ["decay", "wiki"],
-            false,
-            true
-        );
-        reg!(
-            registry,
-            WikiDeleteTool::new(store.clone()),
-            "Wiki Delete",
-            "wiki",
-            ["delete", "wiki"],
-            true,
-            true
-        );
-
-        if let (Some(ref prov), Some(ref mdl)) = (&self.provider, &self.model) {
-            reg!(
-                registry,
-                CreatePlanTool::new(
-                    prov.clone(),
-                    mdl.clone(),
-                    store.clone(),
-                    self.planning_prompt.clone(),
-                ),
-                "Create Plan",
-                "system",
-                ["plan", "markdown"],
-                false,
-                true
-            );
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SystemToolProvider — evolution, history query, maintenance
-// ---------------------------------------------------------------------------
-
-/// Provides system/maintenance tools (conditional on store and provider).
+/// Provides system tools backed by the session store.
 pub struct SystemToolProvider {
     session_store: Option<SessionStore>,
-    maintenance_store: Option<MaintenanceStore>,
-    page_store: Option<PageStore>,
-    provider: Option<Arc<dyn gasket_providers::LlmProvider>>,
-    model: Option<String>,
-    evolution_prompt: Option<String>,
-    distill_prompt: Option<String>,
-    event_store: Option<gasket_storage::EventStore>,
 }
 
 impl SystemToolProvider {
-    pub fn new(
-        session_store: Option<SessionStore>,
-        maintenance_store: Option<MaintenanceStore>,
-        page_store: Option<PageStore>,
-        provider: Option<Arc<dyn gasket_providers::LlmProvider>>,
-        model: Option<String>,
-        evolution_prompt: Option<String>,
-        distill_prompt: Option<String>,
-        event_store: Option<gasket_storage::EventStore>,
-    ) -> Self {
-        Self {
-            session_store,
-            maintenance_store,
-            page_store,
-            provider,
-            model,
-            evolution_prompt,
-            distill_prompt,
-            event_store,
-        }
+    pub fn new(session_store: Option<SessionStore>) -> Self {
+        Self { session_store }
     }
 }
 
 impl ToolProvider for SystemToolProvider {
     fn register_tools(&self, registry: &mut ToolRegistry) {
-        if let (Some(ref ss), Some(ref ms), Some(ref prov), Some(ref mdl), Some(ref es)) = (
-            &self.session_store,
-            &self.maintenance_store,
-            &self.provider,
-            &self.model,
-            &self.event_store,
-        ) {
-            reg!(
-                registry,
-                EvolutionTool::new(EvolutionConfig {
-                    session_store: ss.clone(),
-                    maintenance_store: ms.clone(),
-                    provider: prov.clone(),
-                    model: mdl.clone(),
-                    page_store: self.page_store.clone(),
-                    event_store: es.clone(),
-                    default_threshold: 20,
-                    evolution_prompt: self.evolution_prompt.clone(),
-                    distill_prompt: self.distill_prompt.clone(),
-                    concurrency: 3,
-                }),
-                "Evolution",
-                "system",
-                ["maintenance", "learning"],
-                false,
-                true
-            );
-        }
-
         if let Some(ref db) = self.session_store {
             reg!(
                 registry,
                 HistoryQueryTool::new(db.pool().clone()),
                 "Query History",
-                "wiki",
+                "history",
                 ["history", "search", "sqlite"],
                 false,
                 false
