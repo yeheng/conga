@@ -176,12 +176,9 @@ impl ContextBuilder {
             created_at: chrono::Utc::now(),
             sequence: 0,
         };
-        self.event_store
-            .append(&user_event)
-            .await
-            .map_err(|e| {
-                AgentError::SessionError(format!("Failed to persist user event: {}", e))
-            })?;
+        self.event_store.append(&user_event).await.map_err(|e| {
+            AgentError::SessionError(format!("Failed to persist user event: {}", e))
+        })?;
 
         // ── 4. Load only events after the watermark ──────────────────
         let history_events = if watermark == 0 {
@@ -448,7 +445,7 @@ pub async fn setup_embedding_recall(
 
     // Subscribe to new events and start background indexer.
     let rx = event_store.subscribe();
-    let idx = EmbeddingIndexer::start(provider_arc, store, index, rx)?;
+    let idx = EmbeddingIndexer::start(provider_arc, store, index, event_store.clone(), rx)?;
 
     Ok((searcher, idx))
 }

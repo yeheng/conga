@@ -46,7 +46,7 @@ pub struct RecallHit {
 ///
 /// Two-tier architecture:
 /// - **Hot index** (memory): recent embeddings for fast queries.
-/// - **Cold store** (LanceDB / SQLite): full historical embeddings.
+/// - **Cold store** (LanceDB): full historical embeddings.
 pub struct RecallSearcher {
     provider: Arc<dyn EmbeddingProvider>,
     index: Arc<MemoryIndex>,
@@ -193,19 +193,14 @@ mod tests {
     /// Build a JsonStore-backed event store in a fresh temp dir.
     ///
     /// The `TempDir` is returned alongside the store and must outlive the test.
-    fn make_event_store(
-    ) -> (
+    fn make_event_store() -> (
         Arc<dyn EventStoreTrait>,
         Arc<gasket_storage::JsonStore>,
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(gasket_storage::JsonStore::new(dir.path().to_path_buf()));
-        (
-            store.clone() as Arc<dyn EventStoreTrait>,
-            store,
-            dir,
-        )
+        (store.clone() as Arc<dyn EventStoreTrait>, store, dir)
     }
 
     /// Build a LanceDB-backed vector store in a fresh temp dir.

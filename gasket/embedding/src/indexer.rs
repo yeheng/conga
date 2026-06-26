@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::index::MemoryIndex;
 use crate::provider::EmbeddingProvider;
 use crate::vector_store::{VectorRecord, VectorStore};
+use gasket_storage::EventStoreTrait;
 use gasket_types::{EventType, SessionEvent};
 
 const MIN_CONTENT_LEN: usize = 5;
@@ -29,6 +30,7 @@ impl EmbeddingIndexer {
         provider: Arc<dyn EmbeddingProvider>,
         store: Arc<dyn VectorStore>,
         index: Arc<MemoryIndex>,
+        event_store: Arc<dyn EventStoreTrait>,
         mut rx: broadcast::Receiver<SessionEvent>,
     ) -> Result<Self> {
         let cancel = CancellationToken::new();
@@ -72,7 +74,49 @@ impl EmbeddingIndexer {
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::warn!("embedding indexer lagged {n} events");
+                                tracing::warn!(
+                                    "embedding indexer lagged {n} events; reconciling from event store"
+                                );
+                                // The broadcast ring dropped the oldest `n`
+                                // events from our view. Flush whatever we hold,
+                                // then re-pull a recent window and re-run it.
+                                // `process_batch` dedups against the persistent
+                                // store, so already-indexed events are skipped
+                                // and only the lagged-over ones get embedded.
+                                if !buffer.is_empty() {
+                                    if let Err(e) = Self::process_batch(
+                                        provider.as_ref(),
+                                        store.as_ref(),
+                                        &index,
+                                        std::mem::take(&mut buffer),
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            "embedding indexer reconcile flush error: {e}"
+                                        );
+                                    }
+                                }
+                                let window = (n as usize).saturating_add(BATCH_SIZE);
+                                match event_store.get_recent_events(window).await {
+                                    Ok(events) => {
+                                        if let Err(e) = Self::process_batch(
+                                            provider.as_ref(),
+                                            store.as_ref(),
+                                            &index,
+                                            events,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                "embedding indexer reconcile error: {e}"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        "embedding indexer reconcile fetch failed: {e}"
+                                    ),
+                                }
                             }
                             Err(broadcast::error::RecvError::Closed) => {
                                 if !buffer.is_empty() {
@@ -256,6 +300,14 @@ mod tests {
         (store, dir)
     }
 
+    /// Build a `JsonStore` (the sole event backend) in a fresh temp dir, for
+    /// the indexer's reconcile-on-lag path.
+    fn make_event_store() -> (Arc<gasket_storage::JsonStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(gasket_storage::JsonStore::new(dir.path().to_path_buf()));
+        (store, dir)
+    }
+
     fn make_event(event_type: EventType, content: &str) -> SessionEvent {
         SessionEvent {
             id: Uuid::now_v7(),
@@ -393,11 +445,12 @@ mod tests {
     async fn test_start_and_shutdown() {
         let provider = Arc::new(MockProvider::new(3));
         let (store, _vector_dir) = test_store().await;
+        let (event_store, _event_dir) = make_event_store();
         let index = Arc::new(MemoryIndex::new(3));
         let (_tx, rx) = broadcast::channel::<SessionEvent>(16);
 
-        let mut indexer =
-            EmbeddingIndexer::start(provider, store, index, rx).expect("start indexer");
+        let mut indexer = EmbeddingIndexer::start(provider, store, index, event_store, rx)
+            .expect("start indexer");
 
         indexer.shutdown().await;
         assert!(indexer.handle.is_none());
@@ -407,11 +460,12 @@ mod tests {
     async fn test_start_processes_events() {
         let provider = Arc::new(MockProvider::new(3));
         let (store, _vector_dir) = test_store().await;
+        let (event_store, _event_dir) = make_event_store();
         let index = Arc::new(MemoryIndex::new(3));
         let (tx, rx) = broadcast::channel::<SessionEvent>(16);
 
-        let mut indexer =
-            EmbeddingIndexer::start(provider, store, index.clone(), rx).expect("start indexer");
+        let mut indexer = EmbeddingIndexer::start(provider, store, index.clone(), event_store, rx)
+            .expect("start indexer");
 
         let event = make_event(EventType::UserMessage, "Hello from broadcast channel");
         tx.send(event).unwrap();

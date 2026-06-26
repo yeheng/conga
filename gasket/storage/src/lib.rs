@@ -16,7 +16,7 @@ pub mod query;
 
 use std::path::PathBuf;
 
-pub use json_state::{CronStateFile, KvStateFile, MaintenanceStateFile};
+pub use json_state::{CronStateFile, KvStateFile};
 pub use json_store::JsonStore;
 pub use store_trait::{EventStoreTrait, SessionStoreTrait, StoreError};
 

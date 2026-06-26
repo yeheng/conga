@@ -1,12 +1,9 @@
-//! Tiny JSON-backed state files for cron / kv / maintenance.
+//! Tiny JSON-backed state files for cron / kv state.
 //!
-//! These replace three small SQLite tables (`cron_state`, `kv_store`,
-//! `maintenance_state`) with one JSON file each under `<base>/state/`. Each
-//! file is a serialized map mutated via read-modify-write under an atomic
-//! temp-file + rename ([`crate::fs::atomic_write`]).
-//!
-//! Coexists with the SQLite small-table stores during Phase 2; the JSON path
-//! becomes the default once SQLite is removed.
+//! These replace the small SQLite tables (`cron_state`, `kv_store`) with one
+//! JSON file each under `<base>/state/`. Each file is a serialized map mutated
+//! via read-modify-write under an atomic temp-file + rename
+//! ([`crate::fs::atomic_write`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -126,49 +123,6 @@ impl KvStateFile {
     }
 }
 
-// ── maintenance_state ───────────────────────────────────────────────────────
-
-/// Per-(task, session) watermark state, keyed by `"<task>\u{1f}<session>"`.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-pub struct MaintenanceStateFile {
-    #[serde(default)]
-    pub watermarks: HashMap<String, i64>,
-}
-
-impl MaintenanceStateFile {
-    /// Compound key for a (task, target-session) pair.
-    fn mk(task: &str, target: &str) -> String {
-        format!("{}\u{1f}{}", task, target)
-    }
-
-    /// In-memory watermark lookup on an already-loaded file (no IO).
-    pub fn get_watermark(&self, task: &str, target: &str) -> i64 {
-        self.watermarks
-            .get(&Self::mk(task, target))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub async fn read(path: &Path, task: &str, target: &str) -> anyhow::Result<i64> {
-        Ok(Self::load(path).await?.get_watermark(task, target))
-    }
-
-    pub async fn write(path: &Path, task: &str, target: &str, wm: i64) -> anyhow::Result<()> {
-        rmw(path, |s: &mut Self| {
-            s.watermarks.insert(Self::mk(task, target), wm);
-        })
-        .await
-    }
-
-    async fn load(path: &Path) -> anyhow::Result<Self> {
-        Ok(tokio::fs::read_to_string(path)
-            .await
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,26 +150,5 @@ mod tests {
         assert_eq!(got.0.as_deref(), Some("now"));
         assert_eq!(got.1.as_deref(), Some("later"));
         assert!(CronStateFile::delete(&p, "job").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_maintenance_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("maintenance.json");
-        assert_eq!(
-            MaintenanceStateFile::read(&p, "evolve", "cli:s")
-                .await
-                .unwrap(),
-            0
-        );
-        MaintenanceStateFile::write(&p, "evolve", "cli:s", 7)
-            .await
-            .unwrap();
-        assert_eq!(
-            MaintenanceStateFile::read(&p, "evolve", "cli:s")
-                .await
-                .unwrap(),
-            7
-        );
     }
 }

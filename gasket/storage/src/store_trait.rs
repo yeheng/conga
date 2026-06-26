@@ -81,40 +81,16 @@ pub trait EventStoreTrait: Send + Sync {
     /// Garbage-collect events with `sequence <= target`. Returns count deleted.
     async fn delete_events_upto(&self, key: &SessionKey, target: i64) -> Result<u64, StoreError>;
 
-    /// Load specific events by ID, scoped to a session.
-    async fn get_events_by_ids(
-        &self,
-        key: &SessionKey,
-        ids: &[Uuid],
-    ) -> Result<Vec<SessionEvent>, StoreError>;
-
     /// Load specific events by ID across all sessions (cross-session recall).
-    async fn get_events_by_ids_global(
-        &self,
-        ids: &[Uuid],
-    ) -> Result<Vec<SessionEvent>, StoreError>;
+    async fn get_events_by_ids_global(&self, ids: &[Uuid])
+        -> Result<Vec<SessionEvent>, StoreError>;
 
     /// Recent user/assistant events across all sessions (`limit == 0` = all).
     /// Used for embedding backfill.
     async fn get_recent_events(&self, limit: usize) -> Result<Vec<SessionEvent>, StoreError>;
 
-    /// Keyword search within a session's user/assistant events (substring match).
-    async fn search_session_events(
-        &self,
-        key: &SessionKey,
-        keyword: &str,
-        limit: i64,
-    ) -> Result<Vec<SessionEvent>, StoreError>;
-
-    /// Most recent summary event for a session, if any.
-    async fn get_latest_summary(&self, key: &SessionKey)
-        -> Result<Option<SessionEvent>, StoreError>;
-
     /// Delete all events + metadata for a session.
     async fn clear_session(&self, key: &SessionKey) -> Result<(), StoreError>;
-
-    /// All session keys for a channel.
-    async fn get_sessions_by_channel(&self, channel: &str) -> Result<Vec<String>, StoreError>;
 
     /// Subscribe to newly appended events via broadcast channel.
     fn subscribe(&self) -> broadcast::Receiver<SessionEvent>;
@@ -146,34 +122,17 @@ pub trait SessionStoreTrait: Send + Sync {
     /// Save a checkpoint summary at a target sequence.
     async fn save_checkpoint(
         &self,
-        key: &str,
+        key: &SessionKey,
         target: i64,
         summary: &str,
     ) -> Result<(), StoreError>;
 
-    /// Most recent checkpoint at or before `target`.
-    async fn load_checkpoint(
-        &self,
-        key: &str,
-        target: i64,
-    ) -> Result<Option<(String, i64)>, StoreError>;
-
     /// Scan all sessions with at least one event: `(session_key, total_events, updated_at)`.
     async fn scan_active_sessions(&self) -> Result<Vec<(String, i64, String)>, StoreError>;
-
-    /// Sessions needing a maintenance task: `(session_key, total_events, watermark)`.
-    async fn get_sessions_needing_evolution(
-        &self,
-        task: &str,
-        threshold: i64,
-    ) -> Result<Vec<(String, i64, i64)>, StoreError>;
 
     /// Mark compaction started for a session.
     async fn mark_compaction_started(&self, key: &SessionKey) -> Result<(), StoreError>;
 
     /// Mark compaction finished for a session.
     async fn mark_compaction_finished(&self, key: &SessionKey) -> Result<(), StoreError>;
-
-    /// Whether compaction is marked in-progress for a session.
-    async fn is_compaction_in_progress(&self, key: &SessionKey) -> Result<bool, StoreError>;
 }

@@ -287,9 +287,14 @@ async fn test_indexer_broadcast_processing() {
 
     let rx = event_store.subscribe();
 
-    let mut indexer =
-        EmbeddingIndexer::start(provider.clone(), embedding_store, index.clone(), rx)
-            .expect("start indexer");
+    let mut indexer = EmbeddingIndexer::start(
+        provider.clone(),
+        embedding_store,
+        index.clone(),
+        event_store.clone(),
+        rx,
+    )
+    .expect("start indexer");
 
     let e1 = make_event(EventType::UserMessage, "First user message via broadcast");
     let e2 = make_event(
@@ -362,9 +367,14 @@ async fn test_indexer_dedup() {
     assert_eq!(index.len(), 0);
 
     let rx = event_store.subscribe();
-    let mut indexer =
-        EmbeddingIndexer::start(provider.clone(), embedding_store, index.clone(), rx)
-            .expect("start indexer");
+    let mut indexer = EmbeddingIndexer::start(
+        provider.clone(),
+        embedding_store,
+        index.clone(),
+        event_store.clone(),
+        rx,
+    )
+    .expect("start indexer");
 
     event_store.append(&event).await.unwrap();
 

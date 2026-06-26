@@ -119,7 +119,7 @@ pub async fn checkpoint(
     }
 
     session_store
-        .save_checkpoint(&session_key.to_string(), current_max_sequence, &summary)
+        .save_checkpoint(session_key, current_max_sequence, &summary)
         .await?;
 
     info!(
@@ -224,7 +224,7 @@ pub async fn save_ask_checkpoint(
 
     // target_sequence = 0 distinguishes ask-checkpoints from proactive ones.
     session_store
-        .save_checkpoint(&session_key.to_string(), 0, &summary)
+        .save_checkpoint(session_key, 0, &summary)
         .await?;
 
     info!(

@@ -27,7 +27,6 @@ use tokio::sync::{broadcast, Mutex as TokioMutex};
 use tracing::warn;
 
 use crate::fs::atomic_write;
-use crate::json_state::MaintenanceStateFile;
 use crate::store_trait::{EventStoreTrait, SessionStoreTrait, StoreError};
 
 /// Per-session sidecar metadata, persisted as `<chat_id>.meta.json`.
@@ -105,9 +104,6 @@ impl JsonStore {
         self.channel_dir(key)
             .join(format!("{}.meta.json", safe_name(&key.chat_id)))
     }
-    fn maintenance_path(&self) -> PathBuf {
-        self.base.join("state").join("maintenance.json")
-    }
     fn lock_key(key: &SessionKey) -> String {
         key.to_string()
     }
@@ -152,14 +148,6 @@ impl JsonStore {
         let json = serde_json::to_string_pretty(meta)?;
         atomic_write(&self.meta_path(key), json).await?;
         Ok(())
-    }
-
-    fn read_maintenance(&self) -> MaintenanceStateFile {
-        let p = self.maintenance_path();
-        std::fs::read_to_string(&p)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
     }
 
     /// Rebuild `next_sequence` and cache it.
@@ -258,10 +246,7 @@ impl EventStoreTrait for JsonStore {
         Ok(seq)
     }
 
-    async fn get_session_history(
-        &self,
-        key: &SessionKey,
-    ) -> Result<Vec<SessionEvent>, StoreError> {
+    async fn get_session_history(&self, key: &SessionKey) -> Result<Vec<SessionEvent>, StoreError> {
         let mut v = Self::read_events(&self.events_path(key));
         v.sort_by_key(|e| e.sequence);
         Ok(v)
@@ -313,11 +298,7 @@ impl EventStoreTrait for JsonStore {
             .collect())
     }
 
-    async fn delete_events_upto(
-        &self,
-        key: &SessionKey,
-        target: i64,
-    ) -> Result<u64, StoreError> {
+    async fn delete_events_upto(&self, key: &SessionKey, target: i64) -> Result<u64, StoreError> {
         let lock = self.write_lock(key);
         let _g = lock.lock().await;
 
@@ -339,20 +320,6 @@ impl EventStoreTrait for JsonStore {
         Ok(deleted)
     }
 
-    async fn get_events_by_ids(
-        &self,
-        key: &SessionKey,
-        ids: &[uuid::Uuid],
-    ) -> Result<Vec<SessionEvent>, StoreError> {
-        let want: std::collections::HashSet<uuid::Uuid> = ids.iter().copied().collect();
-        let mut v: Vec<_> = Self::read_events(&self.events_path(key))
-            .into_iter()
-            .filter(|e| want.contains(&e.id))
-            .collect();
-        v.sort_by_key(|e| e.sequence);
-        Ok(v)
-    }
-
     async fn get_events_by_ids_global(
         &self,
         ids: &[uuid::Uuid],
@@ -362,7 +329,11 @@ impl EventStoreTrait for JsonStore {
         self.for_each_sessions_dir(|events| {
             out.extend(events.into_iter().filter(|e| want.contains(&e.id)));
         });
-        out.sort_by(|a, b| a.session_key.cmp(&b.session_key).then(a.sequence.cmp(&b.sequence)));
+        out.sort_by(|a, b| {
+            a.session_key
+                .cmp(&b.session_key)
+                .then(a.sequence.cmp(&b.sequence))
+        });
         Ok(out)
     }
 
@@ -372,43 +343,20 @@ impl EventStoreTrait for JsonStore {
             all.extend(events.into_iter().filter(|e| {
                 matches!(
                     e.event_type,
-                    gasket_types::EventType::UserMessage | gasket_types::EventType::AssistantMessage
+                    gasket_types::EventType::UserMessage
+                        | gasket_types::EventType::AssistantMessage
                 )
             }));
         });
-        all.sort_by(|a, b| a.session_key.cmp(&b.session_key).then(a.sequence.cmp(&b.sequence)));
+        all.sort_by(|a, b| {
+            a.session_key
+                .cmp(&b.session_key)
+                .then(a.sequence.cmp(&b.sequence))
+        });
         if limit > 0 {
             all.truncate(limit);
         }
         Ok(all)
-    }
-
-    async fn search_session_events(
-        &self,
-        key: &SessionKey,
-        keyword: &str,
-        limit: i64,
-    ) -> Result<Vec<SessionEvent>, StoreError> {
-        let mut v: Vec<_> = Self::read_events(&self.events_path(key))
-            .into_iter()
-            .filter(|e| {
-                matches!(
-                    e.event_type,
-                    gasket_types::EventType::UserMessage | gasket_types::EventType::AssistantMessage
-                )
-            })
-            .filter(|e| e.content.contains(keyword))
-            .collect();
-        v.sort_by(|a, b| b.sequence.cmp(&a.sequence));
-        v.truncate(limit as usize);
-        Ok(v)
-    }
-
-    async fn get_latest_summary(&self, key: &SessionKey) -> Result<Option<SessionEvent>, StoreError> {
-        Ok(Self::read_events(&self.events_path(key))
-            .into_iter()
-            .filter(|e| e.event_type.is_summary())
-            .max_by_key(|e| e.sequence))
     }
 
     async fn clear_session(&self, key: &SessionKey) -> Result<(), StoreError> {
@@ -418,21 +366,6 @@ impl EventStoreTrait for JsonStore {
         let _ = tokio::fs::remove_file(self.meta_path(key)).await;
         self.next_seq.lock().remove(&Self::lock_key(key));
         Ok(())
-    }
-
-    async fn get_sessions_by_channel(&self, channel: &str) -> Result<Vec<String>, StoreError> {
-        let mut keys = vec![];
-        let ch_dir = self.base.join("sessions").join(safe_name(channel));
-        if let Ok(mut entries) = tokio::fs::read_dir(&ch_dir).await {
-            while let Ok(Some(e)) = entries.next_entry().await {
-                if let Some(name) = e.path().file_stem().and_then(|s| s.to_str()) {
-                    if !name.ends_with(".meta") {
-                        keys.push(format!("{}:{}", channel, name));
-                    }
-                }
-            }
-        }
-        Ok(keys)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
@@ -484,8 +417,7 @@ impl SessionStoreTrait for JsonStore {
         let m = self.read_meta(key);
         let summary = m.summary.clone();
         let watermark = m.watermark;
-        // Most recent checkpoint (latest target_sequence) — mirrors the
-        // SQLite backend's "working memory" selection.
+        // Most recent checkpoint (latest target_sequence).
         let checkpoint = m
             .checkpoints
             .iter()
@@ -497,37 +429,20 @@ impl SessionStoreTrait for JsonStore {
 
     async fn save_checkpoint(
         &self,
-        key: &str,
+        key: &SessionKey,
         target: i64,
         summary: &str,
     ) -> Result<(), StoreError> {
-        let sk = SessionKey::parse(key)
-            .unwrap_or_else(|| SessionKey::new(ChannelType::Cli, key));
-        let lock = self.write_lock(&sk);
+        let lock = self.write_lock(key);
         let _g = lock.lock().await;
-        let mut meta = self.read_meta(&sk);
+        let mut meta = self.read_meta(key);
         meta.checkpoints.retain(|c| c.target_sequence != target);
         meta.checkpoints.push(Checkpoint {
             target_sequence: target,
             summary: summary.to_string(),
             created_at: Utc::now().to_rfc3339(),
         });
-        self.write_meta(&sk, &meta).await
-    }
-
-    async fn load_checkpoint(
-        &self,
-        key: &str,
-        target: i64,
-    ) -> Result<Option<(String, i64)>, StoreError> {
-        let sk = SessionKey::parse(key)
-            .unwrap_or_else(|| SessionKey::new(ChannelType::Cli, key));
-        let m = self.read_meta(&sk);
-        Ok(m.checkpoints
-            .iter()
-            .filter(|c| c.target_sequence <= target)
-            .max_by_key(|c| c.target_sequence)
-            .map(|c| (c.summary.clone(), c.target_sequence)))
+        self.write_meta(key, &meta).await
     }
 
     async fn scan_active_sessions(&self) -> Result<Vec<(String, i64, String)>, StoreError> {
@@ -539,25 +454,6 @@ impl SessionStoreTrait for JsonStore {
                     events.len() as i64,
                     first.created_at.to_rfc3339(),
                 ));
-            }
-        });
-        Ok(out)
-    }
-
-    async fn get_sessions_needing_evolution(
-        &self,
-        task: &str,
-        threshold: i64,
-    ) -> Result<Vec<(String, i64, i64)>, StoreError> {
-        let maint = self.read_maintenance();
-        let mut out = vec![];
-        self.for_each_sessions_dir(|events| {
-            if let Some(first) = events.first() {
-                let total = events.len() as i64;
-                let wm = maint.get_watermark(task, &first.session_key);
-                if total - wm >= threshold {
-                    out.push((first.session_key.clone(), total, wm));
-                }
             }
         });
         Ok(out)
@@ -579,10 +475,6 @@ impl SessionStoreTrait for JsonStore {
         meta.compaction_in_progress = false;
         meta.compaction_started_at = None;
         self.write_meta(key, &meta).await
-    }
-
-    async fn is_compaction_in_progress(&self, key: &SessionKey) -> Result<bool, StoreError> {
-        Ok(self.read_meta(key).compaction_in_progress)
     }
 }
 
