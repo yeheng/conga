@@ -19,7 +19,9 @@ use crate::error::AgentError;
 use crate::hooks::{HookAction, HookBuilder, HookPoint, HookRegistry, MutableContext, VaultHook};
 use crate::vault::{VaultInjector, VaultStore};
 use gasket_storage::process_history;
-use gasket_storage::{EventStore, HistoryConfig, SessionStore};
+use gasket_storage::{EventStoreTrait, HistoryConfig, SessionStoreTrait};
+#[cfg(feature = "embedding")]
+use gasket_storage::EventStore;
 
 /// Outcome of the context building pipeline.
 ///
@@ -51,8 +53,8 @@ pub struct ChatRequest {
 /// Decouples the complex pipeline preparation logic from `AgentSession`,
 /// following the Single Responsibility Principle.
 pub struct ContextBuilder {
-    event_store: EventStore,
-    session_store: SessionStore,
+    event_store: Arc<dyn EventStoreTrait>,
+    session_store: Arc<dyn SessionStoreTrait>,
     system_prompt: String,
     skills_context: Option<String>,
     hooks: Arc<HookRegistry>,
@@ -62,8 +64,8 @@ pub struct ContextBuilder {
 impl ContextBuilder {
     /// Create a new context builder.
     pub fn new(
-        event_store: EventStore,
-        session_store: SessionStore,
+        event_store: Arc<dyn EventStoreTrait>,
+        session_store: Arc<dyn SessionStoreTrait>,
         system_prompt: String,
         skills_context: Option<String>,
         hooks: Arc<HookRegistry>,
@@ -80,12 +82,12 @@ impl ContextBuilder {
     }
 
     /// Access the event store.
-    pub fn event_store(&self) -> &EventStore {
+    pub fn event_store(&self) -> &Arc<dyn EventStoreTrait> {
         &self.event_store
     }
 
     /// Access the session store.
-    pub fn session_store(&self) -> &SessionStore {
+    pub fn session_store(&self) -> &Arc<dyn SessionStoreTrait> {
         &self.session_store
     }
 
@@ -177,7 +179,7 @@ impl ContextBuilder {
             sequence: 0,
         };
         self.event_store
-            .append_event(&user_event)
+            .append(&user_event)
             .await
             .map_err(|e| {
                 AgentError::SessionError(format!("Failed to persist user event: {}", e))

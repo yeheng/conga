@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use gasket_storage::SessionStore;
+use gasket_storage::SessionStoreTrait;
 
 /// Async indexing task for queue-based processing
 #[derive(Debug, Clone)]
@@ -29,7 +29,7 @@ pub enum AsyncIndexTask {
 #[allow(dead_code)]
 pub struct IndexingService {
     /// SQLite store (retained for API compatibility).
-    store: Arc<SessionStore>,
+    store: Arc<dyn SessionStoreTrait>,
     /// Async task queue (optional, set via enable_queue)
     queue: Option<Arc<IndexingQueue<AsyncIndexTask>>>,
     /// Shutdown signal for background worker
@@ -40,7 +40,7 @@ pub struct IndexingService {
 
 impl IndexingService {
     /// Create a new indexing service.
-    pub fn new(store: Arc<SessionStore>) -> Self {
+    pub fn new(store: Arc<dyn SessionStoreTrait>) -> Self {
         Self {
             store,
             queue: None,

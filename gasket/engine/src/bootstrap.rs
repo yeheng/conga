@@ -29,6 +29,18 @@ pub struct EngineInfra {
     pub sqlite_store: Arc<SqliteStore>,
 }
 
+impl EngineInfra {
+    /// Build a fresh `Arc<dyn EventStoreTrait>` backed by the shared SQLite pool.
+    pub fn event_store(&self) -> Arc<dyn gasket_storage::EventStoreTrait> {
+        Arc::new(gasket_storage::EventStore::new(self.sqlite_store.pool()))
+    }
+
+    /// Build a fresh `Arc<dyn SessionStoreTrait>` backed by the shared SQLite pool.
+    pub fn session_store(&self) -> Arc<dyn gasket_storage::SessionStoreTrait> {
+        Arc::new(gasket_storage::SessionStore::new(self.sqlite_store.pool()))
+    }
+}
+
 /// Channel-capacity hint passed to [`init_engine_infra`].
 ///
 /// Different hosts want different capacities — the CLI agent uses small

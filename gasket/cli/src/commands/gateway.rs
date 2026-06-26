@@ -434,8 +434,10 @@ fn build_extra_tools(
     ));
 
     let ctx_pool = sqlite_store.pool();
-    let ctx_event_store = EventStore::new(ctx_pool.clone());
-    let ctx_session_store = gasket_engine::SessionStore::new(ctx_pool);
+    let ctx_event_store: Arc<dyn gasket_storage::EventStoreTrait> =
+        Arc::new(EventStore::new(ctx_pool.clone()));
+    let ctx_session_store: Arc<dyn gasket_storage::SessionStoreTrait> =
+        Arc::new(gasket_engine::SessionStore::new(ctx_pool));
     let mut ctx_compactor = ContextCompactor::new(
         provider_info.provider.clone(),
         ctx_event_store,

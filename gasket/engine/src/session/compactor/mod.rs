@@ -54,7 +54,7 @@ use anyhow::{bail, Result};
 use tracing::{debug, info, warn};
 
 use gasket_providers::LlmProvider;
-use gasket_storage::{EventStore, SessionStore};
+use gasket_storage::{EventStoreTrait, SessionStoreTrait};
 use gasket_types::SessionKey;
 
 /// Default prompt for LLM summarization (used when no custom prompt is configured).
@@ -113,9 +113,9 @@ pub struct ContextCompactor {
     /// LLM provider for generating summaries.
     provider: Arc<dyn LlmProvider>,
     /// Event store for loading events and garbage collection.
-    event_store: EventStore,
+    event_store: Arc<dyn EventStoreTrait>,
     /// SQLite store for summary persistence (session_summaries table).
-    session_store: SessionStore,
+    session_store: Arc<dyn SessionStoreTrait>,
     /// Model to use for summarization.
     model: String,
     /// Token budget for context window.
@@ -144,8 +144,8 @@ impl ContextCompactor {
     /// Create a new compactor.
     pub fn new(
         provider: Arc<dyn LlmProvider>,
-        event_store: EventStore,
-        session_store: SessionStore,
+        event_store: Arc<dyn EventStoreTrait>,
+        session_store: Arc<dyn SessionStoreTrait>,
         model: String,
         token_budget: usize,
     ) -> Self {
@@ -210,7 +210,7 @@ impl ContextCompactor {
     /// Returns `(summary_text, covered_upto_sequence)`.
     /// If no summary exists, returns `("", 0)`.
     pub async fn load_summary_with_watermark(&self, session_key: &SessionKey) -> (String, i64) {
-        stats::load_summary_with_watermark(&self.session_store, session_key).await
+        stats::load_summary_with_watermark(self.session_store.as_ref(), session_key).await
     }
 
     // -----------------------------------------------------------------------
@@ -220,8 +220,8 @@ impl ContextCompactor {
     /// Get context usage statistics for a session.
     pub async fn get_usage_stats(&self, session_key: &SessionKey) -> Result<UsageStats> {
         stats::get_usage_stats(
-            &self.event_store,
-            &self.session_store,
+            self.event_store.as_ref(),
+            self.session_store.as_ref(),
             session_key,
             self.token_budget,
             self.compaction_threshold,
@@ -232,7 +232,12 @@ impl ContextCompactor {
 
     /// Get watermark and sequence information for a session.
     pub async fn get_watermark_info(&self, session_key: &SessionKey) -> Result<WatermarkInfo> {
-        stats::get_watermark_info(&self.event_store, &self.session_store, session_key).await
+        stats::get_watermark_info(
+            self.event_store.as_ref(),
+            self.session_store.as_ref(),
+            session_key,
+        )
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -292,8 +297,8 @@ impl ContextCompactor {
         let listeners: Vec<Arc<dyn CompactionListener>> = self.listeners.clone();
 
         let result = pipeline::run_compaction(
-            &self.event_store,
-            &self.session_store,
+            self.event_store.as_ref(),
+            self.session_store.as_ref(),
             &*self.provider,
             &self.model,
             &self.summarization_prompt,
@@ -336,8 +341,8 @@ impl ContextCompactor {
             &*self.provider,
             &self.model,
             config,
-            &self.event_store,
-            &self.session_store,
+            self.event_store.as_ref(),
+            self.session_store.as_ref(),
             session_key,
             current_max_sequence,
         )
@@ -357,7 +362,7 @@ impl ContextCompactor {
         checkpoint::save_ask_checkpoint(
             &*self.provider,
             &self.model,
-            &self.session_store,
+            self.session_store.as_ref(),
             session_key,
             messages,
             pending_question,
@@ -470,8 +475,8 @@ impl ContextCompactor {
             let mut follow_up = false;
             let run = async {
                 if let Err(e) = pipeline::run_compaction(
-                    &event_store,
-                    &session_store,
+                    event_store.as_ref(),
+                    session_store.as_ref(),
                     &*provider,
                     &model,
                     &summarization_prompt,
@@ -500,8 +505,8 @@ impl ContextCompactor {
                 );
                 *state.lock() = CompactorState::Compressing { pending: false };
                 if let Err(e) = pipeline::run_compaction(
-                    &event_store,
-                    &session_store,
+                    event_store.as_ref(),
+                    session_store.as_ref(),
                     &*provider,
                     &model,
                     &summarization_prompt,

@@ -16,7 +16,7 @@ use crate::session::compactor::ContextCompactor;
 use crate::session::{AgentResponse, FinalizeContext};
 use crate::token_tracker::ModelPricing;
 use crate::vault::redact_secrets;
-use gasket_storage::EventStore;
+use gasket_storage::EventStoreTrait;
 use gasket_types::{EventMetadata, EventType, SessionEvent};
 
 /// Post-processor that finalizes an execution result into an `AgentResponse`.
@@ -26,7 +26,7 @@ use gasket_types::{EventMetadata, EventType, SessionEvent};
 #[derive(Clone)]
 pub struct ResponseFinalizer {
     hooks: Arc<HookRegistry>,
-    event_store: EventStore,
+    event_store: Arc<dyn EventStoreTrait>,
     compactor: Option<Arc<ContextCompactor>>,
     pricing: Option<ModelPricing>,
     max_tokens: u32,
@@ -36,7 +36,7 @@ pub struct ResponseFinalizer {
 impl ResponseFinalizer {
     pub fn new(
         hooks: Arc<HookRegistry>,
-        event_store: EventStore,
+        event_store: Arc<dyn EventStoreTrait>,
         compactor: Option<Arc<ContextCompactor>>,
         pricing: Option<ModelPricing>,
         max_tokens: u32,
@@ -61,7 +61,7 @@ impl ResponseFinalizer {
     ) -> AgentResponse {
         let vault_values = &ctx.local_vault_values;
 
-        save_assistant_event(&self.event_store, &result, ctx, vault_values).await;
+        save_assistant_event(self.event_store.as_ref(), &result, ctx, vault_values).await;
         trigger_compaction(self.compactor.as_ref(), ctx, vault_values);
         execute_after_response_hooks(
             &self.hooks,
@@ -87,7 +87,7 @@ impl ResponseFinalizer {
 
 /// Save the assistant's response as a session event.
 async fn save_assistant_event(
-    event_store: &EventStore,
+    event_store: &dyn EventStoreTrait,
     result: &ExecutionResult,
     ctx: &FinalizeContext,
     vault_values: &[String],
@@ -112,7 +112,7 @@ async fn save_assistant_event(
         created_at: chrono::Utc::now(),
         sequence: 0,
     };
-    if let Err(e) = event_store.append_event(&assistant_event).await {
+    if let Err(e) = event_store.append(&assistant_event).await {
         warn!("Failed to persist assistant event: {}", e);
     }
 }

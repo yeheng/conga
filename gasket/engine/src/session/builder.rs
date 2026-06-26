@@ -107,15 +107,18 @@ impl SessionBuilder {
     pub async fn build(self) -> Result<AgentSession, AgentError> {
         // ── 1. Storage layer ─────────────────────────────────────────
         let pool = self.sqlite_store.pool();
-        let session_store = SessionStore::new(pool.clone());
+        let session_store: Arc<dyn gasket_storage::SessionStoreTrait> =
+            Arc::new(SessionStore::new(pool.clone()));
         #[cfg(feature = "embedding")]
-        let event_store = if let Some(tx) = self.event_store_tx {
-            EventStore::with_pool_and_sender(pool.clone(), tx)
+        let event_store: Arc<dyn gasket_storage::EventStoreTrait> = if let Some(tx) = self.event_store_tx {
+            Arc::new(EventStore::with_pool_and_sender(pool.clone(), tx))
+                as Arc<dyn gasket_storage::EventStoreTrait>
         } else {
-            EventStore::new(pool.clone())
+            Arc::new(EventStore::new(pool.clone())) as Arc<dyn gasket_storage::EventStoreTrait>
         };
         #[cfg(not(feature = "embedding"))]
-        let event_store = EventStore::new(pool.clone());
+        let event_store: Arc<dyn gasket_storage::EventStoreTrait> =
+            Arc::new(EventStore::new(pool.clone())) as Arc<dyn gasket_storage::EventStoreTrait>;
 
         // ── 2. Query provider for real model limits ──────────────────
         let model_limits = self

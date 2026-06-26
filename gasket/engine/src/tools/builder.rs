@@ -116,8 +116,13 @@ pub fn build_tool_registry(registry_config: ToolRegistryConfig) -> ToolRegistry 
         .register_tools(&mut tools);
 
     // ── System tools (history query, session management) ──────
-    let session_store = Some(sqlite_store.session_store());
-    SystemToolProvider::new(session_store).register_tools(&mut tools);
+    let pool = sqlite_store.pool();
+    let event_store: Arc<dyn gasket_storage::EventStoreTrait> =
+        Arc::new(gasket_storage::EventStore::new(pool.clone()));
+    let session_store: Arc<dyn gasket_storage::SessionStoreTrait> =
+        Arc::new(gasket_storage::SessionStore::new(pool.clone()));
+    SystemToolProvider::new(Some(event_store), Some(session_store), Some(pool))
+        .register_tools(&mut tools);
 
     // Extra tools (e.g. gateway-specific MessageTool, CronTool)
     for (tool, metadata) in extra_tools {

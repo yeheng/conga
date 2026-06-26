@@ -1,23 +1,32 @@
 //! New session tool — generate a fresh session key and clear history.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use tracing::info;
 use uuid::Uuid;
 
 use super::{simple_schema, Tool, ToolContext, ToolError, ToolResult};
-use gasket_storage::{EventStore, SessionStore};
+use gasket_storage::{EventStoreTrait, SessionStoreTrait};
 use gasket_types::SessionKey;
 
 /// Tool for starting a new session: clears history and generates a fresh session key.
 pub struct NewSessionTool {
-    session_store: SessionStore,
+    event_store: Arc<dyn EventStoreTrait>,
+    session_store: Arc<dyn SessionStoreTrait>,
 }
 
 impl NewSessionTool {
-    /// Create a new-session tool backed by the given session store.
-    pub fn new(session_store: SessionStore) -> Self {
-        Self { session_store }
+    /// Create a new-session tool backed by the given stores.
+    pub fn new(
+        event_store: Arc<dyn EventStoreTrait>,
+        session_store: Arc<dyn SessionStoreTrait>,
+    ) -> Self {
+        Self {
+            event_store,
+            session_store,
+        }
     }
 }
 
@@ -49,10 +58,12 @@ impl Tool for NewSessionTool {
         info!("Starting new session, clearing old session {}", old_key_str);
 
         // Clear events via EventStore
-        let event_store = EventStore::new(self.session_store.pool());
-        event_store.clear_session(&old_key).await.map_err(|e| {
-            ToolError::ExecutionError(format!("Failed to clear session events: {}", e))
-        })?;
+        self.event_store
+            .clear_session(&old_key)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionError(format!("Failed to clear session events: {}", e))
+            })?;
 
         // Clear summary via SessionStore
         self.session_store

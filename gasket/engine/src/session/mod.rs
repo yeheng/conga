@@ -131,14 +131,14 @@ impl FinalizeContext {
 pub(crate) struct SessionCheckpointCallback {
     session_key: SessionKey,
     compactor: Arc<ContextCompactor>,
-    event_store: gasket_storage::EventStore,
+    event_store: Arc<dyn gasket_storage::EventStoreTrait>,
 }
 
 impl SessionCheckpointCallback {
     pub(crate) fn new(
         session_key: SessionKey,
         compactor: Arc<ContextCompactor>,
-        event_store: gasket_storage::EventStore,
+        event_store: Arc<dyn gasket_storage::EventStoreTrait>,
     ) -> Self {
         Self {
             session_key,
