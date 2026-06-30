@@ -1,9 +1,9 @@
-//! Bridge from `gasket-command::CommandHost` to `AgentSession`.
+//! Bridge from `crate::command::CommandHost` to `AgentSession`.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use gasket_command::CommandHost;
+use crate::command::CommandHost;
 use gasket_engine::broker::{BrokerPayload, MemoryBroker, Topic};
 use gasket_engine::session::AgentSession;
 use gasket_types::{ModelSwitchInfo, SessionKey, SessionSummary};

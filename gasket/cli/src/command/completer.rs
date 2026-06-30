@@ -2,7 +2,7 @@
 
 use reedline::{Completer, Span, Suggestion};
 
-use crate::Dispatcher;
+use crate::command::Dispatcher;
 
 pub struct CommandCompleter {
     candidates: Vec<String>,
@@ -48,9 +48,9 @@ impl Completer for CommandCompleter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtins::{clear, exit, sessions};
-    use crate::dispatcher::DispatcherBuilder;
-    use crate::host::CommandHost;
+    use crate::command::builtins::{clear, exit, sessions};
+    use crate::command::dispatcher::DispatcherBuilder;
+    use crate::command::host::CommandHost;
     use async_trait::async_trait;
     use gasket_types::{ModelSwitchInfo, SessionKey, SessionSummary};
     use std::sync::Arc;

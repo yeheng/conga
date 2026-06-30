@@ -1,7 +1,7 @@
 //! MessageHandler wrapper that routes slash commands through the Dispatcher
 //! before falling back to the LLM pipeline.
 //!
-//! This bridges `gasket-command::Dispatcher` with `gasket-broker::MessageHandler`,
+//! This bridges `crate::command::Dispatcher` with `gasket-broker::MessageHandler`,
 //! so WebSocket (and other streaming channels) get the same slash-command
 //! behavior as the CLI REPL.
 
@@ -13,7 +13,7 @@ use gasket_engine::bus_adapter::EngineHandler;
 use gasket_types::events::{ChannelType, ChatEvent, OutboundMessage};
 use gasket_types::SessionKey;
 
-use gasket_command::{CommandResult, Dispatcher, RouteOutcome};
+use crate::command::{CommandResult, Dispatcher, RouteOutcome};
 
 /// Wraps an [`EngineHandler`] with a [`Dispatcher`] so that slash commands
 /// are intercepted before they reach the LLM.

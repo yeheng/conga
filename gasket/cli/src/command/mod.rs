@@ -14,10 +14,10 @@ pub mod template;
 pub mod types;
 pub mod yaml_loader;
 
+#[cfg(test)]
+mod end_to_end;
+
 pub use completer::CommandCompleter;
 pub use dispatcher::{Dispatcher, DispatcherBuilder};
-pub use error::BuildError;
 pub use host::CommandHost;
-pub use types::{
-    BuiltinHandler, Command, CommandKind, CommandResult, HelpEntry, HelpSource, RouteOutcome,
-};
+pub use types::{CommandResult, RouteOutcome};

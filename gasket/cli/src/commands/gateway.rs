@@ -31,9 +31,9 @@ use tower_http::cors::CorsLayer;
 
 use super::command_host::CliCommandHost;
 use super::dispatching_handler::DispatchingEngineHandler;
-use gasket_command::builtins::{clear, exit, help, model, new as builtin_new, sessions};
-use gasket_command::dispatcher::shared_help_snapshot;
-use gasket_command::DispatcherBuilder;
+use crate::command::builtins::{clear, exit, help, model, new as builtin_new, sessions};
+use crate::command::dispatcher::shared_help_snapshot;
+use crate::command::DispatcherBuilder;
 
 /// Run the gateway command
 pub async fn cmd_gateway() -> Result<()> {
@@ -457,7 +457,7 @@ fn build_extra_tools(
 async fn setup_http_server(
     providers: &Arc<gasket_channels::ImProviders>,
     agent: &Arc<AgentSession>,
-    dispatcher: &Arc<gasket_command::Dispatcher>,
+    dispatcher: &Arc<crate::command::Dispatcher>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     #[cfg(any(feature = "websocket", feature = "feishu"))]
@@ -495,7 +495,7 @@ async fn setup_http_server(
 fn add_context_routes(
     mut app: axum::Router,
     agent: Arc<AgentSession>,
-    dispatcher: Arc<gasket_command::Dispatcher>,
+    dispatcher: Arc<crate::command::Dispatcher>,
 ) -> axum::Router {
     let agent_for_context = agent.clone();
     let agent_for_compact = agent;
@@ -629,7 +629,7 @@ async fn handle_context_compact(
 }
 
 async fn handle_commands_list(
-    dispatcher: Arc<gasket_command::Dispatcher>,
+    dispatcher: Arc<crate::command::Dispatcher>,
 ) -> axum::response::Response {
     let commands: Vec<serde_json::Value> = dispatcher
         .list_commands()
@@ -650,7 +650,7 @@ fn setup_broker_pipeline(
     broker: Arc<gasket_engine::broker::MemoryBroker>,
     providers: &Arc<gasket_channels::ImProviders>,
     agent: &Arc<AgentSession>,
-    dispatcher: &Arc<gasket_command::Dispatcher>,
+    dispatcher: &Arc<crate::command::Dispatcher>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     let outbound_dispatcher = OutboundDispatcher::new(broker.clone(), providers.clone());

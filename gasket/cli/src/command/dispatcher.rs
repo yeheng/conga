@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use crate::error::BuildError;
-use crate::host::CommandHost;
-use crate::parser::{parse, ParsedInput};
-use crate::template::render;
-use crate::types::{Command, CommandKind, CommandResult, HelpEntry, HelpSource, RouteOutcome};
-use crate::yaml_loader::load_user_commands;
+use crate::command::error::BuildError;
+use crate::command::host::CommandHost;
+use crate::command::parser::{parse, ParsedInput};
+use crate::command::template::render;
+use crate::command::types::{Command, CommandKind, CommandResult, HelpEntry, HelpSource, RouteOutcome};
+use crate::command::yaml_loader::load_user_commands;
 use gasket_types::SessionKey;
 
 /// Lazily-filled snapshot of registered commands. The builder writes once
@@ -194,7 +194,7 @@ impl Default for DispatcherBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::BuiltinHandler;
+    use crate::command::types::BuiltinHandler;
     use async_trait::async_trait;
     use futures::FutureExt;
     use gasket_types::{ChannelType, ModelSwitchInfo, SessionKey, SessionSummary};
@@ -378,7 +378,7 @@ mod tests {
         );
     }
 
-    use crate::error::BuildError;
+    use crate::command::error::BuildError;
     use tempfile::TempDir;
 
     fn make_builtin(name: &str, alias: &[&str]) -> Command {

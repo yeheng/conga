@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 
-use crate::dispatcher::HelpSnapshot;
-use crate::host::CommandHost;
-use crate::types::{Command, CommandKind, CommandResult, HelpEntry, HelpSource};
+use crate::command::dispatcher::HelpSnapshot;
+use crate::command::host::CommandHost;
+use crate::command::types::{Command, CommandKind, CommandResult, HelpEntry, HelpSource};
 use gasket_types::SessionKey;
 
 pub fn help(snapshot: Arc<HelpSnapshot>) -> Command {
@@ -62,10 +62,10 @@ fn format_row(e: &HelpEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtins::{clear, exit};
-    use crate::dispatcher::{shared_help_snapshot, DispatcherBuilder};
-    use crate::host::CommandHost;
-    use crate::types::RouteOutcome;
+    use crate::command::builtins::{clear, exit};
+    use crate::command::dispatcher::{shared_help_snapshot, DispatcherBuilder};
+    use crate::command::host::CommandHost;
+    use crate::command::types::RouteOutcome;
     use async_trait::async_trait;
     use gasket_types::{ChannelType, ModelSwitchInfo, SessionKey, SessionSummary};
     use std::sync::Arc;

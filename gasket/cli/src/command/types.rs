@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 
-use crate::host::CommandHost;
+use crate::command::host::CommandHost;
 use gasket_types::SessionKey;
 
 /// A registered command, either a built-in Rust handler or a user YAML entry.

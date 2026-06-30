@@ -1,9 +1,8 @@
 //! Bridge trait between the dispatcher and the host application.
 //!
-//! `gasket-command` does not depend on `gasket-engine`. Built-in handlers
+//! The `command` module does not depend on `gasket-engine`. Built-in handlers
 //! reach engine capabilities (clear session, list sessions, switch model)
-//! through this trait. The CLI and the future Web frontend each provide
-//! their own implementation.
+//! through this trait. The CLI provides its own implementation.
 
 use async_trait::async_trait;
 use gasket_types::{ModelSwitchInfo, SessionKey, SessionSummary};

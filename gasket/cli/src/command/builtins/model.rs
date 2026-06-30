@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 
-use crate::host::CommandHost;
-use crate::types::{Command, CommandKind, CommandResult};
+use crate::command::host::CommandHost;
+use crate::command::types::{Command, CommandKind, CommandResult};
 use gasket_types::SessionKey;
 
 pub fn model() -> Command {
@@ -40,8 +40,8 @@ mod tests {
     use gasket_types::{ChannelType, ModelSwitchInfo, SessionKey, SessionSummary};
     use std::sync::{Arc, Mutex};
 
-    use crate::dispatcher::DispatcherBuilder;
-    use crate::types::RouteOutcome;
+    use crate::command::dispatcher::DispatcherBuilder;
+    use crate::command::types::RouteOutcome;
 
     struct H {
         current: Mutex<String>,

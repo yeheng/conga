@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use futures_util::FutureExt;
-use gasket_command::dispatcher::DispatcherBuilder;
-use gasket_command::types::{Command, CommandKind, CommandResult};
+use crate::command::dispatcher::DispatcherBuilder;
+use crate::command::types::{Command, CommandKind, CommandResult};
 use gasket_engine::broker::{BrokerPayload, MemoryBroker, Topic};
 use gasket_engine::tools::{SubagentSpawner, Tool, ToolContext, ToolRegistry};
 use gasket_types::events::OutboundMessage;
@@ -87,7 +87,7 @@ fn tool_to_command(
         description,
         aliases: vec![],
         kind: CommandKind::Builtin(Arc::new(
-            move |args: &str, _host: Arc<dyn gasket_command::CommandHost>, key: &SessionKey| {
+            move |args: &str, _host: Arc<dyn crate::command::CommandHost>, key: &SessionKey| {
                 let tool_registry = tool_registry.clone();
                 let name = name.clone();
                 let parameters = parameters.clone();

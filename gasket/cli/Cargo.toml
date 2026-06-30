@@ -48,13 +48,13 @@ gasket-engine = { path = "../engine" }
 gasket-storage = { path = "../storage" }
 gasket-sandbox = { path = "../sandbox" }
 gasket-types = { path = "../types" }
-gasket-command = { path = "../command" }
 gasket-channels = { path = "../channels" }
 gasket-broker = { path = "../broker" }
 
 # Async
 tokio.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 futures-util.workspace = true
 
 # CLI
@@ -71,9 +71,12 @@ opentelemetry-otlp = { workspace = true, optional = true }
 
 # Error handling
 anyhow.workspace = true
+thiserror.workspace = true
 
 # Serialization
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+serde_yaml.workspace = true
 
 # Time
 chrono.workspace = true
@@ -109,5 +112,8 @@ rustls.workspace = true
 # HTTP server
 axum = { workspace = true, features = ["ws"], optional = true }
 tower-http = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::types::{Command, CommandKind};
+use crate::command::types::{Command, CommandKind};
 
 #[derive(Deserialize)]
 struct FrontMatter {

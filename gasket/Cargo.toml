@@ -20,7 +20,6 @@ members = [
     "providers",
     "channels",
     "sandbox",
-    "command",
 ]
 
 [profile.release]

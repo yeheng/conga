@@ -12,6 +12,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod cli;
+mod command;
 mod commands;
 mod provider;
 

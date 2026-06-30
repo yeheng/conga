@@ -2,18 +2,20 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 
-use crate::host::CommandHost;
-use crate::types::{Command, CommandKind, CommandResult};
+use crate::command::host::CommandHost;
+use crate::command::types::{Command, CommandKind, CommandResult};
 use gasket_types::SessionKey;
 
-pub fn exit() -> Command {
+const ANSI_CLEAR: &str = "\x1B[2J\x1B[H";
+
+pub fn clear() -> Command {
     Command {
-        name: "exit".into(),
-        description: "Exit the REPL".into(),
-        aliases: vec!["quit".into(), "q".into(), ":q".into()],
+        name: "clear".into(),
+        description: "Clear the terminal screen".into(),
+        aliases: vec![],
         kind: CommandKind::Builtin(Arc::new(
             |_args: &str, _host: Arc<dyn CommandHost>, _session_key: &SessionKey| {
-                async { CommandResult::Quit }.boxed()
+                async { CommandResult::Print(ANSI_CLEAR.to_string()) }.boxed()
             },
         )),
     }
@@ -22,12 +24,12 @@ pub fn exit() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatcher::DispatcherBuilder;
-    use crate::types::RouteOutcome;
-    use std::sync::Arc;
-
     use async_trait::async_trait;
     use gasket_types::{ChannelType, ModelSwitchInfo, SessionKey, SessionSummary};
+    use std::sync::Arc;
+
+    use crate::command::dispatcher::DispatcherBuilder;
+    use crate::command::types::RouteOutcome;
 
     struct H;
 
@@ -43,7 +45,7 @@ mod tests {
         async fn switch_model(
             &self,
             _key: &SessionKey,
-            _new: &str,
+            _: &str,
         ) -> Result<ModelSwitchInfo, String> {
             Ok(ModelSwitchInfo {
                 previous: "m".into(),
@@ -53,35 +55,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_canonical_returns_quit() {
+    async fn clear_emits_ansi_sequence() {
         let d = DispatcherBuilder::new()
             .host(Arc::new(H))
-            .register_builtin(exit())
+            .register_builtin(clear())
             .build()
             .await
             .unwrap();
         let key = SessionKey::new(ChannelType::Cli, "test");
-        assert_eq!(
-            d.route("/exit", &key).await,
-            RouteOutcome::Handled(CommandResult::Quit)
-        );
-    }
-
-    #[tokio::test]
-    async fn exit_aliases_resolve() {
-        let d = DispatcherBuilder::new()
-            .host(Arc::new(H))
-            .register_builtin(exit())
-            .build()
-            .await
-            .unwrap();
-        let key = SessionKey::new(ChannelType::Cli, "test");
-        for s in &["/quit", "/q", "/:q"] {
-            assert_eq!(
-                d.route(s, &key).await,
-                RouteOutcome::Handled(CommandResult::Quit),
-                "alias {s}"
-            );
+        match d.route("/clear", &key).await {
+            RouteOutcome::Handled(CommandResult::Print(s)) => {
+                assert_eq!(s, "\x1B[2J\x1B[H");
+            }
+            other => panic!("unexpected: {:?}", other),
         }
     }
 }

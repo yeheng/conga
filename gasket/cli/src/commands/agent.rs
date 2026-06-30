@@ -9,9 +9,9 @@ use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use tracing::{info, Level};
 
 use gasket_channels::SessionKey;
-use gasket_command::builtins::{clear, exit, help, model, new as builtin_new, sessions};
-use gasket_command::dispatcher::shared_help_snapshot;
-use gasket_command::{CommandCompleter, CommandResult, DispatcherBuilder, RouteOutcome};
+use crate::command::builtins::{clear, exit, help, model, new as builtin_new, sessions};
+use crate::command::dispatcher::shared_help_snapshot;
+use crate::command::{CommandCompleter, CommandResult, DispatcherBuilder, RouteOutcome};
 use gasket_engine::config::ModelRegistry;
 use gasket_engine::providers::ProviderRegistry;
 use gasket_engine::session::{AgentResponse, AgentSession};
