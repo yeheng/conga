@@ -74,6 +74,7 @@ pub struct DispatcherBuilder {
 }
 
 impl Dispatcher {
+    #[allow(dead_code)]
     pub fn builder() -> DispatcherBuilder {
         DispatcherBuilder::new()
     }

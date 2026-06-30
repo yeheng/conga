@@ -22,6 +22,7 @@ pub trait CommandHost: Send + Sync {
     async fn switch_model(&self, key: &SessionKey, new: &str) -> Result<ModelSwitchInfo, String>;
 
     /// Send a message to a specific channel/chat. Default returns an error.
+    #[allow(dead_code)]
     async fn send_message(
         &self,
         _channel: &str,
