@@ -142,9 +142,9 @@ pub fn count_tokens(text: &str) -> usize {
     }
 }
 
-/// Return pre-computed token count from DB, falling back to BPE encoding.
+/// Return pre-computed token count, falling back to BPE encoding.
 ///
-/// Events loaded from SQLite have `content_token_len` set at write time.
+/// Persisted events have `content_token_len` set at write time.
 /// Events created in-memory (not yet persisted) have it as 0, so we
 /// fall back to live BPE token counting.
 fn token_len_or_count(event: &SessionEvent) -> usize {

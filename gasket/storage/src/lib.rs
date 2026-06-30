@@ -12,19 +12,15 @@ mod store_trait;
 
 // ── Merged from gasket-history ──
 pub mod processor;
-pub mod query;
 
 use std::path::PathBuf;
 
-pub use json_state::{CronStateFile, KvStateFile};
+pub use json_state::CronStateFile;
 pub use json_store::JsonStore;
 pub use store_trait::{EventStoreTrait, SessionStoreTrait, StoreError};
 
 // ── History re-exports ──
 pub use processor::{count_tokens, process_history, HistoryConfig, ProcessedHistory};
-pub use query::{
-    HistoryQuery, HistoryQueryBuilder, HistoryResult, QueryOrder, ResultMeta, TimeRange,
-};
 
 pub fn config_dir() -> PathBuf {
     dirs::home_dir()

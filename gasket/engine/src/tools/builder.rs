@@ -146,8 +146,7 @@ pub fn build_tool_registry(registry_config: ToolRegistryConfig) -> ToolRegistry 
     if role.can_spawn() {
         let workflows_dir = workspace.join("workflows");
         tracing::info!("Looking for native workflows in {:?}", workflows_dir);
-        let kv_path = gasket_storage::config_dir().join("state").join("kv.json");
-        match super::discover_workflows(workflows_dir.as_path(), Some(kv_path)) {
+        match super::discover_workflows(workflows_dir.as_path()) {
             Ok(workflow_tools) => {
                 for tool in workflow_tools {
                     tools.register(Box::new(tool));

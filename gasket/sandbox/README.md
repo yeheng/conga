@@ -1,11 +1,14 @@
 # gasket-sandbox
 
-Secure sandbox execution module for gasket with multi-platform support, approval system, and audit logging.
+Secure sandbox execution module for gasket with multi-platform support and audit logging.
+
+> **Approval:** runtime tool-call approval is handled by the live
+> `gasket_types::ApprovalCallback` path (wired through the tool registry), not
+> by this crate.
 
 ## Features
 
 - **Multi-platform support**: Linux (bwrap), macOS (sandbox-exec), Windows (Job Objects)
-- **Approval system**: Fine-grained permission management with CLI and WebSocket interaction
 - **Audit logging**: Comprehensive logging of all operations
 - **Resource limits**: Memory, CPU time, output size, and process count limits
 - **Command policy**: Allowlist/denylist for command filtering
@@ -21,12 +24,10 @@ gasket-sandbox = { path = "gasket-sandbox" }
 
 ## Feature Flags
 
-- `default` - Includes `platform-native`, `approval`, and `audit` features
+- `default` - Includes `platform-native` and `audit` features
 - `platform-native` - Platform-native sandbox (bwrap, sandbox-exec, Job Objects)
-- `approval` - Permission confirmation system
 - `audit` - Audit logging
-- `sqlite` - SQLite storage for approval rules (optional, default uses JSON files)
-- `full` - All features including SQLite
+- `full` - All features
 
 ## Quick Start
 
@@ -60,12 +61,6 @@ sandbox:
   # Backend: auto | fallback | bwrap | sandbox-exec | docker
   backend: auto
 
-  # Approval configuration
-  approval:
-    enabled: true
-    default_level: ask_always  # denied | ask_always | ask_once | allowed
-    session_timeout: 3600
-
   # Resource limits
   limits:
     max_memory_mb: 512
@@ -94,30 +89,6 @@ sandbox:
 | macOS | sandbox-exec | Apple Seatbelt sandbox |
 | Windows | Job Objects | Windows Job Objects limits |
 | All | fallback | Direct execution with ulimit |
-
-## Approval System
-
-The approval system provides fine-grained permission management:
-
-```rust
-use gasket_sandbox::prelude::*;
-
-// Create approval manager
-let store = JsonPermissionStore::default_location()?;
-let config = ApprovalConfig::default();
-let manager = ApprovalManager::new(Box::new(store), config);
-
-// Check permission
-let operation = OperationType::command("rm");
-let verdict = manager.check_permission(&operation, &ExecutionContext::new()).await;
-
-// Add a rule
-let rule = ApprovalRule::new(
-    OperationType::command("ls"),
-    PermissionLevel::Allowed,
-);
-manager.add_rule(rule).await?;
-```
 
 ## Audit Logging
 

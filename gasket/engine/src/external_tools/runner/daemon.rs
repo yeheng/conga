@@ -16,13 +16,13 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
-use crate::plugin::dispatcher::{DispatcherContext, RpcDispatcher};
-use crate::plugin::manifest::{Permission, PluginManifest};
-use crate::plugin::rpc::{
+use crate::external_tools::dispatcher::{DispatcherContext, RpcDispatcher};
+use crate::external_tools::manifest::{Permission, PluginManifest};
+use crate::external_tools::rpc::{
     decode, encode, RpcError, RpcMessage, RpcRequest, RpcResponse, MAX_MESSAGE_SIZE,
 };
-use crate::plugin::runner::simple::spawn_process;
-use crate::plugin::runner::{PluginError, PluginResult};
+use crate::external_tools::runner::simple::spawn_process;
+use crate::external_tools::runner::{PluginError, PluginResult};
 
 /// Persistent JSON-RPC script process.
 pub struct JsonRpcDaemon {

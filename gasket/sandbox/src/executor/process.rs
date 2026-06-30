@@ -10,10 +10,6 @@ use super::ExecutionResult;
 use crate::backend::{create_backend, IsolationLevel, SandboxBackend};
 use crate::config::{CommandPolicy, PolicyVerdict, SandboxConfig};
 use crate::error::{Result, SandboxError};
-
-#[cfg(feature = "approval")]
-use crate::approval::{ApprovalManager, ExecutionContext, OperationType};
-
 #[cfg(feature = "audit")]
 use crate::audit::AuditLog;
 
@@ -23,8 +19,6 @@ pub struct ProcessManager {
     policy: CommandPolicy,
     backend: Box<dyn SandboxBackend>,
     timeout: Duration,
-    #[cfg(feature = "approval")]
-    approval: Option<Arc<ApprovalManager>>,
     #[cfg(feature = "audit")]
     audit: Option<Arc<AuditLog>>,
 }
@@ -47,8 +41,6 @@ impl ProcessManager {
             policy,
             backend,
             timeout,
-            #[cfg(feature = "approval")]
-            approval: None,
             #[cfg(feature = "audit")]
             audit: None,
         })
@@ -57,13 +49,6 @@ impl ProcessManager {
     /// Create with custom timeout
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self
-    }
-
-    /// Set an approval manager for permission checks before execution.
-    #[cfg(feature = "approval")]
-    pub fn with_approval(mut self, approval: Arc<ApprovalManager>) -> Self {
-        self.approval = Some(approval);
         self
     }
 
@@ -102,26 +87,7 @@ impl ProcessManager {
             return Err(SandboxError::PolicyDenied(reason));
         }
 
-        // Step 2: Approval check (if configured)
-        #[cfg(feature = "approval")]
-        {
-            if let Some(ref approval) = self.approval {
-                let operation = OperationType::command_with_args(
-                    command.split_whitespace().next().unwrap_or(""),
-                    command,
-                );
-                let context = ExecutionContext::new().with_working_dir(working_dir);
-
-                let level = approval.request_approval(&operation, &context).await?;
-                if level == crate::approval::PermissionLevel::Denied {
-                    return Err(SandboxError::PermissionDenied(
-                        "operation denied by approval system".into(),
-                    ));
-                }
-            }
-        }
-
-        // Step 3: Audit — command start
+        // Step 2: Audit — command start
         #[cfg(feature = "audit")]
         {
             if let Some(ref audit) = self.audit {
@@ -131,7 +97,7 @@ impl ProcessManager {
             }
         }
 
-        // Step 4: Execute
+        // Step 3: Execute
         let start = Instant::now();
         let result = self
             .backend
@@ -148,7 +114,7 @@ impl ProcessManager {
             duration_ms: duration.as_millis() as u64,
         };
 
-        // Step 5: Audit — command end
+        // Step 4: Audit — command end
         #[cfg(feature = "audit")]
         {
             if let Some(ref audit) = self.audit {

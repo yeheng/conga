@@ -40,11 +40,8 @@ all-providers = ["provider-anthropic", "provider-gemini", "provider-copilot", "p
 # Embedding
 embedding = ["gasket-engine/embedding"]
 
-# Workspace template download (now in CLI, not core)
-workspace-download = ["dep:tar", "dep:flate2"]
-
 # Full build (all optional features enabled)
-full = ["default", "all-providers", "workspace-download", "all-channels", "telemetry", "embedding"]
+full = ["default", "all-providers", "all-channels", "telemetry", "embedding"]
 
 [dependencies]
 gasket-engine = { path = "../engine" }
@@ -112,13 +109,5 @@ rustls.workspace = true
 # HTTP server
 axum = { workspace = true, features = ["ws"], optional = true }
 tower-http = { workspace = true, optional = true }
-
-# HTTP client (for workspace downloads)
-reqwest.workspace = true
-
-# Archive extraction (for workspace template downloads)
-tempfile = "3"
-tar = { version = "0.4", optional = true }
-flate2 = { version = "1.0", optional = true }
 
 

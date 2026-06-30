@@ -1,7 +1,7 @@
 //! Error types for gasket-sandbox
 //!
 //! Provides comprehensive error handling for sandbox operations,
-//! backend failures, approval system, and audit logging.
+//! backend failures, and audit logging.
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -40,22 +40,6 @@ pub enum SandboxError {
     /// Command denied by policy
     #[error("Command denied by policy: {0}")]
     PolicyDenied(String),
-
-    /// Permission denied by approval system
-    #[error("Permission denied: {0}")]
-    PermissionDenied(String),
-
-    /// Approval request failed
-    #[error("Approval request failed: {0}")]
-    ApprovalFailed(String),
-
-    /// Approval timeout (user did not respond)
-    #[error("Approval request timed out after {timeout_secs} seconds")]
-    ApprovalTimeout { timeout_secs: u64 },
-
-    /// Permission store error
-    #[error("Permission store error: {0}")]
-    StoreError(String),
 
     /// IO error
     #[error("IO error: {0}")]

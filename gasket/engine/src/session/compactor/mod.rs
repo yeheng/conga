@@ -114,7 +114,7 @@ pub struct ContextCompactor {
     provider: Arc<dyn LlmProvider>,
     /// Event store for loading events and garbage collection.
     event_store: Arc<dyn EventStoreTrait>,
-    /// SQLite store for summary persistence (session_summaries table).
+    /// JSON store for summary persistence.
     session_store: Arc<dyn SessionStoreTrait>,
     /// Model to use for summarization.
     model: String,

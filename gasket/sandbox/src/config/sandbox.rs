@@ -34,10 +34,6 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub policy: CommandPolicyConfig,
 
-    /// Approval configuration
-    #[serde(default)]
-    pub approval: ApprovalConfig,
-
     /// Audit configuration
     #[serde(default)]
     pub audit: AuditConfig,
@@ -60,7 +56,6 @@ impl Default for SandboxConfig {
             workspace: None,
             limits: ResourceLimits::default(),
             policy: CommandPolicyConfig::default(),
-            approval: ApprovalConfig::default(),
             audit: AuditConfig::default(),
         }
     }
@@ -94,58 +89,6 @@ impl SandboxConfig {
     pub fn with_backend(mut self, backend: impl Into<String>) -> Self {
         self.backend = backend.into();
         self
-    }
-}
-
-/// Approval system configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApprovalConfig {
-    /// Enable approval system (default: true when approval feature is enabled)
-    #[serde(default = "default_approval_enabled")]
-    pub enabled: bool,
-
-    /// Default permission level: denied | ask_always | ask_once | allowed
-    #[serde(default = "default_permission_level")]
-    pub default_level: String,
-
-    /// Path to rules file (JSON format)
-    #[serde(default)]
-    pub rules_file: Option<PathBuf>,
-
-    /// Session timeout in seconds (for ask_once permissions)
-    #[serde(default = "default_session_timeout")]
-    pub session_timeout: u64,
-
-    /// Approval interaction timeout in seconds
-    #[serde(default = "default_interaction_timeout")]
-    pub interaction_timeout: u64,
-}
-
-fn default_approval_enabled() -> bool {
-    true
-}
-
-fn default_permission_level() -> String {
-    "ask_always".to_string()
-}
-
-fn default_session_timeout() -> u64 {
-    3600 // 1 hour
-}
-
-fn default_interaction_timeout() -> u64 {
-    300 // 5 minutes
-}
-
-impl Default for ApprovalConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_approval_enabled(),
-            default_level: default_permission_level(),
-            rules_file: None,
-            session_timeout: default_session_timeout(),
-            interaction_timeout: default_interaction_timeout(),
-        }
     }
 }
 
@@ -244,10 +187,6 @@ policy:
     - cat
   denylist:
     - "rm -rf /"
-approval:
-  enabled: true
-  default_level: ask_once
-  session_timeout: 7200
 audit:
   enabled: true
   log_file: /var/log/gasket/audit.log
@@ -258,8 +197,6 @@ audit:
         assert_eq!(config.tmp_size_mb, 128);
         assert_eq!(config.limits.max_memory_mb, 1024);
         assert_eq!(config.policy.allowlist, vec!["ls", "cat"]);
-        assert!(config.approval.enabled);
-        assert_eq!(config.approval.session_timeout, 7200);
         assert!(config.audit.enabled);
     }
 }

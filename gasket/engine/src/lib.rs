@@ -25,16 +25,6 @@ pub mod external_tools;
 pub mod heartbeat;
 pub mod hooks;
 pub mod kernel;
-
-/// Deprecated alias for [`external_tools`]. The crate was renamed because
-/// "plugin" implies a dynamic extension system (dlopen/cdylib), while this
-/// module actually wraps external scripts and subprocesses as `Tool` impls.
-/// New code should use `external_tools::`; the `plugin::` path is kept as a
-/// re-export so existing imports continue to work.
-#[deprecated(note = "renamed to `external_tools` — same module, honest name")]
-pub mod plugin {
-    pub use crate::external_tools::*;
-}
 pub mod session;
 pub mod skills;
 pub mod subagents;

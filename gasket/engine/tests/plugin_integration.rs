@@ -1,4 +1,4 @@
-use gasket_engine::plugin::discover_plugins_in_dir;
+use gasket_engine::external_tools::discover_plugins_in_dir;
 use gasket_engine::tools::{Tool, ToolContext, ToolRegistry};
 use gasket_providers::LlmProvider;
 use gasket_types::{
@@ -96,10 +96,10 @@ async fn test_jsonrpc_ping_tool() {
         .expect("test_ping not found")
         .manifest()
         .clone();
-    let ping_tool = gasket_engine::plugin::PluginTool::new(
+    let ping_tool = gasket_engine::external_tools::PluginTool::new(
         ping_manifest,
         test_scripts_dir(),
-        Some(gasket_engine::plugin::EngineResources {
+        Some(gasket_engine::external_tools::EngineResources {
             tool_registry: Arc::new(ToolRegistry::new()),
             provider: Arc::new(FailingMockProvider),
         }),

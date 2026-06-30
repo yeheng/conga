@@ -28,7 +28,6 @@
 //! ```
 
 pub mod manager;
-pub mod monitor;
 pub mod runner;
 pub mod tracker;
 
@@ -37,9 +36,6 @@ pub use manager::{spawn_subagent, SimpleSpawner, TaskSpec};
 
 // Re-exports - tracker types
 pub use tracker::{SubagentResult, SubagentTracker, TrackerError};
-
-// Re-exports - monitor types
-pub use monitor::{Intervention, MonitoredHandle, MonitoredSpawner, ProgressUpdate};
 
 // Re-exports - runner
 pub use runner::{run_subagent, ModelResolver};

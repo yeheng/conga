@@ -1,15 +1,20 @@
 //! # gasket-sandbox
 //!
-//! Secure sandbox execution module for gasket with multi-platform support,
-//! approval system, and audit logging.
+//! Secure sandbox execution module for gasket with multi-platform support and
+//! audit logging.
 //!
 //! ## Features
 //!
 //! - **Multi-platform support**: Linux (bwrap), macOS (sandbox-exec), Windows (Job Objects)
-//! - **Approval system**: Fine-grained permission management with CLI and WebSocket interaction
 //! - **Audit logging**: Comprehensive logging of all operations
 //! - **Resource limits**: Memory, CPU time, output size, and process count limits
 //! - **Command policy**: Allowlist/denylist for command filtering
+//!
+//! ## Approval
+//!
+//! Runtime tool-call approval is handled by the live
+//! `gasket_types::ApprovalCallback` path (wired through the tool registry),
+//! not by this crate.
 //!
 //! ## Quick Start
 //!
@@ -38,12 +43,6 @@ pub mod config;
 pub mod error;
 pub mod executor;
 
-#[cfg(feature = "approval")]
-pub mod approval;
-
-#[cfg(feature = "approval")]
-pub mod interaction;
-
 #[cfg(feature = "audit")]
 pub mod audit;
 
@@ -52,15 +51,6 @@ pub use backend::{available_backends, create_backend, Platform, SandboxBackend};
 pub use config::{AuditConfig, CommandPolicy, CommandPolicyConfig, ResourceLimits, SandboxConfig};
 pub use error::{Result, SandboxError};
 pub use executor::{ExecutionResult, ProcessManager};
-
-#[cfg(feature = "approval")]
-pub use approval::{
-    ApprovalManager, ApprovalRequest, ApprovalResponse, ApprovalRule, Condition, ExecutionContext,
-    OperationType, PermissionLevel, PermissionStore, PermissionVerdict, RuleSource,
-};
-
-#[cfg(feature = "approval")]
-pub use interaction::{AllowAllInteraction, ApprovalInteraction, DenyAllInteraction};
 
 #[cfg(feature = "audit")]
 pub use audit::{AuditEvent, AuditEventType, AuditLog};
@@ -71,9 +61,6 @@ pub mod prelude {
     pub use crate::config::SandboxConfig;
     pub use crate::error::{Result, SandboxError};
     pub use crate::executor::{ExecutionResult, ProcessManager};
-
-    #[cfg(feature = "approval")]
-    pub use crate::approval::{ApprovalManager, ApprovalRequest, OperationType, PermissionLevel};
 
     #[cfg(feature = "audit")]
     pub use crate::audit::{AuditEvent, AuditLog};

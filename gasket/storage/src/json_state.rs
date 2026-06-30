@@ -1,9 +1,8 @@
-//! Tiny JSON-backed state files for cron / kv state.
+//! Tiny JSON-backed state files for cron schedule state.
 //!
-//! These replace the small SQLite tables (`cron_state`, `kv_store`) with one
-//! JSON file each under `<base>/state/`. Each file is a serialized map mutated
-//! via read-modify-write under an atomic temp-file + rename
-//! ([`crate::fs::atomic_write`]).
+//! Replaces the small SQLite `cron_state` table with one JSON file under
+//! `<base>/state/`. Mutated via read-modify-write under an atomic temp-file
+//! + rename ([`crate::fs::atomic_write`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -90,53 +89,12 @@ impl CronStateFile {
 }
 
 // ── kv_store ────────────────────────────────────────────────────────────────
-
-/// Generic key/value state: `{key: value}`.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-pub struct KvStateFile {
-    #[serde(default)]
-    pub entries: HashMap<String, String>,
-}
-
-impl KvStateFile {
-    pub async fn read(path: &Path, key: &str) -> anyhow::Result<Option<String>> {
-        Ok(Self::load(path).await?.entries.get(key).cloned())
-    }
-
-    pub async fn write(path: &Path, key: &str, value: &str) -> anyhow::Result<()> {
-        rmw(path, |s: &mut Self| {
-            s.entries.insert(key.into(), value.into());
-        })
-        .await
-    }
-
-    pub async fn delete(path: &Path, key: &str) -> anyhow::Result<bool> {
-        rmw(path, |s: &mut Self| s.entries.remove(key).is_some()).await
-    }
-
-    async fn load(path: &Path) -> anyhow::Result<Self> {
-        Ok(tokio::fs::read_to_string(path)
-            .await
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default())
-    }
-}
+// Removed: generic KV store was only used by WorkflowTool checkpoint/recovery,
+// which has been deleted. Cron schedule state above is the only remaining consumer.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_kv_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("kv.json");
-        assert_eq!(KvStateFile::read(&p, "k").await.unwrap(), None);
-        KvStateFile::write(&p, "k", "v").await.unwrap();
-        assert_eq!(KvStateFile::read(&p, "k").await.unwrap(), Some("v".into()));
-        assert!(KvStateFile::delete(&p, "k").await.unwrap());
-        assert_eq!(KvStateFile::read(&p, "k").await.unwrap(), None);
-    }
 
     #[tokio::test]
     async fn test_cron_json() {

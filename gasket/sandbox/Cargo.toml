@@ -5,23 +5,20 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-keywords = ["sandbox", "security", "isolation", "approval"]
-description = "Secure sandbox execution module for gasket with multi-platform support and approval system"
+keywords = ["sandbox", "security", "isolation"]
+description = "Secure sandbox execution module for gasket with multi-platform support"
 
 [features]
-default = ["platform-native", "approval", "audit"]
+default = ["platform-native", "audit"]
 
 # Platform-native sandbox (bwrap, sandbox-exec, fallback)
 platform-native = []
-
-# Approval system (permission confirmation)
-approval = []
 
 # Audit logging
 audit = []
 
 # Full feature set
-full = ["platform-native", "approval", "audit"]
+full = ["platform-native", "audit"]
 
 [dependencies]
 # Async runtime

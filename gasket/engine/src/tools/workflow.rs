@@ -511,26 +511,16 @@ fn parse_verdict(text: &str) -> Result<(String, String), String> {
 
 // ── WorkflowTool ────────────────────────────────────────────────────────────
 
-/// Serialized state for WorkflowTool crash/recovery.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct WorkflowState {
-    current_idx: usize,
-    step_index: usize,
-    context_map: HashMap<String, String>,
-    retry_counts: HashMap<usize, usize>,
-}
-
 /// A tool that executes a YAML-defined workflow as a state machine.
 #[derive(Clone)]
 pub struct WorkflowTool {
     workflow: Workflow,
-    kv_path: Option<std::path::PathBuf>,
 }
 
 impl WorkflowTool {
     /// Create a new workflow tool from a validated workflow.
-    pub fn new(workflow: Workflow, kv_path: Option<std::path::PathBuf>) -> Self {
-        Self { workflow, kv_path }
+    pub fn new(workflow: Workflow) -> Self {
+        Self { workflow }
     }
 
     /// Execute a single step: spawn subagent, stream events, collect result.
@@ -656,28 +646,6 @@ impl Tool for WorkflowTool {
         let mut step_index = 0usize;
         const MAX_WORKFLOW_STEPS: usize = 100;
 
-        let state_key = format!("workflow_state:{}:{}", ctx.session_key, self.workflow.name);
-
-        // ── Recovery: try to load previous state from KV store ──
-        if let Some(ref p) = self.kv_path {
-            match gasket_storage::KvStateFile::read(p, &state_key).await {
-                Ok(Some(json)) => {
-                    if let Ok(state) = serde_json::from_str::<WorkflowState>(&json) {
-                        current_idx = state.current_idx;
-                        step_index = state.step_index;
-                        context_map.extend(state.context_map);
-                        retry_counts.extend(state.retry_counts);
-                        info!(
-                            "[Workflow {}] Restored state from KV (step_index={})",
-                            self.workflow.name, step_index
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => warn!("[Workflow {}] KV read failed: {}", self.workflow.name, e),
-            }
-        }
-
         loop {
             if step_index >= MAX_WORKFLOW_STEPS {
                 return Err(ToolError::ExecutionError(format!(
@@ -697,21 +665,6 @@ impl Tool for WorkflowTool {
 
             // Store result keyed by step name so templates like {{research}} resolve.
             context_map.insert(step.name.clone(), result);
-
-            // ── Persistence: snapshot state after each successful step ──
-            if let Some(ref p) = self.kv_path {
-                let state = WorkflowState {
-                    current_idx,
-                    step_index,
-                    context_map: context_map.clone(),
-                    retry_counts: retry_counts.clone(),
-                };
-                if let Ok(json) = serde_json::to_string(&state) {
-                    if let Err(e) = gasket_storage::KvStateFile::write(p, &state_key, &json).await {
-                        warn!("[Workflow {}] KV write failed: {}", self.workflow.name, e);
-                    }
-                }
-            }
 
             // Determine next step.
             match &step.transition {
@@ -753,13 +706,6 @@ impl Tool for WorkflowTool {
             }
         }
 
-        // ── Cleanup: delete KV snapshot on successful completion ──
-        if let Some(ref p) = self.kv_path {
-            if let Err(e) = gasket_storage::KvStateFile::delete(p, &state_key).await {
-                warn!("[Workflow {}] KV delete failed: {}", self.workflow.name, e);
-            }
-        }
-
         // If an output_template is defined, render it; otherwise return the raw context JSON.
         if let Some(ref template) = self.workflow.output_template {
             Ok(substitute_template(template, &context_map))
@@ -782,7 +728,6 @@ impl Tool for WorkflowTool {
 /// and wraps each in a `WorkflowTool`.
 pub fn discover_workflows(
     workflows_dir: &Path,
-    kv_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<Vec<WorkflowTool>> {
     let mut tools = Vec::new();
 
@@ -823,7 +768,7 @@ pub fn discover_workflows(
                 match Workflow::from_manifest(&manifest) {
                     Ok(workflow) => {
                         info!("Discovered workflow '{}' from {:?}", workflow.name, path);
-                        tools.push(WorkflowTool::new(workflow, kv_path.clone()));
+                        tools.push(WorkflowTool::new(workflow));
                     }
                     Err(e) => {
                         warn!("Failed to validate workflow from {:?}: {}", path, e);
