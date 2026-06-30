@@ -969,7 +969,7 @@ steps:
             },
         };
         let workflow = Workflow::from_manifest(&manifest).unwrap();
-        let tool = WorkflowTool::new(workflow, None);
+        let tool = WorkflowTool::new(workflow);
         assert_eq!(tool.name(), "my_flow");
         assert_eq!(tool.description(), "does things");
     }
