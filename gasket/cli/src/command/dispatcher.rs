@@ -8,7 +8,9 @@ use crate::command::error::BuildError;
 use crate::command::host::CommandHost;
 use crate::command::parser::{parse, ParsedInput};
 use crate::command::template::render;
-use crate::command::types::{Command, CommandKind, CommandResult, HelpEntry, HelpSource, RouteOutcome};
+use crate::command::types::{
+    Command, CommandKind, CommandResult, HelpEntry, HelpSource, RouteOutcome,
+};
 use crate::command::yaml_loader::load_user_commands;
 use gasket_types::SessionKey;
 

@@ -5,7 +5,10 @@
 //! Note: TokenTracker and TokenUsage are now defined in gasket_types for cross-crate sharing.
 //! This module re-exports the types and adds engine-specific utilities.
 
-pub use gasket_types::{ModelPricing, SessionTokenStats, TokenTracker, TokenUsage};
+pub use gasket_types::{
+    calculate_cost, format_cost, format_token_usage, ModelPricing, SessionTokenStats, TokenTracker,
+    TokenUsage,
+};
 
 use std::sync::OnceLock;
 use tiktoken_rs::CoreBPE;
@@ -37,28 +40,6 @@ pub fn estimate_tokens(text: &str) -> usize {
         Some(enc) => enc.encode_with_special_tokens(text).len(),
         None => text.len() / 4,
     }
-}
-
-/// Calculate cost for token usage given optional pricing
-pub fn calculate_cost(usage: &TokenUsage, pricing: Option<&ModelPricing>) -> f64 {
-    match pricing {
-        Some(p) => p.calculate_cost(usage.input_tokens, usage.output_tokens),
-        None => 0.0,
-    }
-}
-
-/// Format token usage for display
-pub fn format_token_usage(usage: &TokenUsage) -> String {
-    format!(
-        "Input: {} | Output: {} | Total: {}",
-        usage.input_tokens, usage.output_tokens, usage.total_tokens
-    )
-}
-
-/// Format cost for display
-pub fn format_cost(cost: f64, currency: &str) -> String {
-    let symbol = if currency == "CNY" { "¥" } else { "$" };
-    format!("{}{:.4}", symbol, cost)
 }
 
 /// Format token/cost info for a single request

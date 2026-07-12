@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 use tracing::instrument;
 
 use super::ExecutionResult;
+#[cfg(feature = "audit")]
+use crate::audit::AuditLog;
 use crate::backend::{create_backend, IsolationLevel, SandboxBackend};
 use crate::config::{CommandPolicy, PolicyVerdict, SandboxConfig};
 use crate::error::{Result, SandboxError};
-#[cfg(feature = "audit")]
-use crate::audit::AuditLog;
 
 /// Process manager for executing commands
 pub struct ProcessManager {

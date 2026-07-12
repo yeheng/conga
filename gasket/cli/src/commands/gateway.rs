@@ -70,8 +70,7 @@ pub async fn cmd_gateway() -> Result<()> {
     let cron_path = gasket_engine::config::config_dir()
         .join("state")
         .join("cron.json");
-    let cron_service =
-        Arc::new(CronService::new(workspace.clone(), cron_path).await);
+    let cron_service = Arc::new(CronService::new(workspace.clone(), cron_path).await);
 
     let inbound_sender = gasket_channels::InboundSender::new(inbound_tx.clone());
     let providers = Arc::new(gasket_channels::ImProviders::from_config(
@@ -110,7 +109,10 @@ pub async fn cmd_gateway() -> Result<()> {
 
     // Build the slash-command dispatcher for WebSocket clients.
     // Built-ins are registered here; user YAML commands are loaded from ~/.gasket/commands.
-    let host = Arc::new(CliCommandHost::new(agent.clone(), Some(outbound_tx.clone())));
+    let host = Arc::new(CliCommandHost::new(
+        agent.clone(),
+        Some(outbound_tx.clone()),
+    ));
     let help_snap = shared_help_snapshot();
     let user_dir = dirs::home_dir().map(|h| h.join(".gasket/commands"));
     let mut dispatcher_builder = DispatcherBuilder::new()
@@ -273,11 +275,7 @@ async fn setup_agent_pipeline(
     // `embedding_recall` carries (searcher, indexer).
     #[cfg(feature = "embedding")]
     let (history_search, embedding_recall) = if let Some(ref emb_cfg) = config.embedding {
-        match gasket_engine::session::history::builder::setup_embedding_recall(
-            store,
-            emb_cfg,
-        )
-        .await
+        match gasket_engine::session::history::builder::setup_embedding_recall(store, emb_cfg).await
         {
             Ok((searcher, indexer)) => {
                 let params = gasket_engine::tools::HistorySearchParams {
@@ -351,10 +349,7 @@ async fn setup_agent_pipeline(
             agent_config.clone(),
             tools.clone(),
             store.clone(),
-            gasket_engine::session::builder::EmbeddingContext {
-                searcher,
-                indexer,
-            },
+            gasket_engine::session::builder::EmbeddingContext { searcher, indexer },
         )
         .await
         .context("Failed to initialize agent (check workspace bootstrap files)")?
@@ -700,21 +695,13 @@ async fn setup_direct_pipeline(
             let route_outcome = dispatcher.route(&msg.content, &session_key).await;
             match route_outcome {
                 RouteOutcome::Handled(CommandResult::Print(text)) => {
-                    let outbound = OutboundMessage::new(
-                        msg.channel,
-                        msg.chat_id,
-                        text,
-                    );
+                    let outbound = OutboundMessage::new(msg.channel, msg.chat_id, text);
                     if let Err(e) = providers_in.send(&outbound).await {
                         tracing::error!(target: "gateway::inbound", "Send failed: {}", e);
                     }
                 }
                 RouteOutcome::Handled(CommandResult::Error(text)) => {
-                    let outbound = OutboundMessage::new(
-                        msg.channel,
-                        msg.chat_id,
-                        text,
-                    );
+                    let outbound = OutboundMessage::new(msg.channel, msg.chat_id, text);
                     if let Err(e) = providers_in.send(&outbound).await {
                         tracing::error!(target: "gateway::inbound", "Send failed: {}", e);
                     }
@@ -723,7 +710,10 @@ async fn setup_direct_pipeline(
                 RouteOutcome::Rewrite { prompt, .. } => {
                     dispatch_agent_turn(
                         agent.clone(),
-                        InboundMessage { content: prompt, ..msg },
+                        InboundMessage {
+                            content: prompt,
+                            ..msg
+                        },
                         providers_in.clone(),
                     )
                     .await;
@@ -731,7 +721,10 @@ async fn setup_direct_pipeline(
                 RouteOutcome::Passthrough(text) => {
                     dispatch_agent_turn(
                         agent.clone(),
-                        InboundMessage { content: text, ..msg },
+                        InboundMessage {
+                            content: text,
+                            ..msg
+                        },
                         providers_in.clone(),
                     )
                     .await;
@@ -772,11 +765,7 @@ async fn dispatch_agent_turn(
         }
         Err(e) => {
             tracing::error!(target: "gateway::dispatch", "Agent error: {}", e);
-            let error_out = OutboundMessage::new(
-                msg.channel,
-                msg.chat_id,
-                format!("Error: {}", e),
-            );
+            let error_out = OutboundMessage::new(msg.channel, msg.chat_id, format!("Error: {}", e));
             let _ = providers_for_err.send(&error_out).await;
         }
     }

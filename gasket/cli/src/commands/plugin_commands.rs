@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use futures_util::FutureExt;
 use crate::command::dispatcher::DispatcherBuilder;
 use crate::command::types::{Command, CommandKind, CommandResult};
+use futures_util::FutureExt;
 use gasket_engine::tools::{SubagentSpawner, Tool, ToolContext, ToolRegistry};
 use gasket_types::events::OutboundMessage;
 use gasket_types::SessionKey;

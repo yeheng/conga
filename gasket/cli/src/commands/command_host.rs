@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use crate::command::CommandHost;
+use async_trait::async_trait;
 use gasket_engine::session::AgentSession;
 use gasket_types::events::OutboundMessage;
 use gasket_types::{ModelSwitchInfo, SessionKey, SessionSummary};

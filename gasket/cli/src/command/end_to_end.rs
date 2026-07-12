@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use crate::command::builtins::{clear, exit, help, model, new as builtin_new, sessions};
 use crate::command::dispatcher::shared_help_snapshot;
 use crate::command::{CommandHost, CommandResult, DispatcherBuilder, RouteOutcome};
+use async_trait::async_trait;
 use gasket_types::{ChannelType, ModelSwitchInfo, SessionKey, SessionSummary};
 
 struct H {

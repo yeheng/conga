@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use super::format::extract_json_value;
 use super::spawn_common::spawn_event_forwarder;
 use super::{Tool, ToolContext, ToolError, ToolResult};
 
@@ -438,21 +439,10 @@ fn substitute_template(template: &str, ctx: &HashMap<String, String>) -> String 
 
 /// Extract the first complete JSON object from arbitrary LLM output.
 ///
-/// Tolerates surrounding prose, markdown fences, and trailing commentary by
-/// locating the first `{` and using `serde_json`'s streaming deserializer to
-/// stop at the matching `}`. This is the right level of robustness for LLM
-/// output: strict prompting can't always prevent trailing explanations.
+/// Delegates to [`extract_json_value`] in the `format` module — the single
+/// source of truth for robust JSON extraction from LLM output.
 fn extract_first_json_object(text: &str) -> Result<Value, String> {
-    let trimmed = text.trim();
-    let start = trimmed
-        .find('{')
-        .ok_or_else(|| "No JSON object found in output".to_string())?;
-    let slice = &trimmed[start..];
-    serde_json::Deserializer::from_str(slice)
-        .into_iter::<Value>()
-        .next()
-        .ok_or_else(|| "No JSON object found in output".to_string())?
-        .map_err(|e| format!("JSON parse error: {}", e))
+    extract_json_value(text)
 }
 
 /// Parse a verdict from LLM output.
@@ -726,9 +716,7 @@ impl Tool for WorkflowTool {
 ///
 /// Scans `*.yaml` and `*.yml` files, parses them as `WorkflowManifest`,
 /// and wraps each in a `WorkflowTool`.
-pub fn discover_workflows(
-    workflows_dir: &Path,
-) -> anyhow::Result<Vec<WorkflowTool>> {
+pub fn discover_workflows(workflows_dir: &Path) -> anyhow::Result<Vec<WorkflowTool>> {
     let mut tools = Vec::new();
 
     if !workflows_dir.exists() {

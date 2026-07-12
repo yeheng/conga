@@ -30,9 +30,9 @@ use crate::kernel::{self, ExecutionResult, RuntimeContext, StreamEvent};
 use crate::session::finalizer::ResponseFinalizer;
 use crate::session::history::builder::BuildOutcome;
 use crate::token_tracker::ModelPricing;
-use futures_util::StreamExt;
 use crate::tools::{SubagentSpawner, ToolRegistry};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use gasket_types::events::ChatEvent;
 use gasket_types::pending_ask::PendingAskRegistry;
 use gasket_types::SessionKey;
@@ -252,15 +252,8 @@ impl AgentSession {
         store: Arc<gasket_storage::JsonStore>,
         embedding: builder::EmbeddingContext,
     ) -> Result<Self, AgentError> {
-        builder::build_session_with_embedding(
-            provider,
-            workspace,
-            config,
-            tools,
-            store,
-            embedding,
-        )
-        .await
+        builder::build_session_with_embedding(provider, workspace, config, tools, store, embedding)
+            .await
     }
 
     /// Access the pending-ask registry (for wiring into the subagent spawner).
@@ -491,12 +484,11 @@ impl AgentSession {
         runtime_ctx.refs.session_key = Some(session_key.clone());
 
         if let Some(compactor) = self.compactor.as_ref() {
-            runtime_ctx.checkpoint_callback =
-                Some(Arc::new(SessionCheckpointCallback::new(
-                    fctx.session_key.clone(),
-                    compactor.clone(),
-                    self.context_builder.event_store().clone(),
-                )));
+            runtime_ctx.checkpoint_callback = Some(Arc::new(SessionCheckpointCallback::new(
+                fctx.session_key.clone(),
+                compactor.clone(),
+                self.context_builder.event_store().clone(),
+            )));
         }
 
         // ── Wire channels ───────────────────────────────────────────
@@ -572,7 +564,9 @@ impl AgentSession {
 
             // PostProcess: finalize response
             let result = result?;
-            let response = finalizer.finalize(result, &fctx_for_task, &model_for_task).await;
+            let response = finalizer
+                .finalize(result, &fctx_for_task, &model_for_task)
+                .await;
             Ok(response)
         });
 

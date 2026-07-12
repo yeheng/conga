@@ -696,25 +696,4 @@ mod tests {
         assert_eq!(query.token, Some("test-token".to_string()));
         assert_eq!(query.user_id, Some("user-123".to_string()));
     }
-
-    #[test]
-    fn test_websocket_manager_creation() {
-        let broker = std::sync::Arc::new(gasket_broker::MemoryBroker::default());
-        let manager = WebSocketManager::new(crate::middleware::InboundSender::new(broker));
-
-        assert_eq!(manager.connection_count(), 0);
-    }
-
-    #[test]
-    fn test_auth_validator() {
-        let broker = std::sync::Arc::new(gasket_broker::MemoryBroker::default());
-        let manager = WebSocketManager::new(crate::middleware::InboundSender::new(broker));
-
-        // Set a simple validator
-        manager.set_auth_validator(|token| token == "valid-token");
-
-        // The validator is set, we can't easily test it without a full connection
-        // but we can verify the method doesn't panic
-        assert!(manager.auth_validator.read().unwrap().is_some());
-    }
 }

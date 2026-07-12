@@ -1,6 +1,7 @@
 //! Shared formatting helpers for tool output.
 
 use super::SubagentResult;
+use serde_json::Value;
 
 /// Extract a JSON array from an LLM response that may contain extraneous text.
 ///
@@ -96,6 +97,14 @@ pub fn extract_json_object<T: serde::de::DeserializeOwned>(
 
     // 4. Final attempt.
     serde_json::from_str::<T>(trimmed)
+}
+
+/// Extract the first JSON object from arbitrary LLM output as a raw `Value`.
+///
+/// Tolerates surrounding prose, markdown fences, and trailing commentary
+/// by delegating to [`extract_json_object`] with `serde_json::Value`.
+pub fn extract_json_value(text: &str) -> Result<Value, String> {
+    extract_json_object::<Value>(text).map_err(|e| format!("JSON parse error: {}", e))
 }
 
 /// Truncate a string for display in the WebSocket stream.

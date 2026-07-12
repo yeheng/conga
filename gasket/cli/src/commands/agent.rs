@@ -8,10 +8,10 @@ use colored::Colorize;
 use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use tracing::{info, Level};
 
-use gasket_channels::SessionKey;
 use crate::command::builtins::{clear, exit, help, model, new as builtin_new, sessions};
 use crate::command::dispatcher::shared_help_snapshot;
 use crate::command::{CommandCompleter, CommandResult, DispatcherBuilder, RouteOutcome};
+use gasket_channels::SessionKey;
 use gasket_engine::config::ModelRegistry;
 use gasket_engine::providers::ProviderRegistry;
 use gasket_engine::session::{AgentResponse, AgentSession};
@@ -188,10 +188,7 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
             agent_config.clone(),
             tools.clone(),
             store.clone(),
-            gasket_engine::session::builder::EmbeddingContext {
-                searcher,
-                indexer,
-            },
+            gasket_engine::session::builder::EmbeddingContext { searcher, indexer },
         )
         .await
         .context("Failed to initialize agent (check workspace bootstrap files)")?
@@ -298,7 +295,10 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
             // help snapshot. The CLI is the only path through this dispatcher;
             // bot channels (Telegram, Discord, Slack) keep their existing
             // passthrough behavior — they never see this code.
-            let host = Arc::new(CliCommandHost::new(agent.clone(), Some(outbound_tx.clone())));
+            let host = Arc::new(CliCommandHost::new(
+                agent.clone(),
+                Some(outbound_tx.clone()),
+            ));
             let help_snap = shared_help_snapshot();
             let user_dir = dirs::home_dir().map(|h| h.join(".gasket/commands"));
 

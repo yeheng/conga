@@ -22,12 +22,7 @@ use gasket_storage::count_tokens;
 /// | SOUL.md     | Core behavioral rules & knowledge management   |
 /// | MEMORY.md   | Session memory (auto-truncated, may not exist) |
 /// | BOOTSTRAP.md| First-run onboarding ritual                    |
-pub const BOOTSTRAP_FILES_FULL: &[&str] = &[
-    "PROFILE.md",
-    "SOUL.md",
-    "MEMORY.md",
-    "BOOTSTRAP.md",
-];
+pub const BOOTSTRAP_FILES_FULL: &[&str] = &["PROFILE.md", "SOUL.md", "MEMORY.md", "BOOTSTRAP.md"];
 
 /// Bootstrap files loaded for the minimal (subagent) profile — only core identity
 pub const BOOTSTRAP_FILES_MINIMAL: &[&str] = &["PROFILE.md", "SOUL.md"];

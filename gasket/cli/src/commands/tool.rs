@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use gasket_engine::config::load_config;
 use gasket_engine::tools::{build_tool_registry, ToolContext, ToolRegistryConfig};
 
-
 /// Execute a tool directly via CLI.
 ///
 /// Example: gasket tool execute evolution '{"threshold": 20}'
@@ -16,18 +15,17 @@ pub async fn cmd_tool_execute(name: String, args: String) -> Result<()> {
     let provider_info = crate::provider::find_provider(&config, vault.as_deref())
         .context("No provider available")?;
 
-    let store = Arc::new(gasket_engine::JsonStore::new(gasket_engine::config::config_dir()));
+    let store = Arc::new(gasket_engine::JsonStore::new(
+        gasket_engine::config::config_dir(),
+    ));
 
     gasket_engine::config::init_config(config.clone());
 
     // Initialize embedding recall if configured
     #[cfg(feature = "embedding")]
     let (history_search, _embedding_indexer) = if let Some(ref emb_cfg) = config.embedding {
-        match gasket_engine::session::history::builder::setup_embedding_recall(
-            &store,
-            emb_cfg,
-        )
-        .await
+        match gasket_engine::session::history::builder::setup_embedding_recall(&store, emb_cfg)
+            .await
         {
             Ok((searcher, indexer)) => {
                 let params = gasket_engine::tools::HistorySearchParams {

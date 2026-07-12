@@ -11,9 +11,9 @@ use crate::SubagentSpawner;
 use gasket_storage::{EventStoreTrait, SessionStoreTrait};
 
 use super::{
-    registry::ToolRegistry, AskUserTool, ClearSessionTool, EditFileTool, ExecTool, HistoryQueryTool,
-    ListDirTool, NewSessionTool, ReadFileTool, SpawnParallelTool, SpawnTool, ToolMetadata,
-    WebFetchTool, WebSearchTool, WriteFileTool,
+    registry::ToolRegistry, AskUserTool, ClearSessionTool, EditFileTool, ExecTool,
+    HistoryQueryTool, ListDirTool, NewSessionTool, ReadFileTool, SpawnParallelTool, SpawnTool,
+    ToolMetadata, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 
 /// Trait for subsystems that provide tools to the registry.

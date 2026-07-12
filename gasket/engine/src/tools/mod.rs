@@ -51,7 +51,8 @@ pub use context::ContextTool;
 pub use cron::CronTool;
 pub use filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use format::{
-    extract_json_array, extract_json_object, format_subagent_response, truncate_for_display,
+    extract_json_array, extract_json_object, extract_json_value, format_subagent_response,
+    truncate_for_display,
 };
 pub use history_query::HistoryQueryTool;
 #[cfg(feature = "embedding")]
