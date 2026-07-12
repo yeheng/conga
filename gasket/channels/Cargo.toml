@@ -20,7 +20,6 @@ all-channels = ["telegram", "discord", "slack", "feishu", "wechat", "websocket"]
 [dependencies]
 # Internal crates
 gasket-types = { path = "../types" }
-gasket-broker = { workspace = true }
 
 # Async
 tokio.workspace = true

@@ -8,8 +8,7 @@ description = "Core execution engine for gasket"
 
 [dependencies]
 gasket-types = { path = "../types" }
-gasket-broker = { path = "../broker" }
-
+gasket-channels = { path = "../channels" }
 gasket-storage = { path = "../storage" }
 gasket-providers = { path = "../providers" }
 gasket-sandbox = { path = "../sandbox" }

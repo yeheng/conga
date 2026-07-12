@@ -7,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::events::InboundMessage;
@@ -202,23 +203,23 @@ pub fn log_outbound(channel: &str, chat_id: &str, content_len: usize) {
 use std::sync::Arc;
 
 /// A wrapper that applies auth and rate-limit checks before forwarding
-/// messages to the message broker.
+/// messages to the inbound mpsc channel.
 ///
 /// This ensures that **all** channels — including webhook-driven ones — go
 /// through the same middleware pipeline (auth + rate-limit) before reaching
-/// the broker's Topic::Inbound.
+/// the engine's inbound dispatch loop.
 #[derive(Clone)]
 pub struct InboundSender {
-    broker: Arc<gasket_broker::MemoryBroker>,
+    tx: mpsc::Sender<InboundMessage>,
     rate_limiter: Option<Arc<SimpleRateLimiter>>,
     auth_checker: Option<Arc<SimpleAuthChecker>>,
 }
 
 impl InboundSender {
-    /// Create a new `InboundSender` backed by the message broker.
-    pub fn new(broker: Arc<gasket_broker::MemoryBroker>) -> Self {
+    /// Create a new `InboundSender` backed by an mpsc channel.
+    pub fn new(tx: mpsc::Sender<InboundMessage>) -> Self {
         Self {
-            broker,
+            tx,
             rate_limiter: None,
             auth_checker: None,
         }
@@ -263,14 +264,10 @@ impl InboundSender {
             }
         }
 
-        let envelope = gasket_broker::Envelope::new(
-            gasket_broker::Topic::Inbound,
-            gasket_broker::BrokerPayload::Inbound(msg),
-        );
-        self.broker
-            .publish(envelope)
+        self.tx
+            .send(msg)
             .await
-            .map_err(|e| anyhow::anyhow!("broker publish failed: {}", e))
+            .map_err(|_| anyhow::anyhow!("inbound channel closed"))
     }
 }
 

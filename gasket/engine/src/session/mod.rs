@@ -1,13 +1,9 @@
 //! Session management layer — wraps the kernel with stateful lifecycle.
 //!
 //! AgentSession owns session state (events, prompts, memory, compaction)
-//! and delegates per-turn request orchestration to
-//! [`pipeline::RequestPipeline`]. The session crate is split into two halves:
-//!
-//! - **Lifecycle (here in `mod.rs`):** clear/list/switch_model/force_compact/
-//!   graceful_shutdown — operations whose lifetime spans many turns.
-//! - **Per-turn pipeline (`pipeline.rs`):** preprocess → execute → postprocess.
-//!   Owned by `AgentSession` as a field, never carries session-level state.
+//! and handles per-turn request orchestration via `process_turn`.
+//! The preprocess → execute → postprocess flow is inlined into a single
+//! async function for clarity — no trait objects, no cross-file state搬运.
 
 pub mod builder;
 pub mod compactor;
@@ -15,7 +11,6 @@ pub mod config;
 pub mod finalizer;
 pub mod history;
 pub mod pending_ask;
-pub(crate) mod pipeline;
 pub mod prompt;
 pub mod skills_loader;
 
@@ -31,9 +26,11 @@ use tracing::{info, warn};
 
 use crate::error::AgentError;
 use crate::hooks::HookRegistry;
-use crate::kernel::{ExecutionResult, RuntimeContext, StreamEvent};
-use crate::session::pipeline::RequestPipeline;
+use crate::kernel::{self, ExecutionResult, RuntimeContext, StreamEvent};
+use crate::session::finalizer::ResponseFinalizer;
+use crate::session::history::builder::BuildOutcome;
 use crate::token_tracker::ModelPricing;
+use futures_util::StreamExt;
 use crate::tools::{SubagentSpawner, ToolRegistry};
 use async_trait::async_trait;
 use gasket_types::events::ChatEvent;
@@ -93,6 +90,7 @@ impl From<AgentResponse> for gasket_types::SubagentResponse {
 }
 
 /// Owned snapshot for post-response finalization.
+#[derive(Clone)]
 pub(crate) struct FinalizeContext {
     session_key: SessionKey,
     session_key_str: String,
@@ -195,14 +193,9 @@ impl crate::kernel::CheckpointCallback for SessionCheckpointCallback {
 /// Stateful session management — wraps the kernel, adds session lifecycle.
 ///
 /// Owns session-level state (events, prompts, compaction, cost tracking) and
-/// delegates per-turn request orchestration to `pipeline: RequestPipeline`.
-/// The split decouples two responsibilities that were previously crammed
-/// into one god-object:
-///
-/// - **Session lifecycle:** active model, history, compactor, pending asks,
-///   embedding index, graceful shutdown.
-/// - **Per-turn pipeline:** finalizer + tracked task spawning. Lives in
-///   `pipeline.rs` and never touches session-only state.
+/// handles per-turn request orchestration via `process_turn` — a single
+/// async function that inlines preprocess → execute → postprocess.
+/// No trait objects, no cross-file state搬运, no indirection.
 #[allow(unused_variables)]
 pub struct AgentSession {
     runtime_ctx: RuntimeContext,
@@ -213,9 +206,11 @@ pub struct AgentSession {
     compactor: Option<Arc<ContextCompactor>>,
     /// Pricing config for cost tracking. None when cost tracking is disabled.
     pricing: Option<ModelPricing>,
-    /// Per-turn request orchestration. Holds the response finalizer and a
-    /// `TaskTracker` so that `graceful_shutdown` can await in-flight turns.
-    pipeline: RequestPipeline,
+    /// Response finalizer — invoked after each kernel execution to persist
+    /// events, trigger compaction, and calculate cost.
+    finalizer: ResponseFinalizer,
+    /// TaskTracker so that `graceful_shutdown` can await in-flight turns.
+    pending_done: tokio_util::task::TaskTracker,
     /// Pending-ask registry shared with tools through `RuntimeContext`.
     pending_asks: Arc<PendingAskRegistryImpl>,
     /// RAII guard for the background embedding indexer.
@@ -223,8 +218,6 @@ pub struct AgentSession {
     #[cfg(feature = "embedding")]
     embedding_indexer: Option<gasket_embedding::EmbeddingIndexer>,
 }
-
-// `PipelineContext` now lives in `pipeline.rs` as `pub(crate)`.
 
 impl AgentSession {
     /// Create a new session with default services.
@@ -424,15 +417,14 @@ impl AgentSession {
     /// all pending `finalize_response` calls complete. This prevents data loss where
     /// an assistant message has been generated but not yet persisted to the EventStore.
     pub async fn graceful_shutdown(&self) {
-        let tracker = self.pipeline.pending_done();
-        tracker.close();
-        if !tracker.is_empty() {
+        self.pending_done.close();
+        if !self.pending_done.is_empty() {
             info!(
                 "Graceful shutdown: awaiting {} pending finalization task(s)",
-                tracker.len()
+                self.pending_done.len()
             );
         }
-        tracker.wait().await;
+        self.pending_done.wait().await;
     }
 
     /// Inbound entry: try to deliver to a pending ask first, otherwise run
@@ -466,13 +458,11 @@ impl AgentSession {
         Ok(HandleOutcome::Replied { events, result })
     }
 
-    /// Process a message with streaming.
+    /// Process a single turn: preprocess → execute → postprocess, inlined.
     ///
-    /// Delegates per-turn orchestration to [`RequestPipeline`]. This method
-    /// stays on `AgentSession` because external callers depend on it, but it
-    /// now contains only the wiring (channels, synthesis callback,
-    /// aggregator-cancel) that is genuinely session-scoped. The
-    /// preprocess/execute/postprocess stages live in `pipeline.rs`.
+    /// This is the single linear async function that replaces the old
+    /// `RequestPipeline` three-stage split. No cross-file state搬运,
+    /// no PipelineContext temporary struct, no trait objects.
     pub async fn process_direct_streaming_with_channel(
         &self,
         content: &str,
@@ -485,61 +475,110 @@ impl AgentSession {
         ),
         AgentError,
     > {
-        let (mut ctx, aborted) = self
-            .pipeline
-            .preprocess(
-                &self.runtime_ctx,
-                self.model(),
-                &self.context_builder,
-                self.compactor.as_ref(),
-                content,
-                session_key,
-            )
-            .await?;
+        // ── Stage 1: PreProcess — build request context ──────────────
+        let active_model = self.model();
+        let build_outcome = self.context_builder.build(content, session_key).await?;
+        let request = match build_outcome {
+            BuildOutcome::Aborted(msg) => {
+                return Ok(early_abort_response(msg, active_model));
+            }
+            BuildOutcome::Ready(req) => req,
+        };
 
-        if let Some(msg) = aborted {
-            return Ok(early_abort_response(msg, ctx.model));
+        let fctx = FinalizeContext::from_request(&request);
+        let messages = request.messages;
+        let mut runtime_ctx = self.runtime_ctx.clone();
+        runtime_ctx.refs.session_key = Some(session_key.clone());
+
+        if let Some(compactor) = self.compactor.as_ref() {
+            runtime_ctx.checkpoint_callback =
+                Some(Arc::new(SessionCheckpointCallback::new(
+                    fctx.session_key.clone(),
+                    compactor.clone(),
+                    self.context_builder.event_store().clone(),
+                )));
         }
 
+        // ── Wire channels ───────────────────────────────────────────
         let (kernel_tx, kernel_rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let (chat_tx, chat_rx) = tokio::sync::mpsc::channel(64);
 
         let outbound_tx = bridge_outbound_to_chat(chat_tx.clone());
-        ctx.runtime_ctx.refs.outbound_tx = Some(outbound_tx.clone());
-        ctx.runtime_ctx.config.tool_filter = tool_filter;
+        runtime_ctx.refs.outbound_tx = Some(outbound_tx.clone());
+        runtime_ctx.config.tool_filter = tool_filter;
 
         // Inject the synthesis callback at the session layer — the kernel
         // itself stays oblivious to specific channel implementations.
-        let synth_session_key = ctx.runtime_ctx.refs.session_key.clone().unwrap_or_else(|| {
+        let synth_session_key = runtime_ctx.refs.session_key.clone().unwrap_or_else(|| {
             gasket_types::SessionKey::new(gasket_types::events::ChannelType::Cli, "default")
         });
-        ctx.runtime_ctx.refs.synthesis_callback = Some(Arc::new(
+        runtime_ctx.refs.synthesis_callback = Some(Arc::new(
             crate::kernel::synthesis::WebSocketSynthesizer::new(
-                ctx.runtime_ctx.provider.clone(),
-                ctx.runtime_ctx.provider.default_model().to_string(),
+                runtime_ctx.provider.clone(),
+                runtime_ctx.provider.default_model().to_string(),
                 outbound_tx,
                 synth_session_key,
             ),
         ));
 
         // Reset any previous aggregator left from the prior turn.
-        let cancel = ctx
-            .runtime_ctx
+        let cancel = runtime_ctx
             .refs
             .aggregator_cancel
             .get_or_insert_with(gasket_types::AggregatorCancel::new);
         cancel.cancel_current();
 
-        let messages = std::mem::take(&mut ctx.messages);
-        let result_handle = self
-            .pipeline
-            .spawn_pipeline_task(ctx, messages, kernel_tx, kernel_rx, chat_tx);
+        // ── Stage 2 + 3: Execute + PostProcess — spawn tracked task ──
+        let finalizer = self.finalizer.clone();
+        let fctx_for_task = fctx.clone();
+        let model_for_task = active_model.clone();
+        let chat_tx_err = chat_tx.clone();
+
+        let result_handle = self.pending_done.spawn(async move {
+            // Forward kernel StreamEvents to ChatEvent channel
+            let stream_future = StreamExt::for_each(
+                tokio_stream::wrappers::ReceiverStream::new(kernel_rx)
+                    .filter_map(|event| futures_util::future::ready(event.to_chat_event())),
+                |chat| {
+                    let chat_tx = chat_tx.clone();
+                    async move {
+                        let _ = chat_tx.send(chat).await;
+                    }
+                },
+            );
+
+            // Execute kernel
+            let exec_future = async move {
+                match kernel::execute_streaming(&runtime_ctx, messages, kernel_tx).await {
+                    Ok(r) => Ok::<_, AgentError>(r),
+                    Err(crate::kernel::KernelError::MaxIterations(n)) => Ok(ExecutionResult {
+                        content: format!("Maximum iterations ({}) reached.", n),
+                        reasoning_content: None,
+                        tools_used: vec![],
+                        token_usage: None,
+                    }),
+                    Err(e) => Err(e.into()),
+                }
+            };
+
+            let (result, _) = tokio::join!(exec_future, stream_future);
+
+            if let Err(ref e) = result {
+                let _ = chat_tx_err
+                    .send(ChatEvent::error(format!("Agent error: {}", e)))
+                    .await;
+                let _ = chat_tx_err.send(ChatEvent::done()).await;
+            }
+
+            // PostProcess: finalize response
+            let result = result?;
+            let response = finalizer.finalize(result, &fctx_for_task, &model_for_task).await;
+            Ok(response)
+        });
 
         Ok((chat_rx, result_handle))
     }
 }
-
-// Post-processing logic lives in `session::finalizer::ResponseFinalizer`.
 
 // ── Free-function helpers for streaming entry point ─────────────────────────
 

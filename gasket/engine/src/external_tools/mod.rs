@@ -58,8 +58,9 @@ struct JsonRpcState {
     dispatcher: Arc<RpcDispatcher>,
     resources: EngineResources,
     /// Lazy daemon: `None` until first call, then populated and reused
-    /// until idle-expired.
-    daemon: Arc<tokio::sync::RwLock<Option<Arc<JsonRpcDaemon>>>>,
+    /// until idle-expired. Uses a simple parking_lot::Mutex — no async
+    /// lock, no double-checked locking dance. Plugins are low-concurrency.
+    daemon: Arc<parking_lot::Mutex<Option<Arc<JsonRpcDaemon>>>>,
 }
 
 impl PluginTool {
@@ -84,7 +85,7 @@ impl PluginTool {
             (PluginProtocol::JsonRpc, Some(resources)) => PluginRuntime::JsonRpc(JsonRpcState {
                 dispatcher: Arc::new(build_dispatcher()),
                 resources,
-                daemon: Arc::new(tokio::sync::RwLock::new(None)),
+                daemon: Arc::new(parking_lot::Mutex::new(None)),
             }),
             (PluginProtocol::JsonRpc, None) => {
                 warn!(
@@ -120,8 +121,11 @@ impl JsonRpcState {
         }
     }
 
-    /// Get or spawn the JSON-RPC daemon, handling idle expiration and
-    /// double-checked locking.
+    /// Get or spawn the JSON-RPC daemon, handling idle expiration.
+    ///
+    /// Uses a simple synchronous `parking_lot::Mutex` — no async lock, no
+    /// double-checked locking. Plugin calls are serial/low-concurrency so
+    /// the brief mutex hold during spawn-amortization is irrelevant.
     async fn get_or_spawn_daemon(
         &self,
         manifest: &PluginManifest,
@@ -130,9 +134,9 @@ impl JsonRpcState {
         call_timeout_secs: u64,
         idle_timeout_secs: u64,
     ) -> Result<Arc<JsonRpcDaemon>, ToolError> {
-        // Fast path: existing live daemon.
+        // Fast path: existing live daemon (no idle expiry).
         {
-            let guard = self.daemon.read().await;
+            let guard = self.daemon.lock();
             if let Some(d) = guard.as_ref() {
                 if !d.is_idle_expired() {
                     return Ok(d.clone());
@@ -140,14 +144,9 @@ impl JsonRpcState {
             }
         }
 
-        // Slow path: take write lock and double-check.
-        let mut guard = self.daemon.write().await;
-        if let Some(d) = guard.as_ref() {
-            if !d.is_idle_expired() {
-                return Ok(d.clone());
-            }
-        }
-
+        // Slow path: spawn new daemon. The spawn itself is async, so we
+        // can't hold the non-Send parking_lot::MutexGuard across .await.
+        // Instead: acquire lock to check, release, spawn, acquire again to set.
         let new_daemon = Arc::new(
             JsonRpcDaemon::spawn(
                 manifest,
@@ -161,7 +160,11 @@ impl JsonRpcState {
             .await
             .map_err(|e| ToolError::ExecutionError(e.to_string()))?,
         );
-        *guard = Some(new_daemon.clone());
+
+        {
+            let mut guard = self.daemon.lock();
+            *guard = Some(new_daemon.clone());
+        }
         Ok(new_daemon)
     }
 }

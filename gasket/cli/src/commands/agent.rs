@@ -38,7 +38,10 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
     // ── Infrastructure initialization (Linus refactor: extracted to engine) ──
     let gasket_engine::bootstrap::EngineInfra {
         config,
-        broker,
+        inbound_tx: _,
+        inbound_rx: _,
+        outbound_tx,
+        outbound_rx: _,
         store,
     } = gasket_engine::bootstrap::init_engine_infra(
         gasket_engine::bootstrap::BrokerCapacity::agent_repl(),
@@ -295,7 +298,7 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
             // help snapshot. The CLI is the only path through this dispatcher;
             // bot channels (Telegram, Discord, Slack) keep their existing
             // passthrough behavior — they never see this code.
-            let host = Arc::new(CliCommandHost::new(agent.clone(), Some(broker.clone())));
+            let host = Arc::new(CliCommandHost::new(agent.clone(), Some(outbound_tx.clone())));
             let help_snap = shared_help_snapshot();
             let user_dir = dirs::home_dir().map(|h| h.join(".gasket/commands"));
 
@@ -316,7 +319,7 @@ pub async fn cmd_agent(opts: AgentOptions) -> Result<()> {
                 builder,
                 agent.tools(),
                 Some(subagent_spawner_for_commands.clone()),
-                Some(broker.clone()),
+                Some(outbound_tx.clone()),
             );
             let dispatcher = builder
                 .build()

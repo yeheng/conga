@@ -14,7 +14,6 @@ members = [
     "types",
     "storage",
     "embedding",
-    "broker",
     "engine",
     "cli",
     "providers",
@@ -106,7 +105,6 @@ gasket-embedding = { path = "embedding" }
 gasket-providers = { path = "providers" }
 gasket-channels = { path = "channels" }
 gasket-sandbox = { path = "sandbox" }
-gasket-broker = { path = "broker" }
 gasket-engine = { path = "engine" }
 
 # Async channel primitives

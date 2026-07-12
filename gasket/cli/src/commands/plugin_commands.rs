@@ -8,7 +8,6 @@ use std::sync::Arc;
 use futures_util::FutureExt;
 use crate::command::dispatcher::DispatcherBuilder;
 use crate::command::types::{Command, CommandKind, CommandResult};
-use gasket_engine::broker::{BrokerPayload, MemoryBroker, Topic};
 use gasket_engine::tools::{SubagentSpawner, Tool, ToolContext, ToolRegistry};
 use gasket_types::events::OutboundMessage;
 use gasket_types::SessionKey;
@@ -76,7 +75,7 @@ fn tool_to_command(
     tool: &dyn Tool,
     tool_registry: Arc<ToolRegistry>,
     spawner: Option<Arc<dyn SubagentSpawner>>,
-    broker: Option<Arc<MemoryBroker>>,
+    outbound_tx: Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
 ) -> Command {
     let name = tool.name().to_string();
     let description = tool.description().to_string();
@@ -92,26 +91,20 @@ fn tool_to_command(
                 let name = name.clone();
                 let parameters = parameters.clone();
                 let spawner = spawner.clone();
-                let broker = broker.clone();
+                let outbound_tx = outbound_tx.clone();
                 let parsed = parse_tool_args(args, &parameters);
                 let _session_key = key.clone();
 
                 async move {
                     // Create a channel so the plugin can send intermediate messages
-                    let (outbound_tx, mut outbound_rx) =
+                    let (plugin_tx, mut plugin_rx) =
                         tokio::sync::mpsc::channel::<OutboundMessage>(32);
 
-                    // Background task: forward plugin messages directly via broker.
-                    // Use try_publish so we never block the plugin if the outbound
-                    // dispatcher is not running (e.g. CLI mode without WebSocket).
+                    // Background task: forward plugin outbound messages to gateway.
                     let forward_handle = tokio::spawn(async move {
-                        while let Some(msg) = outbound_rx.recv().await {
-                            if let Some(ref broker) = broker {
-                                let envelope = gasket_engine::broker::Envelope::new(
-                                    Topic::Outbound,
-                                    BrokerPayload::Outbound(msg),
-                                );
-                                if let Err(e) = broker.try_publish(envelope) {
+                        while let Some(msg) = plugin_rx.recv().await {
+                            if let Some(ref tx) = outbound_tx {
+                                if let Err(e) = tx.send(msg).await {
                                     tracing::warn!("Plugin message forward dropped: {}", e);
                                 }
                             }
@@ -122,7 +115,7 @@ fn tool_to_command(
                     if let Some(s) = spawner {
                         ctx = ctx.spawner(s);
                     }
-                    ctx = ctx.outbound_tx(outbound_tx);
+                    ctx = ctx.outbound_tx(plugin_tx);
                     ctx = ctx.session_key(key.clone());
 
                     let result = match tool_registry.execute(&name, parsed, &ctx).await {
@@ -147,11 +140,16 @@ pub fn register_tool_commands(
     mut builder: DispatcherBuilder,
     tool_registry: Arc<ToolRegistry>,
     spawner: Option<Arc<dyn SubagentSpawner>>,
-    broker: Option<Arc<MemoryBroker>>,
+    outbound_tx: Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
 ) -> DispatcherBuilder {
     for name in tool_registry.list() {
         if let Some(tool) = tool_registry.get(name) {
-            let cmd = tool_to_command(tool, tool_registry.clone(), spawner.clone(), broker.clone());
+            let cmd = tool_to_command(
+                tool,
+                tool_registry.clone(),
+                spawner.clone(),
+                outbound_tx.clone(),
+            );
             builder = builder.register_builtin(cmd);
         }
     }

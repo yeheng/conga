@@ -17,7 +17,6 @@
 
 // NOTE: `agent/` module removed — migrated to `kernel/` + `session/` + `subagents/`
 pub mod bootstrap;
-pub mod bus_adapter;
 pub mod config;
 pub mod cron;
 pub mod error;
@@ -41,11 +40,6 @@ pub use session::AgentConfig;
 pub use subagents::ModelResolver;
 
 // ── Facade re-exports (merged from gasket-core) ─────────────
-
-// Broker (topic-based message broker)
-pub mod broker {
-    pub use gasket_broker::*;
-}
 
 // Providers
 pub mod providers {

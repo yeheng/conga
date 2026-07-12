@@ -12,8 +12,10 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use gasket_broker::MemoryBroker;
+use gasket_channels::InboundMessage;
+use gasket_channels::OutboundMessage;
 use gasket_storage::JsonStore;
+use tokio::sync::mpsc;
 
 use crate::config::{app_config::Config, init_config, load_config};
 
@@ -21,12 +23,15 @@ use crate::config::{app_config::Config, init_config, load_config};
 ///
 /// Owns:
 /// - the parsed config (already pushed into the global slot via `init_config`);
-/// - a topic broker;
+/// - inbound/outbound mpsc channels for direct message routing;
 /// - a `JsonStore` wrapped in an `Arc`, the sole storage backend.
 pub struct EngineInfra {
     pub config: Config,
-    pub broker: Arc<MemoryBroker>,
     pub store: Arc<JsonStore>,
+    pub inbound_tx: mpsc::Sender<InboundMessage>,
+    pub inbound_rx: mpsc::Receiver<InboundMessage>,
+    pub outbound_tx: mpsc::Sender<OutboundMessage>,
+    pub outbound_rx: mpsc::Receiver<OutboundMessage>,
 }
 
 impl EngineInfra {
@@ -71,7 +76,7 @@ impl BrokerCapacity {
 }
 
 /// Initialize the shared infrastructure: load config → init globals →
-/// create broker → open JsonStore → wrap in `Arc`. Returns [`EngineInfra`].
+/// create mpsc channels → open JsonStore → wrap in `Arc`. Returns [`EngineInfra`].
 ///
 /// Fails fast if config cannot be loaded. The caller is expected to handle
 /// vault unlock and provider resolution on top of the returned handle.
@@ -79,13 +84,17 @@ pub async fn init_engine_infra(capacity: BrokerCapacity) -> Result<EngineInfra> 
     let config = load_config().await?;
     init_config(config.clone());
 
-    let broker = Arc::new(MemoryBroker::new(capacity.p2p, capacity.broadcast));
+    let (inbound_tx, inbound_rx) = mpsc::channel(capacity.p2p);
+    let (outbound_tx, outbound_rx) = mpsc::channel(capacity.broadcast);
 
     let store = Arc::new(JsonStore::new(gasket_storage::config_dir()));
 
     Ok(EngineInfra {
         config,
-        broker,
         store,
+        inbound_tx,
+        inbound_rx,
+        outbound_tx,
+        outbound_rx,
     })
 }

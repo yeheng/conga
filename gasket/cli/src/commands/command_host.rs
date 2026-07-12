@@ -4,20 +4,26 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use crate::command::CommandHost;
-use gasket_engine::broker::{BrokerPayload, MemoryBroker, Topic};
 use gasket_engine::session::AgentSession;
+use gasket_types::events::OutboundMessage;
 use gasket_types::{ModelSwitchInfo, SessionKey, SessionSummary};
 
 #[allow(dead_code)]
 pub struct CliCommandHost {
     pub agent: Arc<AgentSession>,
-    pub broker: Option<Arc<MemoryBroker>>,
+    pub outbound_tx: Option<Arc<tokio::sync::mpsc::Sender<OutboundMessage>>>,
 }
 
 #[allow(dead_code)]
 impl CliCommandHost {
-    pub fn new(agent: Arc<AgentSession>, broker: Option<Arc<MemoryBroker>>) -> Self {
-        Self { agent, broker }
+    pub fn new(
+        agent: Arc<AgentSession>,
+        outbound_tx: Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
+    ) -> Self {
+        Self {
+            agent,
+            outbound_tx: outbound_tx.map(Arc::new),
+        }
     }
 }
 
@@ -45,18 +51,16 @@ impl CommandHost for CliCommandHost {
         chat_id: &str,
         content: &str,
     ) -> Result<(), String> {
-        let broker = self.broker.as_ref().ok_or("Broker not available")?;
+        let outbound_tx = self
+            .outbound_tx
+            .as_ref()
+            .ok_or("Outbound channel not available")?;
         let channel_type: gasket_types::events::ChannelType = channel.into();
-        let outbound =
-            gasket_types::events::OutboundMessage::new(channel_type, chat_id, content.to_string());
-        let envelope = gasket_engine::broker::Envelope::new(
-            Topic::Outbound,
-            BrokerPayload::Outbound(outbound),
-        );
-        broker
-            .publish(envelope)
+        let outbound = OutboundMessage::new(channel_type, chat_id, content.to_string());
+        outbound_tx
+            .send(outbound)
             .await
-            .map_err(|e| format!("Broker publish failed: {e}"))?;
+            .map_err(|e| format!("Outbound send failed: {e}"))?;
         Ok(())
     }
 }

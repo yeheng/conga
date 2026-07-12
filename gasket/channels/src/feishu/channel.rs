@@ -547,7 +547,8 @@ mod tests {
     use super::*;
 
     fn create_test_sender() -> InboundSender {
-        InboundSender::new(std::sync::Arc::new(gasket_broker::MemoryBroker::default()))
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        InboundSender::new(tx)
     }
 
     #[test]

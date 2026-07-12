@@ -7,8 +7,6 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use tracing::info;
 
-use gasket_engine::bus_adapter::EngineHandler;
-
 use gasket_engine::config::{load_config, ModelRegistry};
 use gasket_engine::cron::CronService;
 use gasket_engine::providers::ProviderRegistry;
@@ -19,9 +17,7 @@ use gasket_engine::tools::ContextTool;
 use gasket_engine::tools::{build_tool_registry, CronTool, Tool, ToolContext, ToolRegistryConfig};
 use gasket_engine::tools::{MessageTool, ToolMetadata, ToolRegistry};
 use gasket_engine::SubagentSpawner;
-
-use crate::commands::broker_outbound::OutboundDispatcher;
-use gasket_engine::broker::{BrokerPayload, SessionManager};
+use gasket_types::events::{InboundMessage, OutboundMessage};
 use gasket_types::SessionKey;
 
 use super::registry::CliModelResolver;
@@ -30,10 +26,10 @@ use axum::response::IntoResponse;
 use tower_http::cors::CorsLayer;
 
 use super::command_host::CliCommandHost;
-use super::dispatching_handler::DispatchingEngineHandler;
 use crate::command::builtins::{clear, exit, help, model, new as builtin_new, sessions};
 use crate::command::dispatcher::shared_help_snapshot;
 use crate::command::DispatcherBuilder;
+use crate::command::{CommandResult, RouteOutcome};
 
 /// Run the gateway command
 pub async fn cmd_gateway() -> Result<()> {
@@ -52,7 +48,10 @@ pub async fn cmd_gateway() -> Result<()> {
     // ── Infrastructure initialization (Linus refactor: extracted to engine) ──
     let gasket_engine::bootstrap::EngineInfra {
         config,
-        broker,
+        inbound_tx,
+        inbound_rx,
+        outbound_tx,
+        outbound_rx,
         store,
     } = gasket_engine::bootstrap::init_engine_infra(
         gasket_engine::bootstrap::BrokerCapacity::gateway(),
@@ -74,11 +73,13 @@ pub async fn cmd_gateway() -> Result<()> {
     let cron_service =
         Arc::new(CronService::new(workspace.clone(), cron_path).await);
 
-    let inbound_sender = gasket_channels::InboundSender::new(broker.clone());
+    let inbound_sender = gasket_channels::InboundSender::new(inbound_tx.clone());
     let providers = Arc::new(gasket_channels::ImProviders::from_config(
         &config.channels,
         inbound_sender.clone(),
     ));
+    let inbound_tx_heartbeat = inbound_tx.clone();
+    let inbound_tx_cron = inbound_tx;
 
     // Set up WebSocket approval callback if WebSocket is enabled
     let approval_callback = {
@@ -109,7 +110,7 @@ pub async fn cmd_gateway() -> Result<()> {
 
     // Build the slash-command dispatcher for WebSocket clients.
     // Built-ins are registered here; user YAML commands are loaded from ~/.gasket/commands.
-    let host = Arc::new(CliCommandHost::new(agent.clone(), Some(broker.clone())));
+    let host = Arc::new(CliCommandHost::new(agent.clone(), Some(outbound_tx.clone())));
     let help_snap = shared_help_snapshot();
     let user_dir = dirs::home_dir().map(|h| h.join(".gasket/commands"));
     let mut dispatcher_builder = DispatcherBuilder::new()
@@ -129,7 +130,7 @@ pub async fn cmd_gateway() -> Result<()> {
         dispatcher_builder,
         tools.clone(),
         Some(subagent_spawner.clone()),
-        Some(broker.clone()),
+        Some(outbound_tx.clone()),
     );
     let dispatcher = Arc::new(
         dispatcher_builder
@@ -140,11 +141,20 @@ pub async fn cmd_gateway() -> Result<()> {
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     setup_http_server(&providers, &agent, &dispatcher, &mut tasks).await;
-    setup_broker_pipeline(broker.clone(), &providers, &agent, &dispatcher, &mut tasks);
-    start_heartbeat_service(broker.clone(), &workspace, &mut tasks);
+    setup_direct_pipeline(
+        inbound_rx,
+        outbound_rx,
+        &providers,
+        &agent,
+        &dispatcher,
+        &mut tasks,
+    )
+    .await;
+    start_heartbeat_service(inbound_tx_heartbeat, &workspace, &mut tasks);
     cron_service.ensure_system_cron_jobs().await;
     start_cron_checker(
-        broker.clone(),
+        inbound_tx_cron,
+        outbound_tx.clone(),
         &cron_service,
         tools,
         subagent_spawner,
@@ -646,23 +656,130 @@ async fn handle_commands_list(
     (axum::http::StatusCode::OK, axum::Json(commands)).into_response()
 }
 
-fn setup_broker_pipeline(
-    broker: Arc<gasket_engine::broker::MemoryBroker>,
+/// Sets up the direct pipeline: inbound dispatch loop + outbound send loop.
+/// Replaces the old broker-based pipeline (OutboundDispatcher + SessionManager).
+async fn setup_direct_pipeline(
+    mut inbound_rx: tokio::sync::mpsc::Receiver<InboundMessage>,
+    mut outbound_rx: tokio::sync::mpsc::Receiver<OutboundMessage>,
     providers: &Arc<gasket_channels::ImProviders>,
     agent: &Arc<AgentSession>,
     dispatcher: &Arc<crate::command::Dispatcher>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
-    let outbound_dispatcher = OutboundDispatcher::new(broker.clone(), providers.clone());
-    tasks.push(tokio::spawn(outbound_dispatcher.run()));
+    let providers_out = providers.clone();
+    // Outbound loop: read from mpsc channel and send to providers
+    tasks.push(tokio::spawn(async move {
+        while let Some(msg) = outbound_rx.recv().await {
+            // WebSocket is a streaming channel: chunks must arrive in strict
+            // order. Inline the send instead of spawning to preserve FIFO.
+            if msg.channel == gasket_channels::ChannelType::WebSocket {
+                if let Err(e) = providers_out.send(&msg).await {
+                    tracing::error!(target: "gateway::outbound", "Outbound delivery failed: {}", e);
+                }
+                continue;
+            }
+            let providers = providers_out.clone();
+            tokio::spawn(async move {
+                if let Err(e) = providers.send(&msg).await {
+                    tracing::error!(target: "gateway::outbound", "Outbound delivery failed: {}", e);
+                }
+            });
+        }
+        tracing::info!(target: "gateway::outbound", "Outbound loop shutting down");
+    }));
 
-    let engine_handler = EngineHandler::new(agent.clone());
-    let handler = Arc::new(DispatchingEngineHandler::new(
-        engine_handler,
-        dispatcher.clone(),
-    ));
-    let session_mgr = SessionManager::new(broker, handler, std::time::Duration::from_secs(3600));
-    tasks.push(tokio::spawn(session_mgr.run()));
+    let providers_in = providers.clone();
+    let agent = agent.clone();
+    let dispatcher = dispatcher.clone();
+    // Inbound loop: route via dispatcher (slash commands), then fall back to agent
+    tasks.push(tokio::spawn(async move {
+        while let Some(msg) = inbound_rx.recv().await {
+            let session_key = msg.session_key();
+
+            // Try slash-command routing first
+            let route_outcome = dispatcher.route(&msg.content, &session_key).await;
+            match route_outcome {
+                RouteOutcome::Handled(CommandResult::Print(text)) => {
+                    let outbound = OutboundMessage::new(
+                        msg.channel,
+                        msg.chat_id,
+                        text,
+                    );
+                    if let Err(e) = providers_in.send(&outbound).await {
+                        tracing::error!(target: "gateway::inbound", "Send failed: {}", e);
+                    }
+                }
+                RouteOutcome::Handled(CommandResult::Error(text)) => {
+                    let outbound = OutboundMessage::new(
+                        msg.channel,
+                        msg.chat_id,
+                        text,
+                    );
+                    if let Err(e) = providers_in.send(&outbound).await {
+                        tracing::error!(target: "gateway::inbound", "Send failed: {}", e);
+                    }
+                }
+                RouteOutcome::Handled(CommandResult::Quit) => {}
+                RouteOutcome::Rewrite { prompt, .. } => {
+                    dispatch_agent_turn(
+                        agent.clone(),
+                        InboundMessage { content: prompt, ..msg },
+                        providers_in.clone(),
+                    )
+                    .await;
+                }
+                RouteOutcome::Passthrough(text) => {
+                    dispatch_agent_turn(
+                        agent.clone(),
+                        InboundMessage { content: text, ..msg },
+                        providers_in.clone(),
+                    )
+                    .await;
+                }
+            }
+        }
+        tracing::info!(target: "gateway::inbound", "Inbound loop shutting down");
+    }));
+}
+
+/// Dispatch a message turn through the agent and send the results to providers.
+async fn dispatch_agent_turn(
+    agent: Arc<AgentSession>,
+    msg: InboundMessage,
+    providers: Arc<gasket_channels::ImProviders>,
+) {
+    use gasket_engine::session::HandleOutcome;
+
+    let session_key = msg.session_key();
+    let providers_for_err = providers.clone();
+
+    match agent.handle_inbound(&msg.content, &session_key, None).await {
+        Ok(HandleOutcome::Consumed) => {}
+        Ok(HandleOutcome::Replied { mut events, result }) => {
+            // Forward streaming ChatEvents as outbound messages
+            while let Some(event) = events.recv().await {
+                let outbound = OutboundMessage::with_ws_message(
+                    msg.channel.clone(),
+                    msg.chat_id.clone(),
+                    event,
+                );
+                if let Err(e) = providers.send(&outbound).await {
+                    tracing::error!(target: "gateway::dispatch", "Send failed: {}", e);
+                }
+            }
+            // Await the final result; ChatEvents already delivered the content
+            let _ = result.await;
+        }
+        Err(e) => {
+            tracing::error!(target: "gateway::dispatch", "Agent error: {}", e);
+            let error_out = OutboundMessage::new(
+                msg.channel,
+                msg.chat_id,
+                format!("Error: {}", e),
+            );
+            let _ = providers_for_err.send(&error_out).await;
+        }
+    }
 }
 
 async fn shutdown_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
@@ -675,9 +792,9 @@ async fn shutdown_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
     }
 }
 
-/// Start heartbeat service that periodically sends heartbeat tasks through the bus.
+/// Start heartbeat service that periodically sends heartbeat tasks through inbound channel.
 fn start_heartbeat_service(
-    broker: Arc<gasket_engine::broker::MemoryBroker>,
+    inbound_tx: tokio::sync::mpsc::Sender<InboundMessage>,
     workspace: &Path,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
@@ -685,7 +802,7 @@ fn start_heartbeat_service(
     tasks.push(tokio::spawn(async move {
         heartbeat
             .run(|task_text| {
-                let broker = broker.clone();
+                let inbound_tx = inbound_tx.clone();
                 async move {
                     let inbound = gasket_channels::InboundMessage {
                         channel: gasket_channels::ChannelType::Cli,
@@ -697,11 +814,7 @@ fn start_heartbeat_service(
                         timestamp: chrono::Utc::now(),
                         trace_id: None,
                     };
-                    let envelope = gasket_engine::broker::Envelope::new(
-                        gasket_engine::broker::Topic::Inbound,
-                        BrokerPayload::Inbound(inbound),
-                    );
-                    let _ = broker.publish(envelope).await;
+                    let _ = inbound_tx.send(inbound).await;
                 }
             })
             .await;
@@ -711,7 +824,8 @@ fn start_heartbeat_service(
 /// Start cron checker that polls for due jobs every 60 seconds.
 /// Supports direct tool execution (bypassing LLM) for zero-token system tasks.
 fn start_cron_checker(
-    broker: Arc<gasket_engine::broker::MemoryBroker>,
+    inbound_tx: tokio::sync::mpsc::Sender<InboundMessage>,
+    outbound_tx: tokio::sync::mpsc::Sender<OutboundMessage>,
     cron_service: &Arc<CronService>,
     tools: Arc<ToolRegistry>,
     spawner: Arc<dyn SubagentSpawner>,
@@ -719,7 +833,6 @@ fn start_cron_checker(
 ) {
     let cron_svc = cron_service.clone();
     tasks.push(tokio::spawn(async move {
-        let broker = broker;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
@@ -735,7 +848,7 @@ fn start_cron_checker(
                 let chat_id = job.chat_id.clone().unwrap_or_else(|| "cron".to_string());
                 let is_broadcast = chat_id == "*";
 
-                // Check if this is a direct tool execution job (bypass LLM)
+                // Check if this is a direct tool execution job (bypassing LLM)
                 if let Some(ref tool_name) = job.tool {
                     // Direct tool execution path - ZERO LLM tokens consumed
                     tracing::info!(
@@ -744,26 +857,9 @@ fn start_cron_checker(
                         tool_name
                     );
 
-                    // Build ToolContext with broker-based outbound
+                    // Build ToolContext with direct outbound channel
                     let ctx = ToolContext::default()
-                        .outbound_tx({
-                            // Create a temporary mpsc channel for tool output,
-                            // then forward to broker. This preserves the
-                            // ToolContext API while using broker underneath.
-                            let (tx, mut rx) =
-                                tokio::sync::mpsc::channel::<gasket_channels::OutboundMessage>(16);
-                            let broker2 = broker.clone();
-                            tokio::spawn(async move {
-                                while let Some(msg) = rx.recv().await {
-                                    let envelope = gasket_engine::broker::Envelope::new(
-                                        gasket_engine::broker::Topic::Outbound,
-                                        BrokerPayload::Outbound(msg),
-                                    );
-                                    let _ = broker2.publish(envelope).await;
-                                }
-                            });
-                            tx
-                        })
+                        .outbound_tx(outbound_tx.clone())
                         .spawner(spawner.clone());
 
                     let args = job.tool_args.clone().unwrap_or(serde_json::json!({}));
@@ -779,11 +875,7 @@ fn start_cron_checker(
                             } else {
                                 gasket_channels::OutboundMessage::new(channel, &chat_id, result)
                             };
-                            let envelope = gasket_engine::broker::Envelope::new(
-                                gasket_engine::broker::Topic::Outbound,
-                                BrokerPayload::Outbound(out_msg),
-                            );
-                            let _ = broker.publish(envelope).await;
+                            let _ = outbound_tx.send(out_msg).await;
                         }
                         Err(e) => {
                             tracing::error!("Cron job '{}' failed: {}", job.name, e);
@@ -794,24 +886,16 @@ fn start_cron_checker(
                             } else {
                                 gasket_channels::OutboundMessage::new(channel, &chat_id, error_msg)
                             };
-                            let envelope = gasket_engine::broker::Envelope::new(
-                                gasket_engine::broker::Topic::Outbound,
-                                BrokerPayload::Outbound(out_msg),
-                            );
-                            let _ = broker.publish(envelope).await;
+                            let _ = outbound_tx.send(out_msg).await;
                         }
                     }
                 } else if is_broadcast {
                     // Broadcast path: send the message directly to all connected clients
                     let out_msg =
                         gasket_channels::OutboundMessage::broadcast(channel, job.message.clone());
-                    let envelope = gasket_engine::broker::Envelope::new(
-                        gasket_engine::broker::Topic::Outbound,
-                        BrokerPayload::Outbound(out_msg),
-                    );
-                    let _ = broker.publish(envelope).await;
+                    let _ = outbound_tx.send(out_msg).await;
                 } else {
-                    // Traditional LLM-based path
+                    // Traditional LLM-based path — forward to inbound channel
                     let inbound = gasket_channels::InboundMessage {
                         channel,
                         sender_id: "cron".to_string(),
@@ -822,11 +906,7 @@ fn start_cron_checker(
                         timestamp: chrono::Utc::now(),
                         trace_id: None,
                     };
-                    let envelope = gasket_engine::broker::Envelope::new(
-                        gasket_engine::broker::Topic::Inbound,
-                        BrokerPayload::Inbound(inbound),
-                    );
-                    let _ = broker.publish(envelope).await;
+                    let _ = inbound_tx.send(inbound).await;
                 }
 
                 // Advance job tick and persist state to database

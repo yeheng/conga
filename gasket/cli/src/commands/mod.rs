@@ -2,11 +2,9 @@
 
 mod agent;
 mod auth;
-mod broker_outbound;
 mod channels;
 mod command_host;
 mod cron;
-mod dispatching_handler;
 mod embedding;
 mod gateway;
 mod onboard;
