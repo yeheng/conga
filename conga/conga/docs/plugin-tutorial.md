@@ -14,7 +14,7 @@ The **host binary** is the composition root: it calls each linked crate's
 loading, no ABI version, no hot-unload.
 
 Official examples: workspace crate **`conga-ext`** (`hello`, `search`,
-`permission_gate`, `terminal`). `terminal` is gated behind the `terminal`
+`terminal`). `terminal` is gated behind the `terminal`
 Cargo feature. CLI: `cargo run -p conga-cli --features ext`.
 
 Built-in tools (`read` / `write` / `edit` / `bash` / `list` / `grep` /
@@ -27,7 +27,7 @@ Built-in tools (`read` / `write` / `edit` / `bash` / `list` / `grep` /
 
 ```rust
 let mut api = ExtensionApiImpl::new();
-conga_ext::register_all(&mut api); // or hello::register / permission_gate::register
+conga_ext::register_all(&mut api); // or hello::register / search::register
 
 let mut tools = conga_host::built_in_tools();
 tools.extend(std::mem::take(&mut api.tools));
@@ -51,7 +51,7 @@ That is the static-world substitute for a plugin marketplace.
 | Method | What it does | Example |
 |---|---|---|
 | `register_tool(ToolDefinition)` | add a tool the LLM may call | `hello` |
-| `register_before_tool_call(handler)` | block / modify args before run | `permission_gate` |
+| `register_before_tool_call(handler)` | block / modify args before run | `conga_host::PermissionPolicy` |
 | `register_after_tool_call(handler)` | rewrite tool result | — |
 
 `before_tool_call` returns `ToolCallVerdict` (`Allow` / `Block` / `Modify`).
@@ -104,15 +104,15 @@ applies to extension tools too. State lives under `ToolContext.state_dir`
 
 ---
 
-## Example 3: `permission_gate` — policy hook
+## Example 3: `before_tool_call` hooks — policy gates
 
-Source: `conga-ext/src/permission_gate.rs`.
-
-`before_tool_call` can `Block` dangerous `bash` patterns; the loop skips
-execution and returns the reason to the model as an error tool result.
-
-Note: production CLI already uses `conga_host::PermissionPolicy` as a
-`HookChain`. This example shows the same idea via `ExtensionApi`.
+`before_tool_call` can `Block` or `Modify` a tool call before it runs; the
+loop skips execution and returns the reason to the model as an error tool
+result. Production CLI uses `conga_host::PermissionPolicy` (approval
+prompts, risk-based auto-allow) as a real `HookChain` — that is the actual
+security boundary for tool execution, not a string-matching extension hook.
+A pattern-matching `before_tool_call` gate on `bash` command text is easy to
+bypass (whitespace, `$()`, indirection) and should not be treated as one.
 
 ---
 
@@ -129,7 +129,7 @@ ext = ["dep:conga-ext", "conga-ext?/terminal"]
 #[cfg(feature = "ext")]
 {
     conga_ext::hello::register(&mut api);
-    conga_ext::permission_gate::register(&mut api);
+    conga_ext::search::register(&mut api);
 }
 ```
 

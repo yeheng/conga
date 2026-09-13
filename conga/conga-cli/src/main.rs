@@ -11,7 +11,7 @@ use reedline::{DefaultPrompt, Reedline, Signal};
 mod exec;
 
 /// In-process extensions behind feature `ext`: tools + optional hook chain
-/// (`permission_gate`). Without the feature, empty tools / no extra hooks.
+/// (e.g. `rag`, `terminal`). Without the feature, empty tools / no extra hooks.
 fn load_inprocess_ext() -> (Vec<ToolDefinition>, Option<Arc<dyn conga::HookChain>>) {
     #[cfg(feature = "ext")]
     {

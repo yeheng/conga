@@ -592,8 +592,7 @@ mod tests {
         assert!(hits[0].score >= hits[1].score);
 
         // source filter narrows results
-        let _ = s
-            .upsert_doc(
+        s.upsert_doc(
                 "other",
                 Path::new("/n/c.md"),
                 1,

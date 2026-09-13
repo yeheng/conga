@@ -88,7 +88,7 @@ impl JsonlStorage {
         Self::new(config_dir().join("sessions"))
     }
 
-    /// 这个 store 的 root 目录（host 用来列举 session）。
+    /// This store's root directory (used by the host to list sessions).
     pub fn base_dir_clone(&self) -> PathBuf {
         self.base_dir.clone()
     }

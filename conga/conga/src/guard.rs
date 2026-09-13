@@ -57,10 +57,10 @@ mod tests {
         assert_eq!(g.observe("bash", r#"{"command":"ls"}"#), 1);
         assert_eq!(g.observe("bash", r#"{"command":"ls"}"#), 2);
         assert_eq!(g.observe("bash", r#"{"command":"ls"}"#), 3);
-        // 任一侧变化 -> 重置
+        // A change on either side resets the streak.
         assert_eq!(g.observe("bash", r#"{"command":"pwd"}"#), 1);
         assert_eq!(g.observe("read", r#"{"command":"pwd"}"#), 1);
-        // 回到原始组合也是新 streak
+        // Returning to the original combo starts a fresh streak too.
         assert_eq!(g.observe("bash", r#"{"command":"ls"}"#), 1);
     }
 

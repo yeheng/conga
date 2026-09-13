@@ -586,9 +586,7 @@ mod tests {
         for i in 0..crate::memory::MAX_ENTRIES {
             std::fs::write(
                 mem.join(format!("e{i:02}.md")),
-                &format!(
-                    "---\ntitle: e{i:02}\ntags: [t]\ncreated: 1\nsource_session: s\n---\nB.\n"
-                ),
+                format!("---\ntitle: e{i:02}\ntags: [t]\ncreated: 1\nsource_session: s\n---\nB.\n"),
             )
             .unwrap();
         }

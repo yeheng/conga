@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use conga::{
-    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock, ExtensionApiImpl,
-    ModelSpec, ProviderApi, StreamChunk, StreamFn, ToolDefinition,
+    AgentContext, AgentLoopConfig, AgentMessage, ContentBlock, ExtensionApiImpl, ModelSpec,
+    ProviderApi, StreamChunk, StreamFn, ToolDefinition,
 };
 use futures_util::{stream, Stream};
 
@@ -76,69 +76,4 @@ async fn hello_extension_greets() {
             .any(|b| matches!(b, ContentBlock::Text { text } if text == "Hello, Ada!")))
     });
     assert!(greeted, "hello tool should have greeted Ada");
-}
-
-#[tokio::test]
-async fn permission_gate_blocks_bash() {
-    let mut api = ExtensionApiImpl::new();
-    conga_ext::permission_gate::register(&mut api);
-
-    let bash = ToolDefinition {
-        name: "bash".into(),
-        label: "Bash".into(),
-        description: "shell".into(),
-        parameters: serde_json::json!({"type": "object"}),
-        risk: conga::RiskLevel::High,
-        execute: Arc::new(|_| Box::pin(async { Ok(conga::ToolResult::text("RAN")) })),
-    };
-
-    let agent_ctx = AgentContext {
-        system_prompt: "".into(),
-        messages: vec![],
-        tools: vec![bash],
-        cwd: ".".into(),
-        env: Default::default(),
-        session_id: "t".into(),
-    };
-    let cfg = AgentLoopConfig {
-        model: ModelSpec {
-            id: "m".into(),
-            api: ProviderApi::OpenAiCompat,
-            max_tokens: 64,
-        },
-        max_turns: 1,
-        max_tool_calls_per_turn: 5,
-        tool_timeout: None,
-        signal: None,
-        stream_fn: Arc::new(CallToolOnce {
-            tool: "bash".into(),
-            args: serde_json::json!({"command": "rm -rf /tmp/x"}),
-        }),
-        hooks: Some(Arc::new(api) as Arc<dyn conga::types::tool::HookChain>),
-        retry: conga::RetryPolicy::default(),
-        persist: None,
-        steer: None,
-        transform_context: None,
-    };
-
-    let mut saw_block = false;
-    let msgs = conga::run_agent_loop(vec![], agent_ctx, cfg, |ev| {
-        if let AgentEvent::ToolExecutionEnd {
-            result, is_error, ..
-        } = ev
-        {
-            if is_error && result.tool_name == "bash" {
-                saw_block = true;
-            }
-        }
-    })
-    .await
-    .unwrap();
-
-    assert!(saw_block, "bash should have been blocked");
-    let ran = msgs.iter().any(|m| {
-        matches!(m, AgentMessage::ToolResult(tr) if tr.content.iter()
-            .any(|b| matches!(b, ContentBlock::Text { text } if text == "RAN")))
-    });
-    assert!(!ran, "the bash tool must not have executed");
 }

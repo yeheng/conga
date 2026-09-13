@@ -3,7 +3,6 @@
 //! composition root [`prod_register`] is used by the desktop app.
 
 pub mod hello;
-pub mod permission_gate;
 #[cfg(feature = "rag")]
 pub mod rag;
 pub mod search;
@@ -29,7 +28,6 @@ pub fn prod_register(api: &mut dyn conga::ExtensionApi) {
 pub fn register_all(api: &mut dyn ExtensionApi) {
     prod_register(api);
     hello::register(api);
-    permission_gate::register(api);
 }
 
 #[cfg(test)]

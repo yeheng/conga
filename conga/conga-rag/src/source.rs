@@ -22,6 +22,74 @@ pub struct DirSource {
     exclude: GlobSet,
 }
 
+fn build_globs(patterns: &[String]) -> anyhow::Result<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut b = GlobSetBuilder::new();
+    for p in patterns {
+        b.add(Glob::new(p).with_context(|| format!("非法 glob: {p}"))?);
+    }
+    Ok(Some(b.build()?))
+}
+
+impl DirSource {
+    pub fn new(name: &str, cfg: &SourceConfig) -> anyhow::Result<DirSource> {
+        anyhow::ensure!(
+            cfg.path.exists(),
+            "源 {name} 目录不存在: {}",
+            cfg.path.display()
+        );
+        Ok(DirSource {
+            name: name.to_string(),
+            root: cfg.path.clone(),
+            include: build_globs(&cfg.include)?,
+            exclude: build_globs(&cfg.exclude)?.unwrap_or_default(),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn scan(&self) -> anyhow::Result<Vec<FileEntry>> {
+        let mut out = Vec::new();
+        for entry in ignore::WalkBuilder::new(&self.root)
+            .require_git(false)
+            .build()
+        {
+            let entry = entry.with_context(|| format!("遍历 {} 失败", self.root.display()))?;
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let rel = entry
+                .path()
+                .strip_prefix(&self.root)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if let Some(inc) = &self.include {
+                if !inc.is_match(&rel) {
+                    continue;
+                }
+            }
+            if !self.exclude.is_empty() && self.exclude.is_match(&rel) {
+                continue;
+            }
+            out.push(FileEntry {
+                path: entry.path().to_path_buf(),
+                rel,
+            });
+        }
+        out.sort();
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,73 +157,5 @@ mod tests {
             err.to_string().contains("不存在") || err.to_string().contains("not exist"),
             "{err}"
         );
-    }
-}
-
-fn build_globs(patterns: &[String]) -> anyhow::Result<Option<GlobSet>> {
-    if patterns.is_empty() {
-        return Ok(None);
-    }
-    let mut b = GlobSetBuilder::new();
-    for p in patterns {
-        b.add(Glob::new(p).with_context(|| format!("非法 glob: {p}"))?);
-    }
-    Ok(Some(b.build()?))
-}
-
-impl DirSource {
-    pub fn new(name: &str, cfg: &SourceConfig) -> anyhow::Result<DirSource> {
-        anyhow::ensure!(
-            cfg.path.exists(),
-            "源 {name} 目录不存在: {}",
-            cfg.path.display()
-        );
-        Ok(DirSource {
-            name: name.to_string(),
-            root: cfg.path.clone(),
-            include: build_globs(&cfg.include)?,
-            exclude: build_globs(&cfg.exclude)?.unwrap_or_default(),
-        })
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub fn scan(&self) -> anyhow::Result<Vec<FileEntry>> {
-        let mut out = Vec::new();
-        for entry in ignore::WalkBuilder::new(&self.root)
-            .require_git(false)
-            .build()
-        {
-            let entry = entry.with_context(|| format!("遍历 {} 失败", self.root.display()))?;
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
-            let rel = entry
-                .path()
-                .strip_prefix(&self.root)
-                .unwrap_or(entry.path())
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            if let Some(inc) = &self.include {
-                if !inc.is_match(&rel) {
-                    continue;
-                }
-            }
-            if !self.exclude.is_empty() && self.exclude.is_match(&rel) {
-                continue;
-            }
-            out.push(FileEntry {
-                path: entry.path().to_path_buf(),
-                rel,
-            });
-        }
-        out.sort();
-        Ok(out)
     }
 }
