@@ -31,6 +31,7 @@ regex = "1"
 # HTML parsing for the fetch tool + URL handling
 dom_query = "0.28"
 url = { workspace = true }
+rquickjs = { version = "0.13.0", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Opt-in Landlock backend for the bash tool (CONGA_SANDBOX=1).
@@ -41,6 +42,9 @@ session-index = ["dep:sqlx", "dep:anyhow"]
 rag = ["dep:conga-rag"]
 # Opt-in Linux sandbox backend; macOS (sandbox-exec) needs no dependency.
 sandbox-landlock = ["dep:landlock"]
+# JS extension scripts (QuickJS sandbox). Named ext-js per the 2026-09-13
+# language-boundary decision; the dep is the rquickjs binding.
+ext-js = ["dep:rquickjs"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

@@ -261,4 +261,78 @@ mod tests {
         let v = serde_json::to_value(OutgoingEvent::done()).unwrap();
         assert!(v.get("usage_in").is_none() && v.get("usage_cache_read").is_none());
     }
+
+    /// Golden NDJSON fixture shared with the TypeScript SDK
+    /// (`sdk-ts/test/fixtures/wire-events.ndjson`): one line per wire
+    /// event, covering every OutgoingEvent constructor. The SDK's tests
+    /// parse the same file, so this test is the schema contract - any
+    /// serialization change must regenerate the fixture deliberately:
+    /// `CONGA_REGEN_FIXTURE=1 cargo test -p conga-host wire_fixture`
+    ///
+    /// Comparison is per-line PARSED equality: key order inside a JSON
+    /// object is not part of the contract (serde_json's map ordering varies
+    /// with `preserve_order` feature unification across the workspace).
+    #[test]
+    fn wire_fixture_matches_sdk_contract() {
+        // Keys are pre-sorted in the source string so the embedded
+        // arguments/description strings serialize identically whether or not
+        // serde_json's `preserve_order` feature is unified on (BTreeMap sorts;
+        // IndexMap preserves the alphabetical insertion order).
+        let args: serde_json::Value =
+            serde_json::from_str(r#"{"content":"hi","path":"notes/x.txt"}"#).unwrap();
+        let events = vec![
+            OutgoingEvent::content("你好".into()),
+            OutgoingEvent::thinking("checking the plan".into()),
+            OutgoingEvent::tool_start("bash".into(), r#"{"cmd":"ls"}"#.into(), "tc1".into()),
+            OutgoingEvent::tool_end("bash".into(), "a.txt\nb.txt".into(), "tc1".into()),
+            OutgoingEvent::error("provider unreachable".into()),
+            OutgoingEvent::busy("a turn is already running".into()),
+            OutgoingEvent::queued("mid-turn steer".into()),
+            OutgoingEvent::approval_request(
+                "req1".into(),
+                "write".into(),
+                &args,
+                Some("--- a/x.txt\n+++ b/x.txt\n+hi".into()),
+            ),
+            OutgoingEvent::done(),
+            OutgoingEvent::done_with_summary(1_234, 567, 89, 12, 4_321),
+        ];
+        let lines: Vec<String> = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sdk-ts/test/fixtures/wire-events.ndjson");
+        if std::env::var("CONGA_REGEN_FIXTURE").is_ok() {
+            std::fs::create_dir_all(fixture.parent().unwrap()).unwrap();
+            let mut buf = lines.join("\n");
+            buf.push('\n');
+            std::fs::write(&fixture, buf).unwrap();
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&fixture).unwrap_or_else(|e| {
+            panic!(
+                "sdk wire fixture missing ({e}); run CONGA_REGEN_FIXTURE=1 cargo test -p conga-host wire_fixture"
+            )
+        });
+        let on_disk: Vec<serde_json::Value> = on_disk
+            .lines()
+            .map(|l| {
+                serde_json::from_str(l)
+                    .unwrap_or_else(|e| panic!("fixture line is not valid JSON ({e}): {l}"))
+            })
+            .collect();
+        let fresh: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("freshly built line parses"))
+            .collect();
+        assert_eq!(
+            on_disk.len(),
+            fresh.len(),
+            "fixture line count drifted from the wire schema"
+        );
+        for (i, (got, want)) in on_disk.iter().zip(fresh.iter()).enumerate() {
+            assert_eq!(got, want, "wire fixture drift at line {}", i + 1);
+        }
+    }
 }

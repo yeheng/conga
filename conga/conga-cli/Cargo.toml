@@ -18,6 +18,8 @@ serde_json = { workspace = true }
 
 [features]
 default = []
+# JS extension scripts (--ext-js), per the 2026-09-13 language-boundary decision.
+ext-js = ["conga-host/ext-js"]
 # Link optional in-process extensions (hello / todo / permission_gate),
 # plus the terminal PTY tool (forwarded feature).
 ext = ["dep:conga-ext", "conga-ext?/terminal", "conga-ext?/rag"]

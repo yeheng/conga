@@ -17,6 +17,8 @@ pub mod config;
 pub mod event_map;
 pub mod evolve;
 pub mod external_tool;
+#[cfg(feature = "ext-js")]
+pub mod ext_js;
 pub mod hooks;
 pub mod mcp;
 pub mod memory;

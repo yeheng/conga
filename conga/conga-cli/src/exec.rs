@@ -11,7 +11,7 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use conga::TurnEndReason;
+use conga::{AgentEvent, TurnEndReason};
 use conga_host::Mode;
 
 /// Parsed `conga exec` arguments (everything after the `exec` word).
@@ -23,10 +23,12 @@ pub(crate) struct ExecArgs {
     /// so anything stricter neuters the run (the headless approver denies).
     pub(crate) mode: Mode,
     pub(crate) resume: Option<String>,
+    /// JS extension scripts (`--ext-js=<path>`, repeatable).
+    pub(crate) ext_js: Vec<std::path::PathBuf>,
 }
 
 /// Usage line, shared by every error path so the hints cannot drift.
-pub(crate) const USAGE: &str = "usage: conga exec [--json] [--mode=<suggest|auto-edit|full-auto|plan>] [--resume=<id|last>] <task|->";
+pub(crate) const USAGE: &str = "usage: conga exec [--json] [--mode=<suggest|auto-edit|full-auto|plan>] [--resume=<id|last>] [--ext-js=<script.js>] <task|->";
 
 pub(crate) fn parse_args(args: &[String]) -> Result<ExecArgs, String> {
     let mut out = ExecArgs {
@@ -34,12 +36,15 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ExecArgs, String> {
         json: false,
         mode: Mode::FullAuto,
         resume: None,
+        ext_js: Vec::new(),
     };
     for a in args {
         if let Some(v) = a.strip_prefix("--mode=") {
             out.mode = Mode::parse(v).ok_or_else(|| format!("unknown --mode: {v}\n{USAGE}"))?;
         } else if let Some(v) = a.strip_prefix("--resume=") {
             out.resume = Some(v.to_string());
+        } else if let Some(v) = a.strip_prefix("--ext-js=") {
+            out.ext_js.push(std::path::PathBuf::from(v));
         } else if a == "--json" {
             out.json = true;
         } else if a.starts_with("--") {
@@ -99,12 +104,16 @@ pub(crate) async fn run(args: &[String]) -> i32 {
         })
     });
     let (ext_tools, ext_hooks) = crate::load_inprocess_ext();
+    let (js_tools, js_hooks) = crate::load_js_ext_for(&parsed.ext_js);
+    let all_tools: Vec<conga::ToolDefinition> =
+        ext_tools.iter().chain(js_tools.iter()).cloned().collect();
+    let all_hooks: Vec<Arc<dyn conga::HookChain>> = ext_hooks.into_iter().chain(js_hooks).collect();
     let host = match conga_host::SessionAssembly::build_cli(
         parsed.mode,
         deny,
         parsed.resume,
-        ext_hooks.into_iter().collect(),
-        ext_tools,
+        all_hooks,
+        all_tools,
     )
     .await
     {
@@ -118,20 +127,63 @@ pub(crate) async fn run(args: &[String]) -> i32 {
     conga_host::install_ctrl_c(host.signal().clone());
 
     let mut tool_names = std::collections::HashMap::new();
+    // Cumulative usage for the terminal done line — same schema and
+    // semantics as the gateway's turn-boundary emission (ws.rs WireEvent::Done):
+    // accumulate provider-reported usage, emit done (with summary when the
+    // turn actually elapsed) after the last event, then the error line on
+    // failure. (in, out, cache_read, cache_write).
+    let usage = Arc::new((
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ));
+    let usage_c = usage.clone();
+    let turn_start = std::time::Instant::now();
     let mut printer = conga_host::EventPrinter::new(std::io::stdout());
     let json = parsed.json;
     let summary = host
         .run_turn(&task, move |ev| {
-            if json {
-                if let Some(ws) = conga_host::event_map::event_to_ws(&ev, &mut tool_names) {
-                    let mut lock = std::io::stdout().lock();
-                    let _ = writeln!(lock, "{}", serde_json::to_string(&ws).unwrap_or_default());
-                }
-            } else {
+            if !json {
                 printer.on_event(&ev);
+                return;
+            }
+            if let AgentEvent::AfterProviderResponse { response, .. } = &ev {
+                if let Some(u) = &response.usage {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    usage_c.0.fetch_add(u.input_tokens, Relaxed);
+                    usage_c.1.fetch_add(u.output_tokens, Relaxed);
+                    usage_c.2.fetch_add(u.cache_read_tokens.unwrap_or(0), Relaxed);
+                    usage_c.3.fetch_add(u.cache_write_tokens.unwrap_or(0), Relaxed);
+                }
+            }
+            if let Some(ws) = conga_host::event_map::event_to_ws(&ev, &mut tool_names) {
+                let mut lock = std::io::stdout().lock();
+                let _ = writeln!(lock, "{}", serde_json::to_string(&ws).unwrap_or_default());
             }
         })
         .await;
+    if json {
+        use std::sync::atomic::Ordering::Relaxed;
+        let elapsed_ms = turn_start.elapsed().as_millis() as u64;
+        let done = if elapsed_ms > 0 {
+            conga_host::wire::OutgoingEvent::done_with_summary(
+                usage.0.load(Relaxed),
+                usage.1.load(Relaxed),
+                usage.2.load(Relaxed),
+                usage.3.load(Relaxed),
+                elapsed_ms,
+            )
+        } else {
+            conga_host::wire::OutgoingEvent::done()
+        };
+        let mut lock = std::io::stdout().lock();
+        let _ = writeln!(lock, "{}", serde_json::to_string(&done).unwrap_or_default());
+        if let Err(e) = &summary {
+            let ev = conga_host::wire::OutgoingEvent::error(format!("{e}"));
+            let _ = writeln!(lock, "{}", serde_json::to_string(&ev).unwrap_or_default());
+        }
+    }
     let _ = std::io::stdout().flush();
 
     match summary {

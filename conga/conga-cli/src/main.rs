@@ -26,6 +26,42 @@ fn load_inprocess_ext() -> (Vec<ToolDefinition>, Option<Arc<dyn conga::HookChain
     (Vec::new(), None)
 }
 
+/// JS extension scripts (feature `ext-js`). Fails loud at startup: a script
+/// that throws is a config error, not a soft warning.
+fn load_js_ext_for(paths: &[std::path::PathBuf]) -> (Vec<ToolDefinition>, Vec<Arc<dyn conga::HookChain>>) {
+    if paths.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    #[cfg(feature = "ext-js")]
+    {
+        match conga_host::ext_js::load_scripts(paths) {
+            Ok(ext) => (
+                ext.tools,
+                // Always wrap the chain: an empty hook chain is a no-op.
+                vec![ext.hooks],
+            ),
+            Err(e) => {
+                eprintln!("ext-js error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    #[cfg(not(feature = "ext-js"))]
+    {
+        let _ = paths;
+        eprintln!("--ext-js requires a build with --features ext-js");
+        std::process::exit(1);
+    }
+}
+
+/// REPL entry: collect repeatable `--ext-js=<path>` from the process args.
+fn load_js_ext() -> (Vec<ToolDefinition>, Vec<Arc<dyn conga::HookChain>>) {
+    let paths: Vec<std::path::PathBuf> = std::env::args()
+        .filter_map(|a| a.strip_prefix("--ext-js=").map(std::path::PathBuf::from))
+        .collect();
+    load_js_ext_for(&paths)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // config.toml base layer: file first, .env/env override. Must run before
@@ -47,8 +83,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resume_arg = std::env::args().find_map(|a| a.strip_prefix("--resume=").map(String::from));
 
     let (ext_tools, ext_hooks) = load_inprocess_ext();
-    if !ext_tools.is_empty() {
-        eprintln!("(in-process ext tools: {})", ext_tools.len());
+    let (js_tools, js_hooks) = load_js_ext();
+    let all_tools: Vec<ToolDefinition> = ext_tools.iter().chain(js_tools.iter()).cloned().collect();
+    let all_hooks: Vec<Arc<dyn conga::HookChain>> =
+        ext_hooks.into_iter().chain(js_hooks).collect();
+    if !all_tools.is_empty() {
+        eprintln!("(in-process ext tools: {})", all_tools.len());
     }
 
     // One shared assembly (same wiring as the gateway/desktop): skills
@@ -59,8 +99,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mode,
         Arc::new(stdin_approver),
         resume_arg,
-        ext_hooks.into_iter().collect(),
-        ext_tools.clone(),
+        all_hooks,
+        all_tools.clone(),
     )
     .await
     {
@@ -86,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         if let Some(cmd) = line.strip_prefix('/') {
-            handle_slash(cmd, &mut host, &ext_tools).await;
+            handle_slash(cmd, &mut host, &all_tools).await;
             continue;
         }
         // Working history (and its compaction) is log-derived inside
@@ -144,7 +184,7 @@ fn stdin_approver<'a>(
     })
 }
 
-async fn handle_slash(cmd: &str, host: &mut Host, ext_tools: &[ToolDefinition]) {
+async fn handle_slash(cmd: &str, host: &mut Host, all_tools: &[ToolDefinition]) {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
         Some("exit") | Some("quit") => std::process::exit(0),
@@ -226,7 +266,7 @@ async fn handle_slash(cmd: &str, host: &mut Host, ext_tools: &[ToolDefinition]) 
             // Same gathering as startup (ext tools rank after built-ins;
             // external + MCP are reloaded too - a reload that silently
             // skipped MCP would drift from the initial set).
-            host.set_tools(gather_tools(ext_tools.to_vec(), Vec::new(), false).await);
+            host.set_tools(gather_tools(all_tools.to_vec(), Vec::new(), false).await);
             println!("(reloaded tools)");
         }
         Some("help") => println!(
