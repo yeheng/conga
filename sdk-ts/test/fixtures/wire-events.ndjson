@@ -1,0 +1,10 @@
+{"type":"content","content":"你好"}
+{"type":"thinking","content":"checking the plan"}
+{"type":"tool_start","tool_call_id":"tc1","name":"bash","arguments":"{\"cmd\":\"ls\"}"}
+{"type":"tool_end","tool_call_id":"tc1","name":"bash","output":"a.txt\nb.txt"}
+{"type":"error","content":"provider unreachable","message":"provider unreachable"}
+{"type":"busy","content":"a turn is already running","message":"a turn is already running"}
+{"type":"queued","message":"mid-turn steer"}
+{"type":"approval_request","id":"req1","tool_name":"write","description":"{\"content\":\"hi\",\"path\":\"notes/x.txt\"}","arguments":"{\"content\":\"hi\",\"path\":\"notes/x.txt\"}","preview":"--- a/x.txt\n+++ b/x.txt\n+hi"}
+{"type":"done"}
+{"type":"done","usage_in":1234,"usage_out":567,"usage_cache_read":89,"usage_cache_write":12,"elapsed_ms":4321}

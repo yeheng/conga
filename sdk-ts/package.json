@@ -1,0 +1,36 @@
+{
+  "name": "conga-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the conga agent harness — drives `conga exec --json` and parses the gateway wire protocol.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "rm -rf dist-test && tsc -p tsconfig.json && tsc -p tsconfig.test.json && cp -R test/fixtures dist-test/test/fixtures && chmod +x dist-test/test/fixtures/*.mjs && node --test dist-test/test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "llm",
+    "conga"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.12.0",
+    "typescript": "^5.9.3"
+  }
+}
