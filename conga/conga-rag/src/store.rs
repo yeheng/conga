@@ -593,14 +593,14 @@ mod tests {
 
         // source filter narrows results
         s.upsert_doc(
-                "other",
-                Path::new("/n/c.md"),
-                1,
-                "h3",
-                &[(0, "delta content".into(), dim4([1.0, 0.0, 0.0, 0.0]))],
-            )
-            .await
-            .unwrap();
+            "other",
+            Path::new("/n/c.md"),
+            1,
+            "h3",
+            &[(0, "delta content".into(), dim4([1.0, 0.0, 0.0, 0.0]))],
+        )
+        .await
+        .unwrap();
         let only = s
             .knn(&dim4([1.0, 0.0, 0.0, 0.0]), 5, Some("other"))
             .await

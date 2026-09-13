@@ -89,7 +89,11 @@ pub(super) type McpCallFn = Arc<
 /// HTTP transports: name prefixed `mcp__<server>__<tool>` (server tool
 /// names can collide with built-ins or each other), risk High (an external
 /// server is unvetted code), execution dispatched through `call`.
-pub(super) fn mcp_tool_definition(server_name: &str, t: McpTool, call: McpCallFn) -> ToolDefinition {
+pub(super) fn mcp_tool_definition(
+    server_name: &str,
+    t: McpTool,
+    call: McpCallFn,
+) -> ToolDefinition {
     let original_name = t.name.clone();
     let prefixed_name = format!("mcp__{server_name}__{}", t.name);
     let label = format!("{}/{}", server_name, t.title.unwrap_or(t.name));

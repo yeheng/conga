@@ -28,7 +28,9 @@ fn load_inprocess_ext() -> (Vec<ToolDefinition>, Option<Arc<dyn conga::HookChain
 
 /// JS extension scripts (feature `ext-js`). Fails loud at startup: a script
 /// that throws is a config error, not a soft warning.
-fn load_js_ext_for(paths: &[std::path::PathBuf]) -> (Vec<ToolDefinition>, Vec<Arc<dyn conga::HookChain>>) {
+fn load_js_ext_for(
+    paths: &[std::path::PathBuf],
+) -> (Vec<ToolDefinition>, Vec<Arc<dyn conga::HookChain>>) {
     if paths.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -85,8 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (ext_tools, ext_hooks) = load_inprocess_ext();
     let (js_tools, js_hooks) = load_js_ext();
     let all_tools: Vec<ToolDefinition> = ext_tools.iter().chain(js_tools.iter()).cloned().collect();
-    let all_hooks: Vec<Arc<dyn conga::HookChain>> =
-        ext_hooks.into_iter().chain(js_hooks).collect();
+    let all_hooks: Vec<Arc<dyn conga::HookChain>> = ext_hooks.into_iter().chain(js_hooks).collect();
     if !all_tools.is_empty() {
         eprintln!("(in-process ext tools: {})", all_tools.len());
     }

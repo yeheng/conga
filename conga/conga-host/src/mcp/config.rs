@@ -51,7 +51,9 @@ pub fn load_config() -> Result<Vec<(String, McpServerConfig)>, McpError> {
 }
 
 /// Same as [`load_config`] but from an explicit path (tests).
-pub fn load_config_from(path: &std::path::Path) -> Result<Vec<(String, McpServerConfig)>, McpError> {
+pub fn load_config_from(
+    path: &std::path::Path,
+) -> Result<Vec<(String, McpServerConfig)>, McpError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

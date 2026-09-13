@@ -8,7 +8,9 @@ use std::time::Duration;
 use conga::ToolDefinition;
 use tokio::sync::Mutex;
 
-use super::types::{mcp_tool_definition, parse_jsonrpc_value, CallResult, McpTool, Parsed, ToolsListResult};
+use super::types::{
+    mcp_tool_definition, parse_jsonrpc_value, CallResult, McpTool, Parsed, ToolsListResult,
+};
 use super::{McpError, PROTOCOL_VERSION};
 
 /// Proxy for remote MCP traffic: the tool-proxy system first (runtime

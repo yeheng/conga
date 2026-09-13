@@ -153,8 +153,12 @@ pub(crate) async fn run(args: &[String]) -> i32 {
                     use std::sync::atomic::Ordering::Relaxed;
                     usage_c.0.fetch_add(u.input_tokens, Relaxed);
                     usage_c.1.fetch_add(u.output_tokens, Relaxed);
-                    usage_c.2.fetch_add(u.cache_read_tokens.unwrap_or(0), Relaxed);
-                    usage_c.3.fetch_add(u.cache_write_tokens.unwrap_or(0), Relaxed);
+                    usage_c
+                        .2
+                        .fetch_add(u.cache_read_tokens.unwrap_or(0), Relaxed);
+                    usage_c
+                        .3
+                        .fetch_add(u.cache_write_tokens.unwrap_or(0), Relaxed);
                 }
             }
             if let Some(ws) = conga_host::event_map::event_to_ws(&ev, &mut tool_names) {

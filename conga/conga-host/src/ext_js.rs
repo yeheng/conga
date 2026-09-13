@@ -111,7 +111,9 @@ pub fn load_scripts(paths: &[PathBuf]) -> Result<JsExtensions, String> {
         .spawn(move || js_thread(paths, tx, rx, ready_tx))
         .map_err(|e| format!("spawn ext-js thread: {e}"))?;
 
-    ready_rx.recv().map_err(|_| "ext-js thread died".to_string())?
+    ready_rx
+        .recv()
+        .map_err(|_| "ext-js thread died".to_string())?
 }
 
 /// The JS runtime thread: build the sandbox, eval the scripts, report the
@@ -141,7 +143,8 @@ fn js_thread(
                     ),
                 )
                 .map_err(|e| error_string(&ctx, e))?;
-            ctx.eval::<(), _>(PRELUDE).map_err(|e| error_string(&ctx, e))?;
+            ctx.eval::<(), _>(PRELUDE)
+                .map_err(|e| error_string(&ctx, e))?;
             for path in &paths {
                 let code = std::fs::read_to_string(path)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -343,11 +346,7 @@ impl BeforeToolCallHandler for JsBridge {
 }
 
 impl AfterToolCallHandler for JsBridge {
-    fn call(
-        &self,
-        _tool_call_id: &str,
-        result: &ToolResultMessage,
-    ) -> Option<ToolResultMessage> {
+    fn call(&self, _tool_call_id: &str, result: &ToolResultMessage) -> Option<ToolResultMessage> {
         self.request(|reply| JsRequest::AfterHook {
             tool_name: result.tool_name.clone(),
             result: result.clone(),
@@ -358,20 +357,30 @@ impl AfterToolCallHandler for JsBridge {
 
 /// Serve requests until every `JsBridge` drops. Runs inside `ctx.with`, so
 /// all JS values here share the context's lifetime.
-fn serve<'js>(
-    ctx: &rquickjs::Ctx<'js>,
-    registry: &Registry<'js>,
-    rx: &mpsc::Receiver<JsRequest>,
-) {
+fn serve<'js>(ctx: &rquickjs::Ctx<'js>, registry: &Registry<'js>, rx: &mpsc::Receiver<JsRequest>) {
     while let Ok(req) = rx.recv() {
         match req {
-            JsRequest::CallTool { name, args, ctx: tool_ctx, reply } => {
+            JsRequest::CallTool {
+                name,
+                args,
+                ctx: tool_ctx,
+                reply,
+            } => {
                 let _ = reply.send(call_tool(ctx, registry, &name, args, tool_ctx));
             }
-            JsRequest::BeforeHook { tool_name, args, risk, reply } => {
+            JsRequest::BeforeHook {
+                tool_name,
+                args,
+                risk,
+                reply,
+            } => {
                 let _ = reply.send(run_before_hooks(ctx, registry, &tool_name, args, risk));
             }
-            JsRequest::AfterHook { tool_name, result, reply } => {
+            JsRequest::AfterHook {
+                tool_name,
+                result,
+                reply,
+            } => {
                 let _ = reply.send(run_after_hooks(ctx, registry, &tool_name, result));
             }
         }
@@ -583,9 +592,7 @@ fn js_to_json(value: &rquickjs::Value<'_>) -> serde_json::Value {
     match value.type_of() {
         rquickjs::Type::Bool => serde_json::Value::Bool(value.as_bool().unwrap_or(false)),
         rquickjs::Type::Int => serde_json::Value::from(value.as_int().unwrap_or(0)),
-        rquickjs::Type::Float => {
-            serde_json::Value::from(value.as_float().unwrap_or(f64::NAN))
-        }
+        rquickjs::Type::Float => serde_json::Value::from(value.as_float().unwrap_or(f64::NAN)),
         rquickjs::Type::String => serde_json::Value::String(
             value
                 .as_string()
@@ -594,7 +601,11 @@ fn js_to_json(value: &rquickjs::Value<'_>) -> serde_json::Value {
         ),
         rquickjs::Type::Array => {
             let arr = value.as_array().unwrap();
-            let items: Vec<serde_json::Value> = arr.iter::<rquickjs::Value>().flatten().map(|v| js_to_json(&v)).collect();
+            let items: Vec<serde_json::Value> = arr
+                .iter::<rquickjs::Value>()
+                .flatten()
+                .map(|v| js_to_json(&v))
+                .collect();
             serde_json::Value::Array(items)
         }
         rquickjs::Type::Object => {
@@ -668,7 +679,9 @@ conga.registerAfterToolCall(({ isError }) => {
         assert_eq!(tool.risk, RiskLevel::Low);
         assert_eq!(tool.parameters["type"], "object");
 
-        let result = (tool.execute)(tool_call_ctx(serde_json::json!({}))).await.unwrap();
+        let result = (tool.execute)(tool_call_ctx(serde_json::json!({})))
+            .await
+            .unwrap();
         assert_eq!(result.content[0], ContentBlock::text("Hello, world!"));
         let result = (tool.execute)(tool_call_ctx(serde_json::json!({"name": "conga"})))
             .await
@@ -696,12 +709,16 @@ conga.registerTool({
         let ext = load_scripts(&[script]).unwrap();
         let by_name = |n: &str| ext.tools.iter().find(|t| t.name == n).unwrap().clone();
 
-        let ok = (by_name("ok_shape").execute)(tool_call_ctx(serde_json::json!({}))).await.unwrap();
+        let ok = (by_name("ok_shape").execute)(tool_call_ctx(serde_json::json!({})))
+            .await
+            .unwrap();
         assert_eq!(ok.content[0], ContentBlock::text("done"));
         assert_eq!(ok.details["n"], 2);
         assert!(!ok.is_error);
 
-        let err = (by_name("throws").execute)(tool_call_ctx(serde_json::json!({}))).await.unwrap();
+        let err = (by_name("throws").execute)(tool_call_ctx(serde_json::json!({})))
+            .await
+            .unwrap();
         assert!(err.is_error);
         let ContentBlock::Text { text } = &err.content[0] else {
             panic!("expected a text block");
@@ -718,7 +735,12 @@ conga.registerTool({
 
         // Block wins.
         let verdict = hooks
-            .before_tool_call("tc", "bash", &serde_json::json!({"cmd": "ls"}), RiskLevel::High)
+            .before_tool_call(
+                "tc",
+                "bash",
+                &serde_json::json!({"cmd": "ls"}),
+                RiskLevel::High,
+            )
             .await;
         match verdict {
             ToolCallVerdict::Block(reason) => assert_eq!(reason, "no bash in demo"),
@@ -727,7 +749,12 @@ conga.registerTool({
 
         // Modify updates the args flowing to the LLM's tool call.
         let verdict = hooks
-            .before_tool_call("tc", "fetch", &serde_json::json!({"url": "https://evil.com"}), RiskLevel::Medium)
+            .before_tool_call(
+                "tc",
+                "fetch",
+                &serde_json::json!({"url": "https://evil.com"}),
+                RiskLevel::Medium,
+            )
             .await;
         match verdict {
             ToolCallVerdict::Modify(args) => assert_eq!(args["url"], "https://example.com"),
