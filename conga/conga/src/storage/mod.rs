@@ -38,7 +38,19 @@ use crate::types::session_event::SessionEvent;
 /// When `~/.conga` doesn't exist yet but `~/.gasket` does, keep using the
 /// old root so existing sessions, `mcp.json`, and `app_config.json` stay
 /// readable — adopting the new dir only on fresh machines.
+///
+/// `CONGA_CONFIG_DIR` (set to a non-empty value) overrides everything and
+/// returns immediately — embedded hosts (flow's harness runner) pin the
+/// whole state root (settings/sessions/tool state/spill/memory/skills/mcp)
+/// to a scratch directory on ANY platform; the legacy `.gasket` probe is
+/// skipped because a pinned root is an explicit deployment fact, not a
+/// discovered one. Unset, the behavior is byte-for-byte the old one.
 pub fn config_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CONGA_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let new = home.join(".conga");
     let legacy = home.join(".gasket");
@@ -734,6 +746,20 @@ mod tests {
 
         std::fs::create_dir_all(tmp.path().join(".conga")).unwrap();
         assert!(config_dir().ends_with(".conga"));
+
+        // CONGA_CONFIG_DIR 覆盖：显式钉根立即返回，跳过 legacy 探测——
+        // 钉根是部署事实，不是被发现的路径。空值 = 未设置，回到发现路径。
+        let saved_config = std::env::var("CONGA_CONFIG_DIR").ok();
+        let pinned = tmp.path().join("pinned-conga");
+        std::env::set_var("CONGA_CONFIG_DIR", &pinned);
+        assert_eq!(config_dir(), pinned);
+        std::fs::remove_dir_all(tmp.path().join(".conga")).unwrap();
+        std::env::set_var("CONGA_CONFIG_DIR", "");
+        assert!(config_dir().ends_with(".gasket"));
+        match saved_config {
+            Some(c) => std::env::set_var("CONGA_CONFIG_DIR", c),
+            None => std::env::remove_var("CONGA_CONFIG_DIR"),
+        }
 
         match saved {
             Some(h) => std::env::set_var("HOME", h),

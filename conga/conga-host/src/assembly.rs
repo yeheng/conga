@@ -304,11 +304,31 @@ impl SessionAssembly {
             }
         }
         let tools = gather_tools(ext_tools, Vec::new(), false).await;
+        // Sub-agent events carry task/content; they must never hit stderr
+        // unconditionally — embedded hosts pipe stderr tails into persisted
+        // outcomes (flow's harness runner keeps a 512B tail in its journal).
+        // tracing keeps the REPL behavior when its subscriber is installed
+        // and stays silent under the runner's warn filter.
         let tap: SubagentEmit = Arc::new(|ev: SubagentEvent| {
-            eprintln!("[subagent] {ev:?}");
+            tracing::debug!("[subagent] {ev:?}");
         });
         Ok(assemble_host(cfg, session, mode, approver, extra_hooks, tools, tap).await)
     }
+}
+
+/// Headless variant of [`assemble_host`] for [`crate::headless`]: built-in
+/// tool set (external/MCP load from the pinned env/config root — normally
+/// empty there), quiet logging, no extra hooks. Session root, provider and
+/// mode come from the headless caller.
+pub(crate) async fn assemble_headless_host(
+    cfg: HostConfig,
+    session: SessionManager,
+    mode: Mode,
+    approver: Approver,
+    subagent_emit: SubagentEmit,
+) -> Host {
+    let tools = gather_tools(Vec::new(), Vec::new(), true).await;
+    assemble_host(cfg, session, mode, approver, Vec::new(), tools, subagent_emit).await
 }
 
 /// The one Host assembly shared by every caller of this module:

@@ -12,6 +12,7 @@ use conga::{
 
 pub mod approval;
 pub mod assembly;
+pub mod headless;
 pub mod compact;
 pub mod config;
 pub mod event_map;
