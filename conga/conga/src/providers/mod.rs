@@ -83,6 +83,29 @@ impl ProviderConfig {
         })
     }
 
+    /// [`from_parts`](Self::from_parts) with an explicit egress proxy — for
+    /// embedded hosts that carry config as typed values and never touch the
+    /// process environment (flow's in-executor headless assembly).
+    pub fn from_parts_with_proxy(
+        api: ProviderApi,
+        base_url: String,
+        api_key: String,
+        model: String,
+        generic_proxy: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        let proxy = generic_proxy
+            .filter(|p| !p.trim().is_empty())
+            .map(str::to_string);
+        let client = build_client(&None, &None, &proxy)?;
+        Ok(Self {
+            api,
+            base_url,
+            api_key,
+            model,
+            client,
+        })
+    }
+
     /// Read a prefixed provider config, e.g. prefix `CONGA_FAST_LLM` reads
     /// `CONGA_FAST_LLM_BASE_URL` / `_KEY` / `_MODEL` / `_API`. Used for the
     /// sub-agent "fast model" override; proxies fall back to the main

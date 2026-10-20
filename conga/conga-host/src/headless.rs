@@ -164,6 +164,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn headless_with_takes_typed_config_and_restores_env_pins() {
+        let roots = scratch();
+        let saved = env_snapshot(&[
+            "CONGA_CONFIG_DIR",
+            "CONGA_PROJECT_DIR",
+            "CONGA_LLM_KEY",
+        ]);
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CONGA_LLM_KEY");
+        let spec = HeadlessSpec {
+            base_url: "https://inline.example/v1".into(),
+            model: "inline-model".into(),
+            api: "openai".into(),
+            proxy: None,
+            max_turns: Some(9),
+            max_tool_calls_per_turn: None,
+            max_tokens: Some(1234),
+            tool_timeout_secs: None,
+        };
+        let session = build_headless_with("sk-inline", &spec, roots.path(), roots.path(), Mode::FullAuto)
+            .await
+            .expect("inline headless assembly");
+        // 钉根在位（turn 进行中懒读的路径都落在 roots 内）
+        assert_eq!(conga::storage::config_dir(), roots.path().join("conga"));
+        assert_eq!(crate::project_dir(), roots.path());
+        // 毒化 settings 不生效（stream_fn 注入缝与 env 变体同一条）
+        let poisoned = EnvSettings {
+            llm: Some(LlmGroup {
+                base_url: "https://settings.example/v1".into(),
+                api_key: "sk-settings".into(),
+                model: "settings-model".into(),
+                api: "openai".into(),
+            }),
+            fast_llm: None,
+            system_prompt: None,
+            max_tokens: None,
+        };
+        let (cfg, _) = session.host.resolve_turn_provider(&poisoned);
+        assert_eq!(cfg.provider.model, "inline-model");
+        assert_eq!(cfg.provider.base_url, "https://inline.example/v1");
+        assert_eq!(cfg.provider.api_key, "sk-inline");
+        assert_eq!(cfg.tunables.max_turns, 9);
+        assert_eq!(cfg.tunables.max_tokens, 1234);
+        drop(session);
+        // pin 释放后环境恢复
+        assert_ne!(conga::storage::config_dir(), roots.path().join("conga"));
+        env_restore(saved);
+    }
+
+    #[tokio::test]
     async fn headless_settings_file_cannot_reach_the_provider() {
         // The poison: a settings override that would win on the CLI path.
         let poisoned = EnvSettings {
@@ -203,4 +253,161 @@ mod tests {
         assert_eq!(cfg.provider.api_key, "sk-param");
         env_restore(saved);
     }
+}
+
+// ---- in-process variant (flow-executor inline execution) ----
+
+/// RAII pin for the lazily-read global knobs conga consults mid-turn
+/// (`CONGA_CONFIG_DIR`, `CONGA_PROJECT_DIR`): set on creation, restored on
+/// drop — the pin must outlive the whole turn because storage paths are
+/// resolved lazily inside the loop.
+///
+/// **Contract: the caller guarantees no other thread reads or writes these
+/// names concurrently.** flow-executor satisfies this by processing tasks
+/// serially and never touching `CONGA_*` outside the agent path.
+pub struct ScopedEnvPin {
+    saved: Vec<(String, Option<std::ffi::OsString>)>,
+}
+
+impl ScopedEnvPin {
+    pub fn pin(vars: &[(&str, std::ffi::OsString)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(name, _)| (name.to_string(), std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        for (name, value) in vars {
+            std::env::set_var(name, value);
+        }
+        ScopedEnvPin { saved }
+    }
+}
+
+impl Drop for ScopedEnvPin {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.drain(..) {
+            match value {
+                Some(v) => std::env::set_var(&name, v),
+                None => std::env::remove_var(&name),
+            }
+        }
+    }
+}
+
+/// Explicit, typed configuration for in-process hosts: provider trio + proxy
+/// + tunables arrive as values (no `CONGA_*` env round-trip), the api key as
+/// a parameter — the same never-through-env rule as [`build_headless`].
+#[derive(Debug, Clone)]
+pub struct HeadlessSpec {
+    pub base_url: String,
+    pub model: String,
+    /// `openai` (OpenAI-compat) or `anthropic`.
+    pub api: String,
+    pub proxy: Option<String>,
+    pub max_turns: Option<usize>,
+    pub max_tool_calls_per_turn: Option<usize>,
+    pub max_tokens: Option<usize>,
+    pub tool_timeout_secs: Option<u64>,
+}
+
+impl HeadlessSpec {
+    fn provider_config(&self, api_key: &str) -> Result<conga::ProviderConfig, AssemblyError> {
+        let api = match self.api.trim() {
+            "" | "openai" => conga::ProviderApi::OpenAiCompat,
+            "anthropic" => conga::ProviderApi::Anthropic,
+            other => {
+                return Err(AssemblyError::Config(format!(
+                    "unknown api {other:?} (expected openai | anthropic)"
+                )))
+            }
+        };
+        conga::ProviderConfig::from_parts_with_proxy(
+            api,
+            self.base_url.trim().to_string(),
+            api_key.to_string(),
+            self.model.trim().to_string(),
+            self.proxy.as_deref(),
+        )
+        .map_err(|e| AssemblyError::Config(e.to_string()))
+    }
+
+    fn tunables(&self) -> conga::AgentTunables {
+        conga::AgentTunables {
+            max_turns: self.max_turns.unwrap_or(50),
+            max_tool_calls_per_turn: self.max_tool_calls_per_turn.unwrap_or(20),
+            max_tokens: self.max_tokens.unwrap_or(4096),
+            retry: Default::default(),
+            tool_timeout_secs: self.tool_timeout_secs,
+        }
+    }
+}
+
+/// An assembled headless host plus the env pin that keeps its state root and
+/// project dir resolved for the whole turn. Deref to drive `run_turn`.
+pub struct HeadlessHost {
+    pub host: Host,
+    _pin: ScopedEnvPin,
+}
+
+impl std::ops::Deref for HeadlessHost {
+    type Target = Host;
+    fn deref(&self) -> &Host {
+        &self.host
+    }
+}
+
+/// In-process variant of [`build_headless`]: provider + tunables arrive as
+/// typed values (no env reads), state root and project dir are pinned for the
+/// caller's scope, sessions live under `roots/sessions`. Same guarantees:
+/// settings file unreachable (stream_fn injected), no dotenvy/config-file
+/// discovery, env-borne `CONGA_LLM_KEY` refused.
+pub async fn build_headless_with(
+    api_key: &str,
+    spec: &HeadlessSpec,
+    roots: &Path,
+    project_dir: &Path,
+    mode: Mode,
+) -> Result<HeadlessHost, AssemblyError> {
+    if std::env::var_os("CONGA_LLM_KEY").is_some() {
+        return Err(AssemblyError::Config(
+            "CONGA_LLM_KEY must not be set in the environment: the headless path \
+             takes the api key as an explicit parameter"
+                .into(),
+        ));
+    }
+    let provider = spec.provider_config(api_key)?;
+    if provider.base_url.is_empty() || provider.model.is_empty() {
+        return Err(AssemblyError::Config(
+            "headless spec requires a non-empty base_url and model".into(),
+        ));
+    }
+    let cfg = crate::HostConfig {
+        tunables: spec.tunables(),
+        provider,
+    };
+    let pin = ScopedEnvPin::pin(&[
+        ("CONGA_CONFIG_DIR", roots.join("conga").into_os_string()),
+        ("CONGA_PROJECT_DIR", project_dir.to_path_buf().into_os_string()),
+    ]);
+    if !conga::storage::config_dir().starts_with(roots) {
+        return Err(AssemblyError::Config(format!(
+            "conga config dir {:?} does not fall inside the pinned roots {:?}",
+            conga::storage::config_dir(),
+            roots
+        )));
+    }
+    let session = SessionManager::with_root(roots.join("sessions"));
+    let deny: Approver = Arc::new(|name: &str, _: &serde_json::Value| {
+        let name = name.to_string();
+        Box::pin(async move {
+            tracing::warn!("headless approval for {name} denied (no human attached)");
+            false
+        })
+    });
+    let quiet_emit: crate::assembly::SubagentEmit = Arc::new(|_: crate::subagent_types::SubagentEvent| {});
+    let stream_fn = cfg.provider_stream_fn();
+    let host = crate::assembly::assemble_headless_host(cfg, session, mode, deny, quiet_emit).await;
+    Ok(HeadlessHost {
+        host: host.with_stream_fn(stream_fn),
+        _pin: pin,
+    })
 }
