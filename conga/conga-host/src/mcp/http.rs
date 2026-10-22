@@ -514,6 +514,728 @@ mod tests {
         session_id: Option<String>,
     }
 
+    /// One request as observed by the fake HTTP server (full head + body).
+    #[derive(Debug, Clone)]
+    struct CapturedRequest {
+        head: String,
+        body: serde_json::Value,
+    }
+
+    impl CapturedRequest {
+        fn method(&self) -> String {
+            self.head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().next())
+                .unwrap_or_default()
+                .to_string()
+        }
+
+        fn path(&self) -> String {
+            self.head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string()
+        }
+
+        fn header(&self, name: &str) -> Option<String> {
+            self.head.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case(name)
+                    .then(|| v.trim().to_string())
+            })
+        }
+    }
+
+    /// How the fake server answers one request.
+    enum Reply {
+        /// Send these raw bytes, then close the connection.
+        Bytes(String),
+        /// Send these raw bytes, then keep the connection open — the body
+        /// stalls, so the client has to hit its own timeout.
+        BytesThenHold(String),
+    }
+
+    /// A local HTTP server that answers every request with `responder`.
+    struct FakeServer {
+        url: String,
+        seen: Arc<tokio::sync::Mutex<Vec<CapturedRequest>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeServer {
+        async fn seen(&self) -> Vec<CapturedRequest> {
+            self.seen.lock().await.clone()
+        }
+    }
+
+    impl Drop for FakeServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    /// A JSON response with the given body.
+    fn json_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// An SSE response with the given event stream.
+    fn sse_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// Start a fake HTTP server on loopback that answers every request with
+    /// `responder`.
+    async fn start_fake_server(responder: fn(&serde_json::Value) -> Reply) -> FakeServer {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let seen_task = seen.clone();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let Some((head, body)) = read_http_request(&mut sock, &mut buf).await else {
+                    continue;
+                };
+                seen_task.lock().await.push(CapturedRequest {
+                    head,
+                    body: body.clone(),
+                });
+                match responder(&body) {
+                    Reply::Bytes(raw) => {
+                        let _ = sock.write_all(raw.as_bytes()).await;
+                    }
+                    Reply::BytesThenHold(raw) => {
+                        let _ = sock.write_all(raw.as_bytes()).await;
+                        let _ = sock.flush().await;
+                        // Hold the connection open until the client hangs up.
+                        let mut sink = [0u8; 64];
+                        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                match sock.read(&mut sink).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                }
+            }
+        });
+
+        FakeServer {
+            url: format!("http://{addr}/mcp"),
+            seen,
+            handle,
+        }
+    }
+
+    /// Build a client that talks to `url` directly.
+    ///
+    /// `.no_proxy()` is mandatory: the machine sets `HTTP_PROXY` /
+    /// `HTTPS_PROXY`, and reqwest would otherwise route the loopback
+    /// request through the proxy.
+    ///
+    /// The reqwest-level timeout is deliberately longer than the MCP
+    /// deadline (`timeout`): the MCP deadline is what the transport must
+    /// honour, so it must always fire first.
+    fn test_client(
+        url: &str,
+        headers: HashMap<String, String>,
+        timeout: Duration,
+    ) -> Arc<McpHttpClient> {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(timeout + Duration::from_secs(10))
+            .build()
+            .unwrap();
+        Arc::new(McpHttpClient {
+            client,
+            url: url.to_string(),
+            headers,
+            timeout,
+            server_name: "fake".to_string(),
+            next_id: tokio::sync::Mutex::new(1),
+            session_id: Mutex::new(None),
+        })
+    }
+
+    /// A JSON-RPC result frame echoing the request's id.
+    fn result_frame(body: &serde_json::Value, result: &str) -> String {
+        let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
+        json_response(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#
+        ))
+    }
+
+    #[test]
+    fn sse_payload_maps_an_error_frame_and_ignores_foreign_payloads() {
+        // A JSON-RPC error addressed to us → Some(Err(..)).
+        let err = sse_payload(
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"nope"}}"#,
+            7,
+        )
+        .expect("an error frame for our id is ours");
+        match err {
+            Err(McpError::ServerError { code, message }) => {
+                assert_eq!(code, -32601);
+                assert_eq!(message, "nope");
+            }
+            other => panic!("expected a server error, got {other:?}"),
+        }
+
+        // A payload that is not JSON at all → None (not ours).
+        assert!(sse_payload("not json", 7).is_none());
+        // A notification (no id) → None.
+        assert!(sse_payload(r#"{"jsonrpc":"2.0","method":"notifications/progress"}"#, 7).is_none());
+        // A response for another id → None.
+        assert!(sse_payload(r#"{"jsonrpc":"2.0","id":99,"result":{}}"#, 7).is_none());
+    }
+
+    // ── `request` ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn http_request_posts_a_jsonrpc_frame_and_returns_the_result() {
+        let server =
+            start_fake_server(|body| Reply::Bytes(result_frame(body, r#"{"ok":true}"#))).await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let result = client
+            .request(42, "tools/list", serde_json::json!({"cursor": "x"}))
+            .await
+            .expect("request");
+
+        assert_eq!(result["ok"], true);
+        let seen = server.seen().await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method(), "POST");
+        assert_eq!(seen[0].path(), "/mcp");
+        assert_eq!(
+            seen[0].header("content-type").as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            seen[0].header("accept").as_deref(),
+            Some("application/json, text/event-stream")
+        );
+        assert_eq!(seen[0].body["jsonrpc"], "2.0");
+        assert_eq!(seen[0].body["id"], 42);
+        assert_eq!(seen[0].body["method"], "tools/list");
+        assert_eq!(seen[0].body["params"], serde_json::json!({"cursor": "x"}));
+    }
+
+    #[tokio::test]
+    async fn http_request_sends_the_configured_headers() {
+        let server = start_fake_server(|body| Reply::Bytes(result_frame(body, "{}"))).await;
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer tok123".to_string());
+        let client = test_client(&server.url, headers, Duration::from_secs(5));
+
+        client
+            .request(1, "tools/list", serde_json::json!({}))
+            .await
+            .expect("request");
+
+        let seen = server.seen().await;
+        assert_eq!(
+            seen[0].header("authorization").as_deref(),
+            Some("Bearer tok123")
+        );
+    }
+
+    #[tokio::test]
+    async fn http_request_reports_a_jsonrpc_error_response() {
+        let server = start_fake_server(|body| {
+            let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
+            Reply::Bytes(json_response(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32601,"message":"method not found"}}}}"#
+            )))
+        })
+        .await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let err = client
+            .request(7, "nope", serde_json::json!({}))
+            .await
+            .expect_err("error frame");
+
+        match err {
+            McpError::ServerError { code, message } => {
+                assert_eq!(code, -32601);
+                assert_eq!(message, "method not found");
+            }
+            other => panic!("expected a server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_request_rejects_a_response_without_result_or_error() {
+        let server = start_fake_server(|body| {
+            let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
+            Reply::Bytes(json_response(&format!(r#"{{"jsonrpc":"2.0","id":{id}}}"#)))
+        })
+        .await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let err = client
+            .request(3, "tools/list", serde_json::json!({}))
+            .await
+            .expect_err("a response without result/error is not usable");
+
+        match err {
+            McpError::Protocol(msg) => {
+                assert!(msg.contains("no result/error for id 3"), "{msg}");
+            }
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_request_rejects_a_non_json_body() {
+        let server =
+            start_fake_server(|_body| Reply::Bytes(json_response("this is not json"))).await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let err = client
+            .request(1, "tools/list", serde_json::json!({}))
+            .await
+            .expect_err("a broken body is not usable");
+
+        match err {
+            McpError::Protocol(msg) => {
+                assert!(msg.contains("http response json parse error"), "{msg}");
+            }
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_request_times_out_when_the_server_never_answers() {
+        let server = start_fake_server(|_body| Reply::BytesThenHold(String::new())).await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_millis(200));
+
+        let err = client
+            .request(1, "tools/list", serde_json::json!({}))
+            .await
+            .expect_err("a silent server must time out");
+
+        match err {
+            McpError::Timeout(d) => assert_eq!(d, Duration::from_millis(200)),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    // ── `notification` ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn http_notification_posts_a_frame_without_an_id() {
+        let server = start_fake_server(|_body| {
+            Reply::Bytes(
+                "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        client
+            .notification("notifications/initialized")
+            .await
+            .expect("notification");
+
+        let seen = server.seen().await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method(), "POST");
+        assert_eq!(seen[0].body["jsonrpc"], "2.0");
+        assert_eq!(seen[0].body["method"], "notifications/initialized");
+        assert!(
+            seen[0].body.get("id").is_none(),
+            "a notification carries no id: {}",
+            seen[0].body
+        );
+    }
+
+    // ── `post_json` ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn http_post_json_sends_the_body_and_returns_the_response() {
+        let server = start_fake_server(|_body| Reply::Bytes(json_response(r#"{"ok":1}"#))).await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let resp = client
+            .post_json(&serde_json::json!({"hello": "world"}))
+            .await
+            .expect("post");
+
+        assert_eq!(resp.status(), 200);
+        let seen = server.seen().await;
+        assert_eq!(seen[0].body, serde_json::json!({"hello": "world"}));
+    }
+
+    #[tokio::test]
+    async fn http_post_json_reports_a_transport_error() {
+        // Bind then drop: the port is (almost certainly) closed now.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = test_client(
+            &format!("http://{addr}/mcp"),
+            HashMap::new(),
+            Duration::from_secs(2),
+        );
+
+        let err = client
+            .post_json(&serde_json::json!({"a": 1}))
+            .await
+            .expect_err("an unreachable server is an error");
+
+        match err {
+            McpError::Protocol(msg) => assert!(msg.contains("http post error"), "{msg}"),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    // ── `capture_session_id` ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn http_capture_session_id_records_and_trims_the_header() {
+        let client = test_client(
+            "http://127.0.0.1:1/mcp",
+            HashMap::new(),
+            Duration::from_secs(1),
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            SESSION_ID_HEADER,
+            reqwest::header::HeaderValue::from_bytes(b"  sess-42  ").unwrap(),
+        );
+
+        client.capture_session_id(&headers).await;
+
+        assert_eq!(
+            client.session_id.lock().await.clone(),
+            Some("sess-42".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn http_capture_session_id_ignores_missing_and_empty_headers() {
+        let client = test_client(
+            "http://127.0.0.1:1/mcp",
+            HashMap::new(),
+            Duration::from_secs(1),
+        );
+
+        client
+            .capture_session_id(&reqwest::header::HeaderMap::new())
+            .await;
+        assert_eq!(client.session_id.lock().await.clone(), None);
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            SESSION_ID_HEADER,
+            reqwest::header::HeaderValue::from_bytes(b"   ").unwrap(),
+        );
+        client.capture_session_id(&headers).await;
+        assert_eq!(
+            client.session_id.lock().await.clone(),
+            None,
+            "a blank session id must not be captured"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_post_json_echoes_the_captured_session_id() {
+        let server = start_fake_server(|_body| Reply::Bytes(json_response("{}"))).await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            SESSION_ID_HEADER,
+            reqwest::header::HeaderValue::from_static("sess-xyz"),
+        );
+        client.capture_session_id(&headers).await;
+
+        client
+            .post_json(&serde_json::json!({"a": 1}))
+            .await
+            .expect("post");
+
+        let seen = server.seen().await;
+        assert_eq!(
+            seen[0].header("mcp-session-id").as_deref(),
+            Some("sess-xyz")
+        );
+    }
+
+    // ── `read_sse` ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn http_read_sse_returns_the_matching_event() {
+        let server = start_fake_server(|_body| {
+            Reply::Bytes(sse_response(
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"ok\":true}}\n\n",
+            ))
+        })
+        .await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let resp = client
+            .post_json(&serde_json::json!({"id": 9}))
+            .await
+            .expect("post");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let result = client
+            .read_sse(resp, 9, deadline)
+            .await
+            .expect("sse result");
+
+        assert_eq!(result["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn http_read_sse_reports_a_jsonrpc_error_event() {
+        let server = start_fake_server(|_body| {
+            Reply::Bytes(sse_response(
+                "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"error\":{\"code\":-32602,\"message\":\"bad params\"}}\n\n",
+            ))
+        })
+        .await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let resp = client
+            .post_json(&serde_json::json!({"id": 9}))
+            .await
+            .expect("post");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let err = client
+            .read_sse(resp, 9, deadline)
+            .await
+            .expect_err("error event");
+
+        match err {
+            McpError::ServerError { code, message } => {
+                assert_eq!(code, -32602);
+                assert_eq!(message, "bad params");
+            }
+            other => panic!("expected a server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_read_sse_fails_when_the_stream_ends_without_a_match() {
+        let server = start_fake_server(|_body| {
+            Reply::Bytes(sse_response(
+                "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n\n",
+            ))
+        })
+        .await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let resp = client
+            .post_json(&serde_json::json!({"id": 9}))
+            .await
+            .expect("post");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let err = client
+            .read_sse(resp, 9, deadline)
+            .await
+            .expect_err("no matching event");
+
+        match err {
+            McpError::Protocol(msg) => {
+                assert!(
+                    msg.contains("SSE stream ended without a response for id 9"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_read_sse_times_out_when_the_stream_stalls() {
+        let server = start_fake_server(|_body| {
+            Reply::BytesThenHold(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_millis(200));
+
+        let resp = client
+            .post_json(&serde_json::json!({"id": 9}))
+            .await
+            .expect("post");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let err = client
+            .read_sse(resp, 9, deadline)
+            .await
+            .expect_err("a stalled stream must time out");
+
+        match err {
+            McpError::Timeout(d) => assert_eq!(d, Duration::from_millis(200)),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    // ── `call` ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn http_call_sends_tools_call_and_parses_the_call_result() {
+        let server = start_fake_server(|body| {
+            Reply::Bytes(result_frame(
+                body,
+                r#"{"content":[{"type":"text","text":"streamed"}],"isError":false}"#,
+            ))
+        })
+        .await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let result = client
+            .call("echo", &serde_json::json!({"text": "hello"}))
+            .await
+            .expect("tools/call");
+
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 1);
+        let seen = server.seen().await;
+        assert_eq!(seen[0].body["method"], "tools/call");
+        assert_eq!(seen[0].body["params"]["name"], "echo");
+        assert_eq!(
+            seen[0].body["params"]["arguments"],
+            serde_json::json!({"text": "hello"})
+        );
+    }
+
+    #[tokio::test]
+    async fn http_call_reports_a_server_error() {
+        let server = start_fake_server(|body| {
+            let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
+            Reply::Bytes(json_response(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32602,"message":"invalid params"}}}}"#
+            )))
+        })
+        .await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let err = client
+            .call("echo", &serde_json::json!({}))
+            .await
+            .expect_err("error frame");
+
+        match err {
+            McpError::ServerError { code, message } => {
+                assert_eq!(code, -32602);
+                assert_eq!(message, "invalid params");
+            }
+            other => panic!("expected a server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_call_rejects_a_result_that_is_not_a_call_result() {
+        let server =
+            start_fake_server(|body| Reply::Bytes(result_frame(body, r#"{"content":"oops"}"#)))
+                .await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let err = client
+            .call("echo", &serde_json::json!({}))
+            .await
+            .expect_err("a malformed result is an error");
+
+        match err {
+            McpError::Protocol(msg) => assert!(msg.contains("tools/call parse error"), "{msg}"),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    // ── `tool_definition` ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn http_tool_definition_wraps_the_tool_and_dispatches_a_call() {
+        let server = start_fake_server(|body| {
+            Reply::Bytes(result_frame(
+                body,
+                r#"{"content":[{"type":"text","text":"streamed"}],"isError":false}"#,
+            ))
+        })
+        .await;
+        let client = test_client(&server.url, HashMap::new(), Duration::from_secs(5));
+
+        let def = client.tool_definition(McpTool {
+            name: "echo".into(),
+            title: Some("Echo tool".into()),
+            description: "echo back the arguments".into(),
+            annotations: serde_json::json!({}),
+            input_schema: serde_json::json!({"type": "object"}),
+        });
+
+        assert_eq!(def.name, "mcp__fake__echo");
+        assert_eq!(def.label, "fake/Echo tool");
+        assert_eq!(def.description, "echo back the arguments");
+        assert_eq!(def.parameters, serde_json::json!({"type": "object"}));
+        assert_eq!(def.risk, conga::RiskLevel::High);
+
+        let result = (def.execute)(super::super::test_util::tool_call_ctx_for_test(
+            "c1",
+            serde_json::json!({"text": "hello"}),
+        ))
+        .await
+        .expect("execute");
+        assert!(!result.is_error);
+        assert!(matches!(
+            &result.content[0],
+            ContentBlock::Text { text } if text == "streamed"
+        ));
+
+        let seen = server.seen().await;
+        assert_eq!(seen[0].body["method"], "tools/call");
+        assert_eq!(seen[0].body["params"]["name"], "echo");
+    }
+
+    // ── `process_line` ────────────────────────────────────────────
+
+    #[test]
+    fn sse_process_line_collects_only_data_fields() {
+        let mut d = SseDecoder::new();
+
+        // A blank line is the event-dispatch point.
+        assert!(d.process_line(""));
+        assert!(d.data.is_empty());
+
+        // Comments and unknown fields are ignored.
+        assert!(!d.process_line(": keep-alive"));
+        assert!(!d.process_line("event: message"));
+        assert!(!d.process_line("id: 42"));
+        assert!(d.data.is_empty());
+
+        // A `data:` field is collected; one space after the colon is
+        // stripped, the rest is kept verbatim.
+        assert!(!d.process_line("data:  spaced"));
+        assert_eq!(d.data, vec![" spaced".to_string()]);
+
+        // A line without a colon is a field with an empty value.
+        assert!(!d.process_line("data"));
+        assert_eq!(d.data, vec![" spaced".to_string(), String::new()]);
+    }
+
     /// Read one HTTP request (head + Content-Length body) from `sock`.
     /// Returns the head text and the JSON body, or `None` on EOF.
     async fn read_http_request(
@@ -798,8 +1520,12 @@ mod proxy_tests {
     use super::*;
 
     /// Serializes these tests: they touch the process-global tool-proxy
-    /// override (conga's own test lock is pub(crate), unavailable here).
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// override (and read the proxy env). The crate-wide test lock is
+    /// shared with `proxy.rs` and `tools/fetch.rs`, so the override and
+    /// the env cannot be observed by another test mid-flight.
+    fn lock() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::proxy::test_util::LOCK.blocking_lock()
+    }
 
     fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
         let map: std::collections::HashMap<String, String> = pairs
@@ -811,7 +1537,7 @@ mod proxy_tests {
 
     #[test]
     fn tool_proxy_wins_over_legacy_env() {
-        let _g = LOCK.lock().unwrap();
+        let _g = lock();
         crate::proxy::set_tool_proxy(Some("socks5://tool:1080")).unwrap();
         assert_eq!(
             pick_mcp_proxy(&fake_env(&[
@@ -825,7 +1551,7 @@ mod proxy_tests {
 
     #[test]
     fn legacy_llm_proxy_still_works() {
-        let _g = LOCK.lock().unwrap();
+        let _g = lock();
         crate::proxy::set_tool_proxy(None).unwrap();
         assert_eq!(
             pick_mcp_proxy(&fake_env(&[("CONGA_LLM_PROXY", "http://llm:8080")])),

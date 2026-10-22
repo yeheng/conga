@@ -413,4 +413,201 @@ mod tests {
         let back: Usage = serde_json::from_value(json).unwrap();
         assert_eq!(back, u);
     }
+
+    // ── AgentMessage::user ────────────────────────────────────────
+
+    #[test]
+    fn user_message_wraps_the_text_in_one_block() {
+        let m = AgentMessage::user("hello");
+        match &m {
+            AgentMessage::User(u) => {
+                assert_eq!(u.content, vec![ContentBlock::text("hello")]);
+                assert!(u.timestamp > 0, "timestamp must be set");
+            }
+            other => panic!("expected a user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_message_keeps_an_empty_text_block() {
+        // An empty prompt is still a prompt: the block exists, it is empty.
+        let m = AgentMessage::user("");
+        match &m {
+            AgentMessage::User(u) => assert_eq!(u.content, vec![ContentBlock::text("")]),
+            other => panic!("expected a user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_message_preserves_newlines_and_unicode() {
+        let m = AgentMessage::user("第一行\n第二行 ✅");
+        match &m {
+            AgentMessage::User(u) => {
+                assert_eq!(u.content, vec![ContentBlock::text("第一行\n第二行 ✅")]);
+            }
+            other => panic!("expected a user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_message_serializes_with_the_user_role_tag() {
+        let json = serde_json::to_value(AgentMessage::user("hi")).unwrap();
+        assert_eq!(json["role"], "user");
+        assert_eq!(json["content"][0]["type"], "text");
+        assert_eq!(json["content"][0]["text"], "hi");
+    }
+
+    // ── AgentMessage::assistant_text ──────────────────────────────
+
+    #[test]
+    fn assistant_text_message_carries_one_text_block_and_defaults() {
+        let m = AgentMessage::assistant_text("answer");
+        match &m {
+            AgentMessage::Assistant(a) => {
+                assert_eq!(a.content, vec![ContentBlock::text("answer")]);
+                assert_eq!(a.model, "", "the model id is filled in later");
+                assert_eq!(a.stop_reason, StopReason::EndTurn);
+                assert_eq!(a.usage, None);
+                assert!(a.stream_indices.is_empty());
+                assert!(a.timestamp > 0);
+            }
+            other => panic!("expected an assistant message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_text_message_with_empty_text() {
+        let m = AgentMessage::assistant_text("");
+        match &m {
+            AgentMessage::Assistant(a) => assert_eq!(a.content, vec![ContentBlock::text("")]),
+            other => panic!("expected an assistant message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_text_message_serializes_with_the_assistant_role_tag() {
+        let json = serde_json::to_value(AgentMessage::assistant_text("hi")).unwrap();
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["content"][0]["text"], "hi");
+    }
+
+    // ── AssistantMessage::new / append_text / append_thinking ─────
+
+    #[test]
+    fn assistant_message_new_is_empty_but_tagged() {
+        let m = AssistantMessage::new(&"glm".to_string());
+        assert!(m.content.is_empty());
+        assert_eq!(m.model, "glm");
+        assert_eq!(m.stop_reason, StopReason::EndTurn);
+        assert_eq!(m.usage, None);
+        assert!(m.stream_indices.is_empty());
+    }
+
+    #[test]
+    fn append_text_appends_to_the_last_text_block() {
+        let mut m = AssistantMessage::new(&"m".to_string());
+        m.append_text("he");
+        m.append_text("llo");
+        assert_eq!(m.content, vec![ContentBlock::text("hello")]);
+    }
+
+    #[test]
+    fn append_text_starts_a_new_block_after_a_thinking_block() {
+        let mut m = AssistantMessage::new(&"m".to_string());
+        m.append_thinking("thinking");
+        m.append_text("answer");
+        assert_eq!(m.content.len(), 2);
+        assert_eq!(
+            m.content[0],
+            ContentBlock::Thinking {
+                thinking: "thinking".to_string()
+            }
+        );
+        assert_eq!(m.content[1], ContentBlock::text("answer"));
+    }
+
+    #[test]
+    fn append_thinking_creates_then_appends_to_the_same_block() {
+        let mut m = AssistantMessage::new(&"m".to_string());
+        m.append_thinking("par");
+        m.append_thinking("tial");
+        assert_eq!(
+            m.content,
+            vec![ContentBlock::Thinking {
+                thinking: "partial".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn append_thinking_after_text_starts_a_new_block() {
+        // The delta only ever joins the LAST block when that block is a
+        // thinking block; a text block in between starts a fresh thinking
+        // block (content order is preserved).
+        let mut m = AssistantMessage::new(&"m".to_string());
+        m.append_text("said");
+        m.append_thinking("thought");
+        assert_eq!(m.content.len(), 2);
+        assert_eq!(m.content[0], ContentBlock::text("said"));
+        assert_eq!(
+            m.content[1],
+            ContentBlock::Thinking {
+                thinking: "thought".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn append_thinking_with_an_empty_delta_creates_an_empty_block() {
+        let mut m = AssistantMessage::new(&"m".to_string());
+        m.append_thinking("");
+        assert_eq!(
+            m.content,
+            vec![ContentBlock::Thinking {
+                thinking: String::new()
+            }]
+        );
+    }
+
+    #[test]
+    fn append_thinking_keeps_unicode_intact() {
+        let mut m = AssistantMessage::new(&"m".to_string());
+        m.append_thinking("思考");
+        m.append_thinking("中");
+        assert_eq!(
+            m.content,
+            vec![ContentBlock::Thinking {
+                thinking: "思考中".to_string()
+            }]
+        );
+    }
+
+    // ── ContentBlock::text ────────────────────────────────────────
+
+    #[test]
+    fn content_block_text_builds_a_text_block() {
+        assert_eq!(
+            ContentBlock::text("x"),
+            ContentBlock::Text {
+                text: "x".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn content_block_text_accepts_an_empty_string() {
+        assert_eq!(
+            ContentBlock::text(""),
+            ContentBlock::Text {
+                text: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn content_block_text_serializes_with_the_text_type_tag() {
+        let json = serde_json::to_value(ContentBlock::text("x")).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "x");
+    }
 }

@@ -232,6 +232,62 @@ mod tests {
         SessionEvent::User(AgentMessage::user(t))
     }
 
+    // ---- block_text ----
+
+    #[test]
+    fn block_text_of_no_blocks_is_empty() {
+        assert_eq!(block_text(&[]), "");
+    }
+
+    #[test]
+    fn block_text_joins_text_blocks_with_newlines() {
+        let blocks = vec![ContentBlock::text("first"), ContentBlock::text("second")];
+        assert_eq!(block_text(&blocks), "first\nsecond");
+    }
+
+    #[test]
+    fn block_text_skips_non_text_blocks() {
+        // Tool-call and thinking blocks carry no indexable prose.
+        let blocks = vec![
+            ContentBlock::ToolCall {
+                tool_call: ToolCall {
+                    id: "t1".into(),
+                    function: FunctionCall {
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+            },
+            ContentBlock::text("kept"),
+            ContentBlock::Thinking {
+                thinking: "hmm".into(),
+            },
+        ];
+        assert_eq!(block_text(&blocks), "kept");
+    }
+
+    #[test]
+    fn block_text_of_only_non_text_blocks_is_empty() {
+        let blocks = vec![ContentBlock::Thinking {
+            thinking: "hmm".into(),
+        }];
+        assert_eq!(block_text(&blocks), "");
+    }
+
+    #[test]
+    fn block_text_keeps_embedded_newlines_and_unicode() {
+        let blocks = vec![
+            ContentBlock::text("line1\nline2"),
+            ContentBlock::text("中文🙂"),
+        ];
+        assert_eq!(block_text(&blocks), "line1\nline2\n中文🙂");
+    }
+
+    #[test]
+    fn block_text_of_a_single_empty_text_block_is_empty() {
+        assert_eq!(block_text(&[ContentBlock::text("")]), "");
+    }
+
     #[tokio::test]
     async fn event_rows_extracts_text_and_skips_markers() {
         let tmp = tempfile::tempdir().unwrap();

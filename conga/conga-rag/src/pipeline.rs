@@ -325,4 +325,100 @@ pub(crate) mod tests {
         let s2 = run_ingest(&cfg, None, false).await.unwrap();
         assert_eq!((s2.added, s2.skipped), (0, 1));
     }
+
+    // --- helpers ---
+
+    #[test]
+    fn hex_encodes_bytes_in_lowercase() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff");
+        assert_eq!(hex(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    #[test]
+    fn hex_matches_the_sha256_digest() {
+        let digest = sha2::Sha256::digest(b"abc");
+        assert_eq!(
+            hex(&digest),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn remove_store_files_removes_db_sidecars_and_the_edge_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(dir.path().join("t.db-wal"), b"wal").unwrap();
+        std::fs::write(dir.path().join("t.db-shm"), b"shm").unwrap();
+        let edge = crate::store::edge_dir(&db);
+        std::fs::create_dir_all(&edge).unwrap();
+        std::fs::write(edge.join("point.bin"), b"shard").unwrap();
+
+        remove_store_files(&db).unwrap();
+        assert!(!db.exists(), "db file must be gone");
+        assert!(!dir.path().join("t.db-wal").exists(), "-wal must be gone");
+        assert!(!dir.path().join("t.db-shm").exists(), "-shm must be gone");
+        assert!(!edge.exists(), "edge shard dir must be gone");
+    }
+
+    #[test]
+    fn remove_store_files_tolerates_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("never-existed.db");
+        remove_store_files(&db).unwrap();
+        assert!(!db.exists());
+    }
+
+    #[test]
+    fn remove_store_files_reports_a_failing_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        // A directory cannot be unlinked: the removal must fail loudly.
+        std::fs::create_dir_all(&db).unwrap();
+        let err = remove_store_files(&db).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--rebuild"), "msg: {msg}");
+        assert!(msg.contains("t.db"), "msg must name the path: {msg}");
+    }
+
+    #[tokio::test]
+    async fn ingest_fails_when_the_source_dir_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let (base, _req) = crate::testsupport::spawn_mock_embeddings(0).await;
+        let cfg = cfg_with_store(&dir.path().join("gone"), &dbdir.path().join("t.db"), &base);
+        let err = run_ingest(&cfg, None, false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("不存在"),
+            "err must name the missing directory: {err:#}"
+        );
+    }
+
+    /// `only` restricts the run to one source: the other source must stay
+    /// untouched until it is ingested explicitly.
+    #[tokio::test]
+    async fn ingest_only_touches_the_selected_source() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let (base, _req) = crate::testsupport::spawn_mock_embeddings(0).await;
+        std::fs::write(a.path().join("a.md"), "match a").unwrap();
+        std::fs::write(b.path().join("b.md"), "match b").unwrap();
+
+        let mut cfg = cfg_with_store(a.path(), &dbdir.path().join("t.db"), &base);
+        let other = crate::config::SourceConfig {
+            kind: "dir".into(),
+            path: b.path().to_path_buf(),
+            include: vec!["**/*.md".into()],
+            exclude: vec![],
+        };
+        cfg.sources.insert("other".to_string(), other);
+
+        let s1 = run_ingest(&cfg, Some("notes"), false).await.unwrap();
+        assert_eq!((s1.scanned, s1.added), (1, 1), "only the selected source");
+
+        let s2 = run_ingest(&cfg, None, false).await.unwrap();
+        assert_eq!((s2.scanned, s2.added), (2, 1), "the rest follows");
+    }
 }

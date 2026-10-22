@@ -17,6 +17,11 @@ use conga_host::session_api::{self, SessionListItem};
 
 mod chat;
 
+/// Serializes the tests that move `$HOME` — it is process-global state, so
+/// two tests that relocate the app config root must not overlap.
+#[cfg(test)]
+pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn session_store_root() -> std::path::PathBuf {
     conga::JsonlStorage::default_root().base_dir_clone()
 }
@@ -205,6 +210,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    use conga::{AgentMessage, ContentBlock, EventStorage, SessionEvent, UserMessage};
+
     struct NoopLogger;
 
     impl log::Log for NoopLogger {
@@ -229,5 +238,375 @@ mod tests {
             )
             .init();
         assert!(log::set_boxed_logger(Box::new(NoopLogger)).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // App config root isolation
+    //
+    // The commands resolve their storage through `conga::storage::config_dir()`,
+    // i.e. `dirs::home_dir()`. That helper re-reads `$HOME` on every call and
+    // never caches it, so moving `$HOME` into a temp dir moves the whole
+    // `~/.conga` root with it — no production seam required.
+    // ------------------------------------------------------------------
+
+    /// Serializes the tests that move `$HOME`: it is process-global state.
+    struct TempHome {
+        dir: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev_home: Option<std::ffi::OsString>,
+    }
+
+    impl TempHome {
+        fn new() -> Self {
+            let guard = crate::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_home = std::env::var_os("HOME");
+            let dir = tempfile::tempdir().expect("temp home");
+            std::env::set_var("HOME", dir.path());
+            Self {
+                dir,
+                _guard: guard,
+                prev_home,
+            }
+        }
+
+        /// `<home>/.conga`
+        fn conga_dir(&self) -> std::path::PathBuf {
+            self.dir.path().join(".conga")
+        }
+
+        /// `<home>/.conga/sessions`
+        fn sessions_dir(&self) -> std::path::PathBuf {
+            self.conga_dir().join("sessions")
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// The smallest possible session log entry.
+    fn user_event(text: &str) -> SessionEvent {
+        SessionEvent::User(AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::text(text)],
+            timestamp: 1,
+        }))
+    }
+
+    /// Write a one-message session into the (redirected) store.
+    async fn seed_session(id: &str, text: &str) {
+        EventStorage::new(session_store_root())
+            .append_event(id, &user_event(text))
+            .await
+            .expect("seed session");
+    }
+
+    /// Run `f`, then restore the process-global tool-proxy override. The
+    /// override lives in conga-host's process globals, so a test that
+    /// installs one must not leak it into the next test.
+    fn with_proxy_restored(f: impl FnOnce()) {
+        let baseline = conga_host::tool_proxy();
+        f();
+        let _ = conga_host::set_tool_proxy(baseline.as_deref());
+    }
+
+    #[tokio::test]
+    async fn session_store_root_lives_under_the_conga_home() {
+        let home = TempHome::new();
+        assert_eq!(session_store_root(), home.sessions_dir());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_is_empty_on_a_fresh_install() {
+        let _home = TempHome::new();
+        assert!(list_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_reports_seeded_sessions() {
+        let _home = TempHome::new();
+        seed_session("sess-1", "hello").await;
+        let items = list_sessions().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "sess-1");
+        assert_eq!(items[0].msg_count, 1);
+        assert!(items[0].name.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_session_messages_is_none_for_an_unknown_session() {
+        let _home = TempHome::new();
+        assert!(get_session_messages("ghost".into()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_session_messages_returns_the_transcript() {
+        let _home = TempHome::new();
+        seed_session("sess-1", "hello").await;
+        let msgs = get_session_messages("sess-1".into())
+            .await
+            .unwrap()
+            .expect("session has data");
+        assert_eq!(msgs.len(), 1);
+        let raw = serde_json::to_string(&msgs[0]).unwrap();
+        assert!(raw.contains("hello"), "transcript lost the message: {raw}");
+    }
+
+    #[tokio::test]
+    async fn rename_session_persists_the_display_name() {
+        let _home = TempHome::new();
+        rename_session("sess-1".into(), "  Release notes  ".into())
+            .await
+            .unwrap();
+        let items = list_sessions().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name.as_deref(), Some("Release notes"));
+    }
+
+    #[tokio::test]
+    async fn rename_session_rejects_invalid_ids_and_names() {
+        let _home = TempHome::new();
+        // Path traversal and empty ids must never reach the filesystem.
+        assert!(rename_session("../evil".into(), "ok".into()).await.is_err());
+        assert!(rename_session("".into(), "ok".into()).await.is_err());
+        assert!(rename_session("sess/1".into(), "ok".into()).await.is_err());
+        // A blank name is not a name.
+        assert!(rename_session("sess-1".into(), "   ".into()).await.is_err());
+        // 200 chars is the documented maximum; 201 is one over.
+        assert!(rename_session("sess-1".into(), "x".repeat(200).into())
+            .await
+            .is_ok());
+        assert!(rename_session("sess-1".into(), "x".repeat(201).into())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_the_session_exactly_once() {
+        let _home = TempHome::new();
+        seed_session("sess-1", "hello").await;
+        assert!(delete_session("sess-1".into()).await.unwrap());
+        assert!(!delete_session("sess-1".into()).await.unwrap());
+        assert!(list_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_session_rejects_invalid_ids() {
+        let _home = TempHome::new();
+        assert!(delete_session("../evil".into()).await.is_err());
+        assert!(delete_session("".into()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn search_sessions_rejects_a_blank_query() {
+        let _home = TempHome::new();
+        assert!(search_sessions("   ".into()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn search_sessions_finds_a_seeded_session() {
+        let _home = TempHome::new();
+        seed_session("sess-1", "hello").await;
+        let hits = search_sessions("hello".into()).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "sess-1");
+    }
+
+    #[test]
+    fn app_config_path_lives_under_the_conga_home() {
+        let home = TempHome::new();
+        assert_eq!(
+            app_config_path(),
+            home.conga_dir().join("app_config.json")
+        );
+    }
+
+    #[test]
+    fn get_app_config_is_none_when_absent() {
+        let _home = TempHome::new();
+        assert!(get_app_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn set_app_config_round_trips_through_the_file() {
+        let _home = TempHome::new();
+        with_proxy_restored(|| {
+            let cfg = serde_json::json!({ "theme": "dark", "conga_proxy": "" });
+            set_app_config(cfg.clone()).unwrap();
+            assert_eq!(get_app_config().unwrap().unwrap(), cfg);
+        });
+    }
+
+    #[test]
+    fn get_app_config_fails_loud_on_a_corrupt_file() {
+        let home = TempHome::new();
+        std::fs::create_dir_all(home.conga_dir()).unwrap();
+        std::fs::write(
+            home.conga_dir().join("app_config.json"),
+            b"{ this is not json",
+        )
+        .unwrap();
+        let err = get_app_config().unwrap_err();
+        assert!(err.contains("corrupt"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_proxy_from_config_installs_clears_and_rejects() {
+        let _home = TempHome::new();
+        let baseline = conga_host::tool_proxy();
+        with_proxy_restored(|| {
+            // A missing key clears the override (direct connection).
+            apply_proxy_from_config(&serde_json::json!({})).unwrap();
+            assert_eq!(conga_host::tool_proxy(), baseline);
+
+            // A valid URL is installed verbatim.
+            apply_proxy_from_config(&serde_json::json!({ "conga_proxy": "http://127.0.0.1:9" }))
+                .unwrap();
+            assert_eq!(
+                conga_host::tool_proxy().as_deref(),
+                Some("http://127.0.0.1:9")
+            );
+
+            // A blank value clears it again.
+            apply_proxy_from_config(&serde_json::json!({ "conga_proxy": "   " })).unwrap();
+            assert_eq!(conga_host::tool_proxy(), baseline);
+
+            // An unsupported scheme is rejected, and the override is left
+            // untouched by the failure.
+            let err = apply_proxy_from_config(&serde_json::json!({ "conga_proxy": "ftp://x.test" }))
+                .unwrap_err();
+            assert!(err.contains("conga_proxy invalid"), "got: {err}");
+            assert_eq!(conga_host::tool_proxy(), baseline);
+        });
+    }
+
+    #[test]
+    fn validate_proxy_accepts_clearing_and_known_schemes() {
+        assert!(validate_proxy("".into()).is_ok());
+        assert!(validate_proxy("   ".into()).is_ok());
+        assert!(validate_proxy("http://127.0.0.1:8080".into()).is_ok());
+        assert!(validate_proxy("https://proxy.test".into()).is_ok());
+        assert!(validate_proxy("socks5://127.0.0.1:1080".into()).is_ok());
+        assert!(validate_proxy("socks5h://127.0.0.1:1080".into()).is_ok());
+    }
+
+    #[test]
+    fn validate_proxy_rejects_unsupported_schemes() {
+        let err = validate_proxy("ftp://proxy.test".into()).unwrap_err();
+        assert!(err.contains("unsupported proxy scheme"), "got: {err}");
+    }
+
+    #[test]
+    fn set_app_config_persists_the_file_even_when_the_proxy_is_invalid() {
+        // Documented current behaviour: the file write happens first, so an
+        // invalid proxy is reported to the caller while the (unusable) value
+        // stays on disk. Startup re-reads the file and skips the invalid
+        // proxy with a warning.
+        let home = TempHome::new();
+        with_proxy_restored(|| {
+            let err = set_app_config(serde_json::json!({ "conga_proxy": "ftp://x.test" }))
+                .unwrap_err();
+            assert!(err.contains("conga_proxy invalid"), "got: {err}");
+            let saved = get_app_config().unwrap().unwrap();
+            assert_eq!(saved["conga_proxy"], serde_json::json!("ftp://x.test"));
+            assert!(home.conga_dir().join("app_config.json").exists());
+        });
+    }
+
+    #[test]
+    fn get_env_settings_never_leaks_the_api_key() {
+        let home = TempHome::new();
+        std::fs::create_dir_all(home.conga_dir()).unwrap();
+        std::fs::write(
+            home.conga_dir().join("settings.json"),
+            serde_json::json!({
+                "llm": {
+                    "baseUrl": "https://api.test/v1",
+                    "model": "test-model",
+                    "apiKey": "sk-secret-value-123456",
+                    "api": "openai"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let masked = get_env_settings();
+        let raw = serde_json::to_string(&masked).unwrap();
+        assert!(!raw.contains("sk-secret-value-123456"), "leaked key: {raw}");
+        assert_eq!(masked["llm"]["apiKeySet"], serde_json::json!(true));
+        assert_eq!(masked["llm"]["model"], serde_json::json!("test-model"));
+        assert_eq!(masked["llm"]["api"], serde_json::json!("openai"));
+    }
+
+    #[test]
+    fn get_env_settings_is_empty_without_a_settings_file() {
+        let _home = TempHome::new();
+        let masked = get_env_settings();
+        assert_eq!(masked["llm"], serde_json::Value::Null);
+        assert_eq!(masked["fastLlm"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn set_env_settings_persists_and_returns_the_masked_view() {
+        let home = TempHome::new();
+        let out = set_env_settings(serde_json::json!({
+            "llm": {
+                "baseUrl": "https://api.test/v1",
+                "model": "test-model",
+                "apiKey": "sk-abcdef123456",
+                "api": "openai"
+            }
+        }))
+        .unwrap();
+
+        let raw = serde_json::to_string(&out).unwrap();
+        assert!(!raw.contains("sk-abcdef123456"), "leaked key: {raw}");
+        assert_eq!(out["llm"]["apiKeySet"], serde_json::json!(true));
+
+        // The raw key IS persisted on disk — the mask only guards the wire.
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.conga_dir().join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["llm"]["apiKey"], serde_json::json!("sk-abcdef123456"));
+    }
+
+    #[test]
+    fn set_env_settings_rejects_an_invalid_group() {
+        let _home = TempHome::new();
+        // A key is present, so the group reaches field validation.
+        let err = set_env_settings(serde_json::json!({
+            "llm": { "baseUrl": "not-a-url", "model": "test-model", "apiKey": "sk-abcdef123456" }
+        }))
+        .unwrap_err();
+        assert!(err.starts_with("llm:"), "got: {err}");
+        assert!(err.contains("base_url"), "got: {err}");
+
+        // An unknown api value is rejected too.
+        let err = set_env_settings(serde_json::json!({
+            "llm": {
+                "baseUrl": "https://api.test/v1",
+                "model": "test-model",
+                "apiKey": "sk-abcdef123456",
+                "api": "gemini"
+            }
+        }))
+        .unwrap_err();
+        assert!(err.contains("api must be openai or anthropic"), "got: {err}");
+    }
+
+    #[test]
+    fn set_env_settings_requires_a_key_when_none_is_stored() {
+        let _home = TempHome::new();
+        // No stored key to inherit and none supplied -> rejected.
+        let err = set_env_settings(serde_json::json!({
+            "llm": { "baseUrl": "https://api.test/v1", "model": "test-model", "apiKey": "" }
+        }))
+        .unwrap_err();
+        assert!(err.contains("apiKey is required"), "got: {err}");
     }
 }

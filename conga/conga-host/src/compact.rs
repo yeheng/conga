@@ -351,6 +351,46 @@ mod tests {
         })
     }
 
+    /// ToolResult whose single text block carries `text`.
+    fn result_with_text(id: &str, text: &str) -> AgentMessage {
+        AgentMessage::ToolResult(ToolResultMessage {
+            tool_call_id: id.into(),
+            tool_name: "f".into(),
+            content: vec![ContentBlock::text(text)],
+            is_error: false,
+            timestamp: 1,
+        })
+    }
+
+    /// The text of a message's first text block (test helper).
+    fn text_of(m: &AgentMessage) -> String {
+        match m {
+            AgentMessage::User(u) => first_text(&u.content),
+            AgentMessage::Assistant(a) => first_text(&a.content),
+            AgentMessage::ToolResult(t) => first_text(&t.content),
+            AgentMessage::Custom(_) => String::new(),
+        }
+    }
+
+    fn first_text(blocks: &[ContentBlock]) -> String {
+        blocks
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Injectable env lookup — never touches the process environment.
+    fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned().ok_or(std::env::VarError::NotPresent)
+    }
+
     #[test]
     fn under_budget_unchanged() {
         let msgs = vec![user("a"), assistant("b")];
@@ -670,5 +710,345 @@ mod tests {
         for id in &result_ids {
             assert!(call_ids.contains(id), "orphan tool_result {id} has no call");
         }
+    }
+
+    // ── env parsing (injected lookups only) ──
+
+    /// `max_messages_from_env` reads the process environment; the only
+    /// hermetic assertion is that it agrees with what that environment says.
+    #[test]
+    fn max_messages_from_env_reads_the_process_environment() {
+        let expected = std::env::var("CONGA_COMPACT_MAX_MESSAGES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_MESSAGES);
+        assert_eq!(max_messages_from_env(), expected);
+    }
+
+    #[test]
+    fn max_messages_from_falls_back_on_unusable_values() {
+        // Unset → default.
+        assert_eq!(
+            max_messages_from(&fake_env(&[])),
+            DEFAULT_MAX_MESSAGES,
+            "unset must fall back to the default"
+        );
+        // Empty / non-numeric / negative / whitespace-padded → default.
+        for raw in ["", "abc", "-1", " 12 ", "12.5", "0x10"] {
+            assert_eq!(
+                max_messages_from(&fake_env(&[("CONGA_COMPACT_MAX_MESSAGES", raw)])),
+                DEFAULT_MAX_MESSAGES,
+                "value {raw:?} must fall back to the default"
+            );
+        }
+        // "0" is a legal value: it means "never compact".
+        assert_eq!(
+            max_messages_from(&fake_env(&[("CONGA_COMPACT_MAX_MESSAGES", "0")])),
+            0
+        );
+        // A huge value is accepted verbatim.
+        assert_eq!(
+            max_messages_from(&fake_env(&[("CONGA_COMPACT_MAX_MESSAGES", "100000")])),
+            100_000
+        );
+    }
+
+    #[test]
+    fn env_parse_reads_the_value_or_returns_the_default() {
+        assert_eq!(env_parse(&fake_env(&[]), "K", 7u32), 7);
+        assert_eq!(env_parse(&fake_env(&[("K", "9")]), "K", 7u32), 9);
+        assert_eq!(env_parse(&fake_env(&[("K", "nope")]), "K", 7u32), 7);
+        // A different key is not read.
+        assert_eq!(env_parse(&fake_env(&[("OTHER", "9")]), "K", 7u32), 7);
+        // Generic over the parsed type.
+        assert_eq!(
+            env_parse(&fake_env(&[("K", "s")]), "K", "d".to_string()),
+            "s".to_string()
+        );
+    }
+
+    // ── atomic grouping ──
+
+    #[test]
+    fn atomic_groups_keeps_an_assistant_with_its_tool_results() {
+        let msgs = vec![
+            user("u1"),
+            assistant_with_tool("t1"),
+            result("t1"),
+            result("t2"),
+            user("u2"),
+            assistant("a2"),
+        ];
+        assert_eq!(atomic_groups(&msgs), vec![(0, 1), (1, 4), (4, 5), (5, 6)]);
+    }
+
+    #[test]
+    fn atomic_groups_on_empty_input_has_no_groups() {
+        assert!(atomic_groups(&[]).is_empty());
+    }
+
+    #[test]
+    fn atomic_groups_treats_a_leading_tool_result_as_its_own_group() {
+        let msgs = vec![result("t1"), user("u")];
+        assert_eq!(atomic_groups(&msgs), vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn atomic_groups_splits_two_assistants_without_tool_results() {
+        let msgs = vec![assistant("a1"), assistant("a2")];
+        assert_eq!(atomic_groups(&msgs), vec![(0, 1), (1, 2)]);
+    }
+
+    // ── the compaction walk ──
+
+    #[test]
+    fn compacted_returns_none_when_nothing_can_be_dropped() {
+        let msgs = vec![user("a"), user("b")];
+        // Under budget.
+        assert!(compacted(&msgs, 5).is_none());
+        // Exactly at the limit.
+        assert!(compacted(&msgs, 2).is_none());
+        // max == 0 disables compaction.
+        assert!(compacted(&msgs, 0).is_none());
+        // Over budget, but only the pinned first group would be dropped.
+        assert!(compacted(&msgs, 1).is_none());
+    }
+
+    #[test]
+    fn compacted_drops_the_oldest_groups_and_prepends_a_notice() {
+        let msgs: Vec<_> = (0..6).map(|i| user(&format!("m{i}"))).collect();
+        let out = compacted(&msgs, 3).expect("must compact");
+        // pinned task + notice + the two newest messages.
+        assert_eq!(out.len(), 4);
+        assert_eq!(text_of(&out[0]), "m0", "original task is pinned");
+        assert!(
+            text_of(&out[1]).contains("compacted 3 earlier messages"),
+            "notice: {}",
+            text_of(&out[1])
+        );
+        assert_eq!(text_of(&out[2]), "m4");
+        assert_eq!(text_of(&out[3]), "m5");
+    }
+
+    #[test]
+    fn compacted_keeps_the_whole_last_atomic_group() {
+        // [user, asst(tc), result, user] — the trailing user is its own group.
+        let msgs = vec![
+            user("u1"),
+            assistant_with_tool("t1"),
+            result("t1"),
+            user("u2"),
+        ];
+        let out = compacted(&msgs, 2).expect("must compact");
+        // pinned + notice + the last group.
+        assert_eq!(out.len(), 3);
+        assert!(matches!(&out[2], AgentMessage::User(_)));
+        assert_eq!(text_of(&out[2]), "u2");
+    }
+
+    /// KNOWN BUG (reported, not fixed): the "pinned original task" is pushed
+    /// as `messages[0]` only — the REST of the pinned group is dropped. When
+    /// the transcript starts with an `Assistant` message, the pinned group is
+    /// `[assistant, tool_result, ...]`, so the tool result disappears and
+    /// the assistant is left with an ORPHAN tool call. The notice also
+    /// under-counts the dropped messages (`dropped` subtracts the pinned
+    /// group's length, but only its first message is actually kept).
+    ///
+    /// This test pins the CURRENT behaviour so the bug stays visible; it
+    /// must be updated when the bug is fixed.
+    #[test]
+    fn pinned_first_group_keeps_only_its_first_message_known_bug() {
+        let msgs = vec![
+            assistant_with_tool("t1"),
+            result("t1"),
+            user("u2"),
+            user("u3"),
+            user("u4"),
+        ];
+        let out = compact_by_count(&msgs, 3);
+        // The pinned assistant (with its tool call) survives...
+        match &out[0] {
+            AgentMessage::Assistant(a) => assert!(a
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolCall { .. }))),
+            other => panic!("expected the pinned assistant, got {other:?}"),
+        }
+        // ...but its tool result is gone → an orphan tool call.
+        let result_ids: Vec<String> = out
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::ToolResult(r) => Some(r.tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            result_ids.is_empty(),
+            "the pinned group's tool result was dropped: {result_ids:?}"
+        );
+        // Two messages were dropped (the tool result and u2), but the notice
+        // counts only one.
+        assert!(
+            text_of(&out[1]).contains("compacted 1 earlier messages"),
+            "notice under-counts: {}",
+            text_of(&out[1])
+        );
+    }
+
+    #[test]
+    fn compaction_truncates_old_tool_results_but_keeps_the_newest_exchange() {
+        let long = "z".repeat(1_000);
+        let msgs = vec![
+            user("u1"),
+            assistant_with_tool("t1"),
+            result_with_text("t1", "old"),
+            user("u2"),
+            assistant_with_tool("t2"),
+            result_with_text("t2", &long),
+            user("u3"),
+            assistant_with_tool("t3"),
+            result_with_text("t3", "newest"),
+        ];
+        let out = compact_by_count(&msgs, 7);
+        // pinned + notice + messages[3..]
+        assert_eq!(out.len(), 8);
+        // The old tool result (index 5) is truncated to a head preview.
+        let truncated = text_of(&out[4]);
+        assert!(
+            truncated.contains("output truncated by compaction"),
+            "old tool result must be truncated: {truncated}"
+        );
+        assert!(truncated.starts_with(&"z".repeat(TRUNCATED_TOOL_RESULT_CHARS)));
+        // The newest exchange stays verbatim.
+        assert_eq!(text_of(&out[7]), "newest");
+    }
+
+    // ── the borrowed / owned view ──
+
+    #[test]
+    fn as_slice_exposes_the_borrowed_and_the_owned_messages() {
+        let msgs = vec![user("a"), user("b")];
+        let borrowed = Compacted::Borrowed(&msgs);
+        assert_eq!(borrowed.as_slice().len(), 2);
+        assert!(std::ptr::eq(borrowed.as_slice().as_ptr(), msgs.as_ptr()));
+
+        let owned = Compacted::Owned(vec![user("x"), user("y"), user("z")]);
+        assert_eq!(owned.as_slice().len(), 3);
+        assert_eq!(text_of(&owned.as_slice()[2]), "z");
+    }
+
+    #[test]
+    fn compact_by_count_view_borrows_when_unchanged_and_owns_after_compaction() {
+        let msgs: Vec<_> = (0..6).map(|i| user(&format!("m{i}"))).collect();
+        match compact_by_count_view(&msgs, 10) {
+            Compacted::Borrowed(s) => {
+                assert!(std::ptr::eq(s.as_ptr(), msgs.as_ptr()));
+                assert_eq!(s.len(), 6);
+            }
+            Compacted::Owned(v) => panic!("under budget must borrow, got owned {v:?}"),
+        }
+        match compact_by_count_view(&msgs, 3) {
+            Compacted::Owned(v) => assert_eq!(v.len(), 4),
+            Compacted::Borrowed(s) => panic!("over budget must own, got borrowed {s:?}"),
+        }
+    }
+
+    // ── tool-result truncation ──
+
+    #[test]
+    fn truncate_tool_result_shortens_long_text_and_marks_it() {
+        let long = "x".repeat(TRUNCATED_TOOL_RESULT_CHARS + 50);
+        let out = truncate_tool_result(&result_with_text("t1", &long));
+        let text = text_of(&out);
+        assert!(
+            text.starts_with(&"x".repeat(TRUNCATED_TOOL_RESULT_CHARS)),
+            "head must be preserved"
+        );
+        assert!(
+            text.contains("output truncated by compaction"),
+            "truncation must be marked: {text}"
+        );
+    }
+
+    #[test]
+    fn truncate_tool_result_keeps_text_at_or_below_the_limit_untouched() {
+        let exact = "y".repeat(TRUNCATED_TOOL_RESULT_CHARS);
+        let text = text_of(&truncate_tool_result(&result_with_text("t1", &exact)));
+        assert_eq!(text, exact, "exactly at the limit must not be truncated");
+
+        let short = "ok";
+        let text = text_of(&truncate_tool_result(&result_with_text("t1", short)));
+        assert_eq!(text, short);
+
+        let empty = text_of(&truncate_tool_result(&result_with_text("t1", "")));
+        assert_eq!(empty, "");
+    }
+
+    #[test]
+    fn truncate_tool_result_passes_other_messages_through() {
+        let out = truncate_tool_result(&user("hello"));
+        assert!(matches!(&out, AgentMessage::User(_)));
+        assert_eq!(text_of(&out), "hello");
+    }
+
+    // ── budget knobs ──
+
+    #[test]
+    fn from_env_with_uses_the_documented_defaults() {
+        let b = ContextBudget::from_env_with(&fake_env(&[]));
+        assert_eq!(b.window(), 128_000);
+        assert_eq!(b.threshold_pct, 80);
+        assert_eq!(b.target_pct, 50);
+        assert_eq!(b.fallback_max_messages, DEFAULT_MAX_MESSAGES);
+        assert_eq!(b.current_tokens(), 0);
+    }
+
+    #[test]
+    fn from_env_with_reads_every_knob() {
+        let b = ContextBudget::from_env_with(&fake_env(&[
+            ("CONGA_CONTEXT_WINDOW", "1000"),
+            ("CONGA_COMPACT_THRESHOLD_PCT", "90"),
+            ("CONGA_COMPACT_TARGET_PCT", "25"),
+            ("CONGA_COMPACT_MAX_MESSAGES", "12"),
+        ]));
+        assert_eq!(b.window(), 1000);
+        assert_eq!(b.threshold_pct, 90);
+        assert_eq!(b.target_pct, 25);
+        assert_eq!(b.fallback_max_messages, 12);
+    }
+
+    #[test]
+    fn from_env_with_ignores_unusable_values() {
+        let b = ContextBudget::from_env_with(&fake_env(&[
+            ("CONGA_CONTEXT_WINDOW", "not-a-number"),
+            ("CONGA_COMPACT_THRESHOLD_PCT", ""),
+            ("CONGA_COMPACT_TARGET_PCT", "-5"),
+            ("CONGA_COMPACT_MAX_MESSAGES", "abc"),
+        ]));
+        assert_eq!(b.window(), 128_000);
+        assert_eq!(b.threshold_pct, 80);
+        assert_eq!(b.target_pct, 50);
+        assert_eq!(b.fallback_max_messages, DEFAULT_MAX_MESSAGES);
+    }
+
+    #[test]
+    fn from_env_agrees_with_the_process_environment() {
+        let b = ContextBudget::from_env();
+        let expected_window = std::env::var("CONGA_CONTEXT_WINDOW")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(128_000);
+        assert_eq!(b.window(), expected_window);
+    }
+
+    #[test]
+    fn current_tokens_reports_the_last_recorded_value() {
+        let mut b = ContextBudget::from_env_with(&fake_env(&[]));
+        assert_eq!(b.current_tokens(), 0, "nothing recorded yet");
+        b.record_input_tokens(1_234);
+        assert_eq!(b.current_tokens(), 1_234);
+        // A later report replaces the previous one.
+        b.record_input_tokens(0);
+        assert_eq!(b.current_tokens(), 0);
     }
 }

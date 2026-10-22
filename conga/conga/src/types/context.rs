@@ -307,4 +307,202 @@ mod tests {
         let t = AgentTunables::from_env_with(&fake_env(&[("CONGA_MAX_TURNS", "not-a-number")]));
         assert_eq!(t.max_turns, 50);
     }
+
+    // ── RetryPolicy ───────────────────────────────────────────────
+
+    #[test]
+    fn retry_policy_default_values() {
+        let r = RetryPolicy::default();
+        assert_eq!(r.max_retries, 2);
+        assert_eq!(r.initial_delay_ms, 500);
+        assert_eq!(r.max_delay_ms, 8_000);
+        assert!(r.jitter);
+    }
+
+    #[test]
+    fn retry_policy_off_disables_retries_and_jitter() {
+        let r = RetryPolicy::off();
+        assert_eq!(r.max_retries, 0);
+        assert_eq!(r.initial_delay_ms, 0);
+        assert_eq!(r.max_delay_ms, 0);
+        assert!(!r.jitter);
+    }
+
+    #[test]
+    fn retry_policy_off_never_retries() {
+        // `off` is the deterministic-failure policy for tests: the retry
+        // budget must be exactly zero, not merely "small".
+        assert_eq!(RetryPolicy::off().max_retries, 0);
+        assert_ne!(
+            RetryPolicy::off().max_retries,
+            RetryPolicy::default().max_retries
+        );
+    }
+
+    // ── env_parse ─────────────────────────────────────────────────
+
+    #[test]
+    fn env_parse_reads_a_numeric_value() {
+        let v = env_parse(&fake_env(&[("K", "42")]), "K", 0usize);
+        assert_eq!(v, 42usize);
+    }
+
+    #[test]
+    fn env_parse_accepts_zero() {
+        // "0" is a legal value, not a missing one.
+        let v = env_parse(&fake_env(&[("K", "0")]), "K", 7usize);
+        assert_eq!(v, 0usize);
+    }
+
+    #[test]
+    fn env_parse_falls_back_when_the_var_is_missing() {
+        let v = env_parse(&fake_env(&[]), "K", 7usize);
+        assert_eq!(v, 7usize);
+    }
+
+    #[test]
+    fn env_parse_falls_back_on_a_malformed_value() {
+        let v = env_parse(&fake_env(&[("K", "twelve")]), "K", 7usize);
+        assert_eq!(v, 7usize);
+    }
+
+    #[test]
+    fn env_parse_falls_back_on_a_negative_value_for_unsigned() {
+        let v = env_parse(&fake_env(&[("K", "-1")]), "K", 7u64);
+        assert_eq!(v, 7u64);
+    }
+
+    // ── AgentTunables::from_env ───────────────────────────────────
+
+    #[test]
+    fn tunables_from_env_agrees_with_the_injected_lookup() {
+        // `from_env` must be a thin wrapper over the process lookup — same
+        // values, whether or not the machine has the vars set.
+        let direct = AgentTunables::from_env();
+        let injected = AgentTunables::from_env_with(&|k: &str| std::env::var(k));
+        assert_eq!(direct.max_turns, injected.max_turns);
+        assert_eq!(
+            direct.max_tool_calls_per_turn,
+            injected.max_tool_calls_per_turn
+        );
+        assert_eq!(direct.max_tokens, injected.max_tokens);
+        assert_eq!(direct.retry.max_retries, injected.retry.max_retries);
+        assert_eq!(direct.tool_timeout_secs, injected.tool_timeout_secs);
+    }
+
+    #[test]
+    fn tunables_tool_timeout_is_absent_by_default() {
+        let t = AgentTunables::from_env_with(&fake_env(&[]));
+        assert_eq!(t.tool_timeout_secs, None);
+    }
+
+    #[test]
+    fn tunables_tool_timeout_parses_seconds() {
+        let t = AgentTunables::from_env_with(&fake_env(&[("CONGA_TOOL_TIMEOUT_S", "30")]));
+        assert_eq!(t.tool_timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn tunables_tool_timeout_ignores_a_malformed_value() {
+        let t = AgentTunables::from_env_with(&fake_env(&[("CONGA_TOOL_TIMEOUT_S", "soon")]));
+        assert_eq!(t.tool_timeout_secs, None);
+    }
+
+    /// Boundary: `0` parses as a REAL zero-second timeout, not as "disabled".
+    /// `agent_loop` feeds that straight into `tokio::time::timeout`, so a
+    /// zero-length deadline cuts off every tool call that does not complete
+    /// synchronously ("tool execution timed out after 0s"). The way to
+    /// disable the engine-level timeout is to leave the variable unset.
+    #[test]
+    fn tunables_tool_timeout_of_zero_parses_as_zero() {
+        let t = AgentTunables::from_env_with(&fake_env(&[("CONGA_TOOL_TIMEOUT_S", "0")]));
+        assert_eq!(t.tool_timeout_secs, Some(0));
+    }
+
+    // ── Debug formatting ──────────────────────────────────────────
+
+    #[test]
+    fn agent_context_debug_summarizes_without_dumping_content() {
+        let ctx = AgentContext {
+            system_prompt: "be brief".to_string(),
+            messages: vec![crate::types::message::AgentMessage::user("hello there")],
+            tools: Vec::new(),
+            cwd: PathBuf::from("/tmp/work"),
+            env: HashMap::from([("K".to_string(), "V".to_string())]),
+            session_id: "s1".to_string(),
+        };
+        let out = format!("{ctx:?}");
+        assert!(out.contains("AgentContext"), "{out}");
+        assert!(out.contains("be brief"), "{out}");
+        assert!(out.contains("messages_len"), "{out}");
+        assert!(out.contains("1"), "{out}");
+        assert!(out.contains("tools_len"), "{out}");
+        assert!(out.contains("/tmp/work"), "{out}");
+        assert!(out.contains("s1"), "{out}");
+    }
+
+    #[test]
+    fn agent_loop_config_debug_summarizes_the_knobs() {
+        let cfg = AgentLoopConfig {
+            model: ModelSpec {
+                id: "claude-sonnet".to_string(),
+                api: ProviderApi::Anthropic,
+                max_tokens: 4096,
+            },
+            max_turns: 7,
+            max_tool_calls_per_turn: 3,
+            tool_timeout: None,
+            signal: None,
+            stream_fn: std::sync::Arc::new(NullStream),
+            hooks: None,
+            retry: RetryPolicy::off(),
+            persist: None,
+            steer: None,
+            transform_context: None,
+        };
+        let out = format!("{cfg:?}");
+        assert!(out.contains("AgentLoopConfig"), "{out}");
+        assert!(out.contains("claude-sonnet"), "{out}");
+        assert!(out.contains("7"), "{out}");
+        assert!(out.contains("3"), "{out}");
+        // Non-exhaustive: the sensitive/derived fields stay out of the log.
+        assert!(!out.contains("persist"), "{out}");
+    }
+
+    // ── StreamFn ──────────────────────────────────────────────────
+
+    /// A `StreamFn` that yields a canned chunk sequence.
+    struct NullStream;
+
+    impl StreamFn for NullStream {
+        fn stream(
+            &self,
+            _model: &ModelSpec,
+            _messages: &[crate::types::message::AgentMessage],
+            _system_prompt: &str,
+            _tools: &[ToolDefinition],
+            _signal: Option<CancelSignal>,
+        ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
+            let chunks = vec![StreamChunk::TextDelta("hi".to_string()), StreamChunk::Done];
+            Box::pin(futures_util::stream::iter(chunks))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_fn_yields_the_provider_chunks() {
+        use futures_util::StreamExt;
+        let fn_impl = NullStream;
+        let model = ModelSpec {
+            id: "m".to_string(),
+            api: ProviderApi::OpenAiCompat,
+            max_tokens: 16,
+        };
+        let mut stream = fn_impl.stream(&model, &[], "", &[], None);
+        assert_eq!(
+            stream.next().await,
+            Some(StreamChunk::TextDelta("hi".to_string()))
+        );
+        assert_eq!(stream.next().await, Some(StreamChunk::Done));
+        assert_eq!(stream.next().await, None);
+    }
 }

@@ -113,11 +113,11 @@ pub async fn build_headless(
 mod tests {
     use super::*;
     use crate::settings::{EnvSettings, LlmGroup};
-    use std::sync::Mutex;
 
     /// 三个 headless 测试都做进程 env 手术；并行会互相践踏（restore 回
-    /// 旧值可能覆盖另一个测试刚设置的值）。串行化本模块内的测试。
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// 旧值可能覆盖另一个测试刚设置的值）。串行化本模块内的测试，并与
+    /// 其它会读同一批 env 变量的测试共用 crate 级锁。
+    use crate::ENV_LOCK;
 
     fn scratch() -> tempfile::TempDir {
         tempfile::tempdir().expect("scratch dir")

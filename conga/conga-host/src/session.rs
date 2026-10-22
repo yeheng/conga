@@ -641,4 +641,249 @@ mod tests {
         sm.append_event(&user_event("c")).await.unwrap();
         assert_eq!(find(sm.list().await.unwrap()).msg_count, 3);
     }
+
+    // ---- Default ----
+
+    #[test]
+    fn default_manager_starts_on_its_own_uuid_session() {
+        let sm = SessionManager::default();
+        let id = sm.current_id();
+        assert!(
+            uuid::Uuid::parse_str(&id).is_ok(),
+            "a fresh manager must own a uuid session id, got: {id}"
+        );
+        let other = SessionManager::default();
+        assert_ne!(
+            id,
+            other.current_id(),
+            "two default managers must not share a session id"
+        );
+    }
+
+    // ---- count_messages ----
+
+    #[test]
+    fn count_messages_of_an_empty_log_is_zero() {
+        assert_eq!(count_messages("", false), 0);
+        assert_eq!(count_messages("", true), 0);
+    }
+
+    #[test]
+    fn count_messages_counts_every_non_empty_line_in_legacy_mode() {
+        // A pre-migration messages.jsonl holds one message per non-empty line.
+        let raw = "{\"a\":1}\n\n{\"b\":2}\n   \n{\"c\":3}\n";
+        assert_eq!(count_messages(raw, false), 3);
+    }
+
+    #[test]
+    fn count_messages_counts_only_model_visible_event_rows() {
+        // TurnStart/TurnEnd are markers: they are not messages.
+        let raw = concat!(
+            "{\"type\":\"turn_start\"}\n",
+            "{\"type\":\"user\"}\n",
+            "{\"type\":\"assistant\"}\n",
+            "{\"type\":\"tool_result\"}\n",
+            "{\"type\":\"turn_end\"}\n",
+        );
+        assert_eq!(count_messages(raw, true), 3);
+    }
+
+    #[test]
+    fn count_messages_counts_nothing_before_the_last_cleared_marker() {
+        // The pre-clear prefix is history on disk, not conversation.
+        let raw = concat!(
+            "{\"type\":\"user\"}\n",
+            "{\"type\":\"assistant\"}\n",
+            "{\"type\":\"cleared\"}\n",
+            "{\"type\":\"user\"}\n",
+        );
+        assert_eq!(count_messages(raw, true), 1);
+    }
+
+    #[test]
+    fn count_messages_skips_torn_unknown_and_typeless_rows() {
+        let raw = concat!(
+            "{\"type\":\"user\"}\n",
+            "{\"type\":\"user\"\n", // torn tail
+            "not json at all\n",
+            "{\"type\":\"future_variant\"}\n", // unknown discriminant
+            "{\"no_type\":true}\n",            // no discriminant at all
+            "{\"type\":\"assistant\"}\n",
+        );
+        assert_eq!(count_messages(raw, true), 2);
+    }
+
+    // ---- read_msg_count_cache ----
+
+    #[tokio::test]
+    async fn read_msg_count_cache_returns_none_for_a_missing_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_msg_count_cache(&tmp.path().join("meta.json"))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn read_msg_count_cache_returns_none_for_unparsable_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("meta.json");
+        std::fs::write(&p, "{not json").unwrap();
+        assert!(read_msg_count_cache(&p).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_msg_count_cache_returns_none_when_a_field_is_missing_or_mistyped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("meta.json");
+        // msg_count_bytes missing
+        std::fs::write(&p, r#"{"msg_count": 3}"#).unwrap();
+        assert!(read_msg_count_cache(&p).await.is_none());
+        // msg_count is not a number
+        std::fs::write(&p, r#"{"msg_count": "three", "msg_count_bytes": 10}"#).unwrap();
+        assert!(read_msg_count_cache(&p).await.is_none());
+        // msg_count_bytes is not a number
+        std::fs::write(&p, r#"{"msg_count": 3, "msg_count_bytes": "ten"}"#).unwrap();
+        assert!(read_msg_count_cache(&p).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_msg_count_cache_returns_the_pair_for_a_valid_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("meta.json");
+        std::fs::write(&p, r#"{"name":"x","msg_count":7,"msg_count_bytes":123}"#).unwrap();
+        assert_eq!(read_msg_count_cache(&p).await, Some((7, 123)));
+    }
+
+    // ---- write_msg_count_cache ----
+
+    #[tokio::test]
+    async fn write_msg_count_cache_creates_the_sidecar_with_the_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("meta.json");
+        write_msg_count_cache(&p, 4, 55).await;
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v[META_MSG_COUNT], 4);
+        assert_eq!(v[META_MSG_COUNT_BYTES], 55);
+    }
+
+    #[tokio::test]
+    async fn write_msg_count_cache_preserves_unrelated_fields() {
+        // The display name written by the rename flow must survive the merge.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("meta.json");
+        std::fs::write(&p, r#"{"name":"Release notes"}"#).unwrap();
+        write_msg_count_cache(&p, 2, 20).await;
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["name"], "Release notes");
+        assert_eq!(v[META_MSG_COUNT], 2);
+        assert_eq!(v[META_MSG_COUNT_BYTES], 20);
+    }
+
+    #[tokio::test]
+    async fn write_msg_count_cache_overwrites_a_previous_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("meta.json");
+        write_msg_count_cache(&p, 1, 10).await;
+        write_msg_count_cache(&p, 9, 90).await;
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v[META_MSG_COUNT], 9);
+        assert_eq!(v[META_MSG_COUNT_BYTES], 90);
+    }
+
+    #[tokio::test]
+    async fn write_msg_count_cache_replaces_a_corrupt_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("meta.json");
+        std::fs::write(&p, "not json at all").unwrap();
+        write_msg_count_cache(&p, 1, 2).await;
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v[META_MSG_COUNT], 1);
+        assert_eq!(v[META_MSG_COUNT_BYTES], 2);
+    }
+
+    #[tokio::test]
+    async fn write_msg_count_cache_is_best_effort_on_an_unwritable_path() {
+        // Missing parent directory: the write fails silently (best effort)
+        // and nothing is created.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("missing-dir").join("meta.json");
+        write_msg_count_cache(&p, 1, 2).await;
+        assert!(
+            !p.exists(),
+            "a failed cache write must not create the sidecar"
+        );
+    }
+
+    // ---- cached_or_count_messages ----
+
+    #[tokio::test]
+    async fn cached_or_count_messages_serves_a_fresh_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = "cached-hit";
+        *sm.current_id.lock() = id.to_string();
+        sm.append_event(&user_event("a")).await.unwrap();
+        let path = sm.storage.events_path(id);
+        let len = std::fs::metadata(&path).unwrap().len();
+        // Seed a cache with a deliberately wrong count but the right size:
+        // a fresh cache is served without a full read.
+        write_msg_count_cache(&sm.storage.meta_path(id), 99, len).await;
+        assert_eq!(sm.cached_or_count_messages(id, &path, len).await, 99);
+    }
+
+    #[tokio::test]
+    async fn cached_or_count_messages_recounts_and_refreshes_a_stale_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = "cached-stale";
+        *sm.current_id.lock() = id.to_string();
+        sm.append_event(&user_event("a")).await.unwrap();
+        sm.append_event(&assistant_event("b")).await.unwrap();
+        let path = sm.storage.events_path(id);
+        let len = std::fs::metadata(&path).unwrap().len();
+        // A cache recorded for a different (older) file size is stale.
+        write_msg_count_cache(&sm.storage.meta_path(id), 99, len - 1).await;
+        assert_eq!(
+            sm.cached_or_count_messages(id, &path, len).await,
+            2,
+            "a stale cache must fall back to a full read"
+        );
+        // The refreshed cache now records the real count and the real size.
+        assert_eq!(
+            read_msg_count_cache(&sm.storage.meta_path(id)).await,
+            Some((2, len))
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_or_count_messages_counts_and_caches_when_no_cache_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = "cached-missing";
+        *sm.current_id.lock() = id.to_string();
+        sm.append_event(&user_event("a")).await.unwrap();
+        let path = sm.storage.events_path(id);
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(sm.cached_or_count_messages(id, &path, len).await, 1);
+        assert_eq!(
+            read_msg_count_cache(&sm.storage.meta_path(id)).await,
+            Some((1, len)),
+            "the counted value must be cached for the next list"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_or_count_messages_returns_zero_for_an_unreadable_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let id = "cached-unreadable";
+        let path = sm.storage.events_path(id);
+        // No events.jsonl on disk: the count is 0 (and the cache write is a
+        // best-effort no-op because the session dir does not exist).
+        assert_eq!(sm.cached_or_count_messages(id, &path, 0).await, 0);
+    }
 }

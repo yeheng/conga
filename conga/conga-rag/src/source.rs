@@ -158,4 +158,50 @@ mod tests {
             "{err}"
         );
     }
+
+    // --- build_globs ---
+
+    #[test]
+    fn build_globs_returns_none_without_patterns() {
+        assert!(build_globs(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_globs_matches_the_given_patterns() {
+        let set = build_globs(&["**/*.md".to_string(), "*.txt".to_string()])
+            .unwrap()
+            .unwrap();
+        assert!(set.is_match("a.md"));
+        assert!(set.is_match("sub/b.md"));
+        assert!(set.is_match("c.txt"));
+        assert!(!set.is_match("c.json"));
+    }
+
+    #[test]
+    fn build_globs_rejects_an_invalid_pattern() {
+        let err = build_globs(&["[".to_string()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("非法 glob"), "msg: {msg}");
+        assert!(msg.contains("["), "msg must name the pattern: {msg}");
+    }
+
+    #[test]
+    fn new_rejects_an_invalid_include_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = DirSource::new("s", &cfg(dir.path(), &["["], &[])).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("非法 glob"),
+            "err: {err:#}"
+        );
+    }
+
+    // --- accessors ---
+
+    #[test]
+    fn exposes_its_name_and_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = DirSource::new("notes", &cfg(dir.path(), &[], &[])).unwrap();
+        assert_eq!(src.name(), "notes");
+        assert_eq!(src.root(), dir.path());
+    }
 }

@@ -239,4 +239,141 @@ mod tests {
         let v = serde_json::json!({"jsonrpc":"2.0","method":"notifications/progress"});
         assert!(matches!(parse_jsonrpc_value(&v, 1), Parsed::Other));
     }
+
+    #[test]
+    fn parse_jsonrpc_value_defaults_missing_error_fields() {
+        // An error object without code/message → the documented defaults.
+        let v = serde_json::json!({"jsonrpc":"2.0","id":3,"error":{}});
+        match parse_jsonrpc_value(&v, 3) {
+            Parsed::Error { code, message } => {
+                assert_eq!(code, -1);
+                assert_eq!(message, "unknown error");
+            }
+            _ => panic!("expected Error"),
+        }
+
+        // Neither result nor error → Other (nothing usable).
+        let v = serde_json::json!({"jsonrpc":"2.0","id":3});
+        assert!(matches!(parse_jsonrpc_value(&v, 3), Parsed::Other));
+    }
+
+    // ── `mcp_tool_definition` ─────────────────────────────────────
+
+    /// A tool as the MCP wire format describes it.
+    fn tool(name: &str, title: Option<&str>) -> McpTool {
+        McpTool {
+            name: name.to_string(),
+            title: title.map(|t| t.to_string()),
+            description: "echo back the arguments".to_string(),
+            annotations: serde_json::json!({}),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    /// A call fn that records the (name, args) it was invoked with and
+    /// answers with one text content block.
+    fn recording_call(
+        seen: Arc<std::sync::Mutex<Option<(String, serde_json::Value)>>>,
+        text: &str,
+        is_error: bool,
+    ) -> McpCallFn {
+        let text = text.to_string();
+        Arc::new(move |name: String, args: serde_json::Value| {
+            let seen = Arc::clone(&seen);
+            let text = text.clone();
+            Box::pin(async move {
+                *seen.lock().unwrap() = Some((name, args));
+                Ok(CallResult {
+                    content: vec![McpContent {
+                        kind: "text".into(),
+                        text: Some(text),
+                        data: None,
+                        mime_type: None,
+                    }],
+                    is_error,
+                })
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_definition_maps_metadata_and_prefixes_the_name() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<(String, serde_json::Value)>));
+        let call = recording_call(Arc::clone(&seen), "hi", false);
+        let def = mcp_tool_definition("github", tool("search", Some("Search repos")), call);
+
+        assert_eq!(def.name, "mcp__github__search");
+        assert_eq!(def.label, "github/Search repos");
+        assert_eq!(def.description, "echo back the arguments");
+        assert_eq!(def.parameters, serde_json::json!({"type": "object"}));
+        assert_eq!(def.risk, RiskLevel::High);
+
+        let result = (def.execute)(super::super::test_util::tool_call_ctx_for_test(
+            "c1",
+            serde_json::json!({"q": "conga"}),
+        ))
+        .await
+        .expect("execute");
+        assert!(!result.is_error);
+        assert!(matches!(
+            &result.content[0],
+            ContentBlock::Text { text } if text == "hi"
+        ));
+        // The un-prefixed tool name and the raw args reach the server.
+        let seen = seen.lock().unwrap().clone().expect("call happened");
+        assert_eq!(seen.0, "search");
+        assert_eq!(seen.1, serde_json::json!({"q": "conga"}));
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_definition_label_falls_back_to_the_tool_name() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<(String, serde_json::Value)>));
+        let call = recording_call(Arc::clone(&seen), "unused", false);
+        let def = mcp_tool_definition("fs", tool("read_file", None), call);
+        assert_eq!(def.label, "fs/read_file");
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_definition_propagates_the_server_error() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<(String, serde_json::Value)>));
+        let call: McpCallFn = Arc::new(|_name: String, _args: serde_json::Value| {
+            Box::pin(async {
+                Err(McpError::ServerError {
+                    code: -32601,
+                    message: "no such tool".into(),
+                })
+            })
+        });
+        let def = mcp_tool_definition("fs", tool("read_file", None), call);
+
+        let err = (def.execute)(super::super::test_util::tool_call_ctx_for_test(
+            "c1",
+            serde_json::json!({}),
+        ))
+        .await
+        .expect_err("server error must surface");
+        assert!(err.to_string().contains("no such tool"), "{err}");
+        assert!(seen.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_definition_returns_an_error_result_when_aborted() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<(String, serde_json::Value)>));
+        let call = recording_call(Arc::clone(&seen), "hi", false);
+        let def = mcp_tool_definition("fs", tool("read_file", None), call);
+
+        let mut ctx = super::super::test_util::tool_call_ctx_for_test("c1", serde_json::json!({}));
+        ctx.signal = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let result = (def.execute)(ctx).await.expect("execute");
+        assert!(result.is_error, "an aborted call must be an error result");
+        assert!(matches!(
+            &result.content[0],
+            ContentBlock::Text { text } if text == "aborted"
+        ));
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "an aborted call must not reach the server"
+        );
+    }
 }

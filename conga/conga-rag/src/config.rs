@@ -432,6 +432,36 @@ overlap_chars = 50
     }
 
     #[test]
+    fn apply_env_rejects_unparsable_min_interval() {
+        let env = |k: &str| match k {
+            "CONGA_RAG_EMBED_MIN_INTERVAL_MS" => Ok("soon".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let mut cfg: RagConfig = toml::from_str(TOML).unwrap();
+        let err = cfg.apply_env(&env).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CONGA_RAG_EMBED_MIN_INTERVAL_MS"),
+            "must name the var: {msg}"
+        );
+        assert!(msg.contains("soon"), "must include the value: {msg}");
+    }
+
+    #[test]
+    fn apply_env_overrides_the_store_path() {
+        let env = |k: &str| match k {
+            "CONGA_RAG_STORE_PATH" => Ok("/tmp/conga-rag-env/index.db".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let mut cfg: RagConfig = toml::from_str(TOML).unwrap();
+        cfg.apply_env(&env).unwrap();
+        assert_eq!(
+            cfg.store_path(),
+            PathBuf::from("/tmp/conga-rag-env/index.db")
+        );
+    }
+
+    #[test]
     fn missing_model_and_url_is_error() {
         let cfg: RagConfig = toml::from_str("").unwrap();
         assert!(cfg.resolve_embedding_with(&no_env).is_err());
@@ -516,5 +546,384 @@ overlap_chars = 50
         cfg.inject_builtins_in(tmp.path());
         cfg.inject_builtins_in(tmp.path());
         assert_eq!(cfg.sources.len(), 1);
+    }
+
+    // --- process-environment flavoured helpers ---
+    //
+    // `envvar`, `load`, `inject_builtins` and `builtin_base` read the
+    // process environment. They are exercised in a child process with a
+    // controlled environment so the assertions stay hermetic.
+
+    /// Marker env var: set only in the spawned probe process.
+    const PROBE_ENV: &str = "CONGA_RAG_LOAD_PROBE";
+
+    #[test]
+    fn load_probe() {
+        if std::env::var(PROBE_ENV).is_err() {
+            return; // not spawned as a probe — the parent test drives it
+        }
+        let summary = match RagConfig::load() {
+            Ok((path, cfg)) => serde_json::json!({
+                "ok": true,
+                "path": path.to_string_lossy(),
+                "model": cfg.embedding.model,
+                "batch": cfg.embedding.batch,
+                "min_interval_ms": cfg.embedding.min_interval_ms,
+                "store": cfg.store_path().to_string_lossy(),
+                "sources": cfg.sources.iter()
+                    .map(|(k, v)| (k.clone(), v.path.to_string_lossy().to_string()))
+                    .collect::<std::collections::BTreeMap<String, String>>(),
+            }),
+            Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}")}),
+        };
+        println!("PROBE {summary}");
+    }
+
+    /// Run the probe in a child process with a controlled environment:
+    /// `HOME` points into the temp dir (no `~/.conga`), the working
+    /// directory is the temp dir (no stray `.env`) and every `CONGA_RAG_*`
+    /// variable is cleared before the caller's overrides are applied.
+    fn run_probe(dir: &std::path::Path, env: &[(&str, &str)]) -> serde_json::Value {
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.current_dir(dir)
+            .arg("--exact")
+            .arg("config::tests::load_probe")
+            .arg("--nocapture")
+            .env(PROBE_ENV, "1")
+            .env("HOME", dir.join("home"))
+            .env_remove("CONGA_RAG_CONFIG")
+            .env_remove("CONGA_RAG_BUILTIN_BASE")
+            .env_remove("CONGA_RAG_EMBED_MODEL")
+            .env_remove("CONGA_RAG_EMBED_BATCH")
+            .env_remove("CONGA_LLM_BASE_URL")
+            .env_remove("CONGA_LLM_KEY");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("probe process");
+        assert!(
+            out.status.success(),
+            "probe failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with("PROBE "))
+            .unwrap_or_else(|| panic!("probe produced no summary: {stdout}"));
+        serde_json::from_str(&line["PROBE ".len()..]).expect("probe summary must be JSON")
+    }
+
+    /// A minimal, valid `rag.toml`.
+    fn write_rag(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn envvar_reads_the_process_environment() {
+        // The wrapper must mirror std::env::var.
+        for key in ["PATH", "HOME", "CARGO_MANIFEST_DIR"] {
+            assert_eq!(
+                envvar(key),
+                std::env::var(key),
+                "envvar must mirror std::env::var for {key}"
+            );
+        }
+        // A key that is not set must surface NotPresent.
+        assert_eq!(
+            envvar("CONGA_RAG_TEST_KEY_THAT_DOES_NOT_EXIST").unwrap_err(),
+            std::env::VarError::NotPresent
+        );
+    }
+
+    #[test]
+    fn load_reads_the_config_file_from_the_process_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("home")).unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let db = dir.path().join("index.db");
+        let rag = dir.path().join("rag.toml");
+        write_rag(
+            &rag,
+            &format!(
+                "[sources.docs]\ntype = \"dir\"\npath = \"{}\"\ninclude = [\"**/*.md\"]\n\n\
+                 [embedding]\nbase_url = \"https://file.example/v1\"\napi_key = \"file-key\"\n\
+                 model = \"file-model\"\nbatch = 8\n\n[store]\npath = \"{}\"\n",
+                src.display(),
+                db.display()
+            ),
+        );
+
+        let summary = run_probe(
+            dir.path(),
+            &[
+                ("CONGA_RAG_CONFIG", rag.to_str().unwrap()),
+                ("CONGA_RAG_EMBED_MODEL", "env-model"),
+            ],
+        );
+        assert_eq!(summary["ok"], true, "summary: {summary}");
+        assert_eq!(summary["path"], rag.to_string_lossy().as_ref());
+        assert_eq!(summary["model"], "env-model", "the env overrides the file");
+        assert_eq!(summary["batch"], 8, "the file value is kept");
+        assert_eq!(summary["store"], db.to_string_lossy().as_ref());
+        assert_eq!(summary["sources"]["docs"], src.to_string_lossy().as_ref());
+        assert_eq!(
+            summary["sources"].as_object().unwrap().len(),
+            1,
+            "no builtin source may be injected: {summary}"
+        );
+    }
+
+    #[test]
+    fn load_injects_the_builtin_sources_from_the_builtin_base() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("home")).unwrap();
+        let builtin = dir.path().join("builtin");
+        std::fs::create_dir_all(builtin.join("notes")).unwrap();
+        std::fs::create_dir_all(builtin.join("memory")).unwrap();
+        let rag = dir.path().join("rag.toml");
+        write_rag(
+            &rag,
+            "[embedding]\nbase_url = \"https://file.example/v1\"\napi_key = \"k\"\nmodel = \"m\"\n",
+        );
+
+        let summary = run_probe(
+            dir.path(),
+            &[
+                ("CONGA_RAG_CONFIG", rag.to_str().unwrap()),
+                ("CONGA_RAG_BUILTIN_BASE", builtin.to_str().unwrap()),
+            ],
+        );
+        assert_eq!(summary["ok"], true, "summary: {summary}");
+        let sources = summary["sources"].as_object().expect("sources");
+        assert_eq!(sources.len(), 2, "notes and memory are injected");
+        assert_eq!(
+            sources["notes"],
+            builtin.join("notes").to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            sources["memory"],
+            builtin.join("memory").to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn an_empty_builtin_base_disables_the_builtin_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("home")).unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let rag = dir.path().join("rag.toml");
+        write_rag(
+            &rag,
+            &format!(
+                "[sources.docs]\ntype = \"dir\"\npath = \"{}\"\n\n\
+                 [embedding]\nbase_url = \"u\"\napi_key = \"k\"\nmodel = \"m\"\n",
+                src.display()
+            ),
+        );
+
+        let summary = run_probe(
+            dir.path(),
+            &[
+                ("CONGA_RAG_CONFIG", rag.to_str().unwrap()),
+                ("CONGA_RAG_BUILTIN_BASE", "   "),
+            ],
+        );
+        assert_eq!(summary["ok"], true, "summary: {summary}");
+        assert!(
+            summary["sources"].get("notes").is_none(),
+            "the builtins must stay disabled: {summary}"
+        );
+        assert!(
+            summary["sources"].get("memory").is_none(),
+            "the builtins must stay disabled: {summary}"
+        );
+    }
+
+    #[test]
+    fn load_reports_a_config_without_sources() {
+        // HOME points at an empty dir → no builtin sources → the config has
+        // no source at all and must be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("home")).unwrap();
+        let rag = dir.path().join("rag.toml");
+        write_rag(
+            &rag,
+            "[embedding]\nbase_url = \"u\"\napi_key = \"k\"\nmodel = \"m\"\n",
+        );
+
+        let summary = run_probe(dir.path(), &[("CONGA_RAG_CONFIG", rag.to_str().unwrap())]);
+        assert_eq!(summary["ok"], false, "summary: {summary}");
+        assert!(
+            summary["error"].as_str().unwrap().contains("sources"),
+            "summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn load_with_reads_the_file_and_applies_env_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let rag = dir.path().join("rag.toml");
+        write_rag(
+            &rag,
+            &format!(
+                "[sources.docs]\ntype = \"dir\"\npath = \"{}\"\n\n\
+                 [embedding]\nbase_url = \"https://file.example/v1\"\napi_key = \"file-key\"\n\
+                 model = \"file-model\"\nbatch = 8\n",
+                src.display()
+            ),
+        );
+        let env = |k: &str| match k {
+            "CONGA_RAG_CONFIG" => Ok(rag.to_string_lossy().into_owned()),
+            "CONGA_RAG_EMBED_MODEL" => Ok("env-model".into()),
+            "CONGA_RAG_EMBED_BATCH" => Ok("3".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+
+        let (path, cfg) = RagConfig::load_with(&env).unwrap();
+        assert_eq!(path, rag);
+        assert_eq!(cfg.embedding.model.as_deref(), Some("env-model"));
+        assert_eq!(cfg.embedding.batch, 3);
+        assert_eq!(
+            cfg.embedding.base_url.as_deref(),
+            Some("https://file.example/v1")
+        );
+        assert_eq!(cfg.sources["docs"].path, src);
+    }
+
+    #[test]
+    fn load_with_expands_a_tilde_in_the_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let rag = dir.path().join("rag.toml");
+        write_rag(
+            &rag,
+            "[sources.docs]\ntype = \"dir\"\npath = \"~/docs\"\n\n\
+             [store]\npath = \"~/index.db\"\n\n\
+             [embedding]\nbase_url = \"u\"\napi_key = \"k\"\nmodel = \"m\"\n",
+        );
+        let env = |k: &str| match k {
+            "CONGA_RAG_CONFIG" => Ok(rag.to_string_lossy().into_owned()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+
+        let (_path, cfg) = RagConfig::load_with(&env).unwrap();
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(cfg.sources["docs"].path, home.join("docs"));
+        assert_eq!(cfg.store_path(), home.join("index.db"));
+    }
+
+    #[test]
+    fn load_with_reports_a_missing_config_file() {
+        let env = |_k: &str| Ok("/nonexistent-conga-rag/rag.toml".to_string());
+        let err = RagConfig::load_with(&env).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("CONGA_RAG_CONFIG"), "msg: {msg}");
+        assert!(msg.contains("rag.toml"), "msg must name the path: {msg}");
+    }
+
+    #[test]
+    fn load_with_reports_a_broken_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rag = dir.path().join("rag.toml");
+        write_rag(&rag, "[sources.docs\npath = \"x\"\n");
+        let env = |k: &str| match k {
+            "CONGA_RAG_CONFIG" => Ok(rag.to_string_lossy().into_owned()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let err = RagConfig::load_with(&env).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("配置解析失败"), "msg: {msg}");
+    }
+
+    #[test]
+    fn load_with_rejects_an_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let rag = dir.path().join("rag.toml");
+        write_rag(
+            &rag,
+            "[sources.docs]\ntype = \"dir\"\npath = \"/tmp\"\n\n\
+             [chunking]\ntarget_chars = 100\noverlap_chars = 100\n",
+        );
+        let env = |k: &str| match k {
+            "CONGA_RAG_CONFIG" => Ok(rag.to_string_lossy().into_owned()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let err = RagConfig::load_with(&env).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("overlap_chars"),
+            "msg must name the broken setting: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_embedding_prefers_the_config_over_the_process_environment() {
+        let cfg: RagConfig = toml::from_str(TOML).unwrap();
+        let r = cfg.resolve_embedding().unwrap();
+        assert_eq!(r.base_url, "https://api.example.com/v1");
+        assert_eq!(r.api_key, "k1");
+        assert_eq!(r.model, "emb-1");
+        assert_eq!(r.batch, 8);
+        assert_eq!(r.min_interval_ms, 0);
+    }
+
+    #[test]
+    fn resolve_embedding_requires_a_model() {
+        let cfg: RagConfig =
+            toml::from_str("[embedding]\nbase_url = \"u\"\napi_key = \"k\"\n").unwrap();
+        let err = cfg.resolve_embedding().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("embedding.model"), "msg: {msg}");
+    }
+
+    #[test]
+    fn with_store_path_overrides_the_store_location() {
+        let cfg: RagConfig = toml::from_str(TOML).unwrap();
+        let p = PathBuf::from("/tmp/conga-rag-test/index.db");
+        let moved = cfg.with_store_path(p.clone());
+        assert_eq!(moved.store.path.as_deref(), Some(p.as_path()));
+        assert_eq!(moved.store_path(), p);
+    }
+
+    #[test]
+    fn inject_builtins_uses_the_builtin_base() {
+        let mut cfg = RagConfig::default();
+        cfg.inject_builtins();
+        match builtin_base() {
+            None => assert!(cfg.sources.is_empty(), "no builtin base → no source"),
+            Some(base) => {
+                for name in ["notes", "memory"] {
+                    let dir = base.join(name);
+                    if dir.is_dir() {
+                        assert_eq!(
+                            cfg.sources.get(name).map(|s| s.path.clone()),
+                            Some(dir),
+                            "{name} must be injected from the builtin base"
+                        );
+                    } else {
+                        assert!(
+                            !cfg.sources.contains_key(name),
+                            "{name} must not be injected when the dir is missing"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_base_follows_the_env_override() {
+        match std::env::var("CONGA_RAG_BUILTIN_BASE") {
+            Ok(v) if v.trim().is_empty() => {
+                assert!(builtin_base().is_none(), "an empty override disables the builtins")
+            }
+            Ok(v) => assert_eq!(builtin_base(), Some(PathBuf::from(v))),
+            Err(_) => assert_eq!(builtin_base(), Some(conga::storage::config_dir())),
+        }
     }
 }

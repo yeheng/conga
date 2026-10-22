@@ -132,3 +132,66 @@ impl SubagentSpawner for NoopSubagentSpawner {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn noop_spawner_returns_one_error_result_per_task() {
+        let results = NoopSubagentSpawner
+            .spawn(vec![
+                SubagentSpawn {
+                    task: "first".into(),
+                },
+                SubagentSpawn {
+                    task: "second".into(),
+                },
+            ])
+            .await;
+        assert_eq!(results.len(), 2);
+
+        assert_eq!(results[0].id, "noop-0");
+        assert_eq!(results[0].index, 1);
+        assert_eq!(results[0].task, "first");
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("subagents not available"),
+            "got: {:?}",
+            results[0].error
+        );
+        assert!(results[0].summary.is_empty());
+        assert!(results[0].output.is_empty());
+        assert_eq!(results[0].tool_count, 0);
+        assert!(results[0].log_path.is_none());
+
+        assert_eq!(results[1].id, "noop-1");
+        assert_eq!(results[1].index, 2);
+        assert_eq!(results[1].task, "second");
+    }
+
+    #[tokio::test]
+    async fn noop_spawner_with_no_tasks_returns_nothing() {
+        let results = NoopSubagentSpawner.spawn(Vec::new()).await;
+        assert!(results.is_empty());
+    }
+
+    /// The trait is object-safe: a host wires the spawner as
+    /// `Arc<dyn SubagentSpawner>` and calls `spawn` through it.
+    #[tokio::test]
+    async fn spawn_is_callable_through_the_trait_object() {
+        let spawner: Arc<dyn SubagentSpawner> = Arc::new(NoopSubagentSpawner);
+        let results = spawner
+            .spawn(vec![SubagentSpawn {
+                task: "do a thing".into(),
+            }])
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task, "do a thing");
+        assert!(results[0].error.is_some());
+    }
+}

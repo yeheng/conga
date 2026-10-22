@@ -460,4 +460,151 @@ mod tests {
         .await;
         assert!(r.is_error);
     }
+
+    // ---- locate_unique: exact / fuzzy / ambiguity / not-found ----
+
+    /// `LocatedRange` carries no `Debug` impl, so `unwrap_err` is not
+    /// available on `Result<LocatedRange, String>` — unwrap the error by
+    /// hand instead.
+    fn locate_err(original: &str, old_text: &str) -> String {
+        match locate_unique(original, old_text) {
+            Ok(_) => panic!("expected {old_text:?} not to match {original:?}"),
+            Err(e) => e,
+        }
+    }
+
+    /// Happy path: one exact hit -> the byte range of that hit, flagged as
+    /// an exact match.
+    #[test]
+    fn locate_unique_returns_exact_range_for_single_match() {
+        let original = "alpha beta gamma";
+        let r = locate_unique(original, "beta").expect("single match");
+        assert!(r.exact, "must be flagged as an exact match");
+        assert_eq!(r.start, 6);
+        assert_eq!(r.end, 10);
+        assert_eq!(&original[r.start..r.end], "beta");
+    }
+
+    /// Error path: several exact hits -> the count is reported so the model
+    /// can disambiguate.
+    #[test]
+    fn locate_unique_rejects_multiple_matches() {
+        let err = locate_err("x x x", "x");
+        assert!(err.contains("appears 3 times"), "{err}");
+        assert!(err.contains("must be unique"), "{err}");
+    }
+
+    /// Error path: neither an exact nor a normalized hit.
+    #[test]
+    fn locate_unique_reports_not_found() {
+        let err = locate_err("abc", "zzz");
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    /// The fuzzy fallback still reports a range into the ORIGINAL text, so
+    /// the replacement lands where the author meant it.
+    #[test]
+    fn locate_unique_falls_back_to_fuzzy_range_in_original() {
+        let original = "foo    bar    baz";
+        let r = locate_unique(original, "foo bar baz").expect("fuzzy match");
+        assert!(!r.exact, "must be flagged as a fuzzy match");
+        assert_eq!(&original[r.start..r.end], "foo    bar    baz");
+    }
+
+    /// Error path: the fuzzy fallback itself is ambiguous.
+    #[test]
+    fn locate_unique_reports_ambiguity_after_normalization() {
+        let err = locate_err("a  b and a  b", "a b");
+        assert!(
+            err.contains("after whitespace/quote normalization"),
+            "{err}"
+        );
+        assert!(err.contains("must be unique"), "{err}");
+    }
+
+    /// Boundary: an empty old_text matches at every position, so it must be
+    /// refused instead of replacing the whole file.
+    #[test]
+    fn locate_unique_rejects_empty_old_text() {
+        let err = locate_err("abc", "");
+        assert!(err.contains("appears"), "{err}");
+    }
+
+    /// Curly quotes in the file are normalized for matching, but the
+    /// reported range still covers the original curly-quote bytes.
+    #[test]
+    fn locate_unique_maps_curly_quote_span_back_to_original() {
+        let original = "say \u{201C}hello\u{201D} now";
+        let r = locate_unique(original, "say \"hello\" now").expect("fuzzy match");
+        assert!(!r.exact);
+        assert_eq!(&original[r.start..r.end], "say \u{201C}hello\u{201D} now");
+    }
+
+    // ---- fuzzy_locate ----
+
+    #[test]
+    fn fuzzy_locate_returns_none_for_empty_pattern() {
+        assert!(matches!(fuzzy_locate("abc", ""), Fuzzy::None));
+        assert!(matches!(fuzzy_locate("", "abc"), Fuzzy::None));
+    }
+
+    #[test]
+    fn fuzzy_locate_returns_many_for_repeated_normalized_match() {
+        match fuzzy_locate("a  b and a  b", "a b") {
+            Fuzzy::Many(n) => assert_eq!(n, 2, "both normalized hits count"),
+            _ => panic!("expected two fuzzy matches"),
+        }
+    }
+
+    #[test]
+    fn fuzzy_locate_maps_middle_span_back_to_original_bytes() {
+        let original = "HEAD  middle  TAIL";
+        match fuzzy_locate(original, "middle") {
+            Fuzzy::Unique(start, end) => {
+                assert_eq!(&original[start..end], "middle");
+            }
+            _ => panic!("expected a unique fuzzy match"),
+        }
+    }
+
+    #[test]
+    fn fuzzy_locate_matches_across_unicode() {
+        let original = "你 好 世界";
+        match fuzzy_locate(original, "你好世界") {
+            Fuzzy::Unique(start, end) => {
+                assert_eq!(&original[start..end], "你 好 世界");
+            }
+            _ => panic!("expected a unique fuzzy match"),
+        }
+    }
+
+    // ---- normalize_fuzzy ----
+
+    #[test]
+    fn normalize_fuzzy_drops_whitespace_and_maps_source_offsets() {
+        let (norm, map) = normalize_fuzzy("a b\tc\nd");
+        assert_eq!(norm, "abcd");
+        assert_eq!(map, vec![0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn normalize_fuzzy_converts_curly_quotes_to_ascii() {
+        let (norm, map) = normalize_fuzzy("\u{2018}a\u{2019} \u{201C}b\u{201D}");
+        assert_eq!(norm, "'a'\"b\"");
+        assert_eq!(map.len(), 6, "one source offset per normalized char");
+        // The map points at the byte offset of each SOURCE char.
+        assert_eq!(map[0], 0, "the opening quote");
+        assert_eq!(map[1], 3, "the letter after a 3-byte quote");
+    }
+
+    #[test]
+    fn normalize_fuzzy_handles_empty_and_multibyte_input() {
+        let (norm, map) = normalize_fuzzy("");
+        assert_eq!(norm, "");
+        assert!(map.is_empty());
+
+        let (norm, map) = normalize_fuzzy("你 好");
+        assert_eq!(norm, "你好");
+        assert_eq!(map, vec![0, 4], "byte offsets of the source chars");
+    }
 }

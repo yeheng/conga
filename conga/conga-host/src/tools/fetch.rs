@@ -173,13 +173,27 @@ async fn ssrf_guard(url: &str) -> Result<Option<SsrfPin>, String> {
 /// Build the fetch client. A DNS pin (guard-validated addresses only) is
 /// bound via `resolve_to_addrs`, so the TCP connection is guaranteed to go
 /// to an address the SSRF guard has seen - reqwest never re-resolves.
+///
+/// A pin and a proxy are mutually exclusive. reqwest honours `HTTP_PROXY`/
+/// `HTTPS_PROXY`/`ALL_PROXY` on its own, and a proxied request is resolved by
+/// the *proxy*, which would silently drop the pin and reopen the
+/// DNS-rebinding window the guard just closed. The tool proxy
+/// (`CONGA_TOOL_PROXY`) short-circuits the guard, so a pin and an explicit
+/// tool proxy never coexist either.
 fn build_client(pin: Option<&SsrfPin>) -> Result<reqwest::Client, reqwest::Error> {
-    let mut builder = crate::proxy::apply_tool_proxy(reqwest::Client::builder())
+    let builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .user_agent("conga-fetch/1.0");
-    if let Some(pin) = pin {
-        builder = builder.resolve_to_addrs(&pin.host, &pin.addrs);
-    }
+    let builder = match pin {
+        // Pinned: no proxy of any kind - the connection must land on the
+        // guard-validated address.
+        Some(pin) => builder
+            .no_proxy()
+            .resolve_to_addrs(&pin.host, &pin.addrs),
+        // Unpinned: the tool proxy may be configured; reqwest's own system
+        // proxy detection stays on.
+        None => crate::proxy::apply_tool_proxy(builder),
+    };
     builder.build()
 }
 
@@ -276,6 +290,22 @@ mod tests {
         let html = r#"<html><body><p>No article or main tag</p></body></html>"#;
         let text = html_to_text(html);
         assert!(text.contains("No article or main tag"));
+    }
+
+    /// Boundary: an empty document yields empty text (no panic).
+    #[test]
+    fn html_to_text_of_an_empty_document_is_empty() {
+        assert_eq!(html_to_text(""), "");
+    }
+
+    /// Blank lines and indentation between blocks are collapsed away.
+    #[test]
+    fn html_to_text_collapses_blank_lines() {
+        let html = "<html><body><p>one</p>\n\n   \n<p>two</p></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("one"), "{text:?}");
+        assert!(text.contains("two"), "{text:?}");
+        assert!(!text.contains("\n\n"), "blank lines must be collapsed: {text:?}");
     }
 
     #[test]
@@ -396,6 +426,29 @@ mod tests {
         // On a normal resolver the guard itself refuses (fail-closed: no
         // validated address, no pin, no request). On wildcard-DNS networks
         // the request still fails - either way nothing is fetched.
+    }
+
+    /// The pin is the SSRF guard's guarantee that the request lands on an
+    /// address the guard validated. A proxy resolves the name on our behalf,
+    /// so a proxied client silently drops that guarantee — reqwest picks up
+    /// `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` on its own, without the guard
+    /// or the tool-proxy override ever seeing them.
+    ///
+    /// reqwest's `Client` debug output lists `proxies` only when the client
+    /// actually carries one, which makes this observable without touching
+    /// process-wide environment variables.
+    #[test]
+    fn pinned_client_carries_no_proxy() {
+        let pin = SsrfPin {
+            host: "pinned.test".into(),
+            addrs: vec!["127.0.0.1:8080".parse().unwrap()],
+        };
+        let client = build_client(Some(&pin)).unwrap();
+        let dbg = format!("{client:?}");
+        assert!(
+            !dbg.contains("proxies"),
+            "a pinned client must not use any proxy (system or tool): {dbg}"
+        );
     }
 
     /// The anti-rebinding core: a client built with a DNS pin must connect
@@ -539,5 +592,141 @@ mod tests {
             head.starts_with("GET http://example.test/"),
             "proxy saw: {head}"
         );
+    }
+
+    // ---- tool definition ----
+
+    #[test]
+    fn tool_definition_exposes_a_url_parameter() {
+        let t = tool();
+        assert_eq!(t.name, "fetch");
+        assert_eq!(t.label, "Fetch");
+        assert_eq!(t.risk, conga::types::tool::RiskLevel::Medium);
+        assert!(
+            t.parameters["properties"]["url"]["type"] == "string",
+            "{:?}",
+            t.parameters
+        );
+        assert_eq!(t.parameters["required"], serde_json::json!(["url"]));
+        assert!(
+            t.description.contains("http/https only"),
+            "{}",
+            t.description
+        );
+    }
+
+    // ---- ssrf guard ----
+    //
+    // Every case below uses an IP LITERAL (or a malformed URL), so the
+    // guard never performs a DNS lookup.
+
+    /// `SsrfPin` has no `Debug` impl, so `unwrap_err` is unavailable here —
+    /// unwrap the error by hand.
+    async fn guard_err(url: &str) -> String {
+        match ssrf_guard(url).await {
+            Ok(_) => panic!("expected {url} to be refused by the SSRF guard"),
+            Err(e) => e,
+        }
+    }
+
+    /// Happy path: a public IPv4 literal is allowed, and needs no DNS pin
+    /// (the connection can only go to the literal itself).
+    #[tokio::test]
+    async fn ssrf_guard_allows_public_ip_literal() {
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        let pin = ssrf_guard("http://1.1.1.1/").await.expect("public literal");
+        assert!(pin.is_none(), "an IP literal needs no DNS pin");
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_rejects_loopback_ip_literal() {
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        let err = guard_err("http://127.0.0.1/").await;
+        assert!(err.contains("non-public address"), "{err}");
+        assert!(err.contains("127.0.0.1"), "{err}");
+        assert!(err.contains("SSRF guard"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_rejects_private_network_ip_literals() {
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        for host in ["10.0.0.1", "172.16.0.1", "192.168.1.1"] {
+            let err = guard_err(&format!("http://{host}/")).await;
+            assert!(err.contains("non-public address"), "{host}: {err}");
+            assert!(err.contains(host), "{host}: {err}");
+        }
+    }
+
+    /// The cloud metadata endpoint is the classic SSRF target.
+    #[tokio::test]
+    async fn ssrf_guard_rejects_cloud_metadata_ip_literal() {
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        let err = guard_err("http://169.254.169.254/latest/meta-data/").await;
+        assert!(err.contains("169.254.169.254"), "{err}");
+        assert!(err.contains("SSRF guard"), "{err}");
+        assert!(
+            err.contains("CONGA_FETCH_ALLOW_PRIVATE_NET=1"),
+            "the opt-out must be named: {err}"
+        );
+    }
+
+    /// IPv6 literals are refused too. (`Url::host_str` returns the bracketed
+    /// form, so the guard reports them via the resolution branch — the
+    /// wording differs from the IPv4 fast path, the verdict does not.)
+    #[tokio::test]
+    async fn ssrf_guard_rejects_ipv6_loopback_literal() {
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        let err = guard_err("http://[::1]/").await;
+        assert!(err.contains("non-public address"), "{err}");
+        assert!(err.contains("::1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_rejects_ipv6_link_local_literal() {
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        let err = guard_err("http://[fe80::1]/").await;
+        assert!(err.contains("non-public address"), "{err}");
+        assert!(err.contains("fe80::1"), "{err}");
+    }
+
+    /// Happy path: a public IPv6 literal is allowed.
+    #[tokio::test]
+    async fn ssrf_guard_allows_public_ipv6_literal() {
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        assert!(
+            ssrf_guard("http://[2001:db8::1]/").await.is_ok(),
+            "a global-unicast IPv6 literal must be allowed"
+        );
+    }
+
+    /// Error path: an unparseable URL never reaches the network.
+    #[tokio::test]
+    async fn ssrf_guard_rejects_unparseable_url() {
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        let err = guard_err("not-a-url").await;
+        assert!(err.contains("invalid URL"), "{err}");
+    }
+
+    /// Error path: a URL without a host (e.g. `file:///etc/passwd`) has
+    /// nothing to validate.
+    #[tokio::test]
+    async fn ssrf_guard_rejects_url_without_host() {
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        let err = guard_err("file:///etc/passwd").await;
+        assert!(err.contains("no host"), "{err}");
+    }
+
+    /// When a tool proxy is configured the proxy decides where traffic may
+    /// go, so the guard steps aside entirely (no pin, no rejection).
+    #[tokio::test]
+    async fn ssrf_guard_is_skipped_when_a_tool_proxy_is_configured() {
+        let _g = crate::proxy::test_util::LOCK.lock().await;
+        crate::proxy::set_tool_proxy(Some("http://127.0.0.1:1")).unwrap();
+        let res = ssrf_guard("http://127.0.0.1/").await;
+        // Reset before asserting: a failing assert must not leave the
+        // global override installed for other tests.
+        crate::proxy::set_tool_proxy(None).unwrap();
+        assert!(res.is_ok(), "the guard must stand down for a proxied request");
+        assert!(res.unwrap().is_none());
     }
 }

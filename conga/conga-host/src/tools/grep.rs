@@ -393,4 +393,224 @@ mod tests {
             "target/ leaked into grep output: {text}"
         );
     }
+
+    /// Boundary: the builtin engine skips files above its size cap (it must
+    /// not slurp a huge/binary file into memory).
+    #[tokio::test]
+    async fn builtin_skips_oversized_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("big.txt"),
+            vec![b'x'; (MAX_FILE_BYTES + 1) as usize],
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(tmp.path().join("small.txt"), "needle\n")
+            .await
+            .unwrap();
+        let re = Regex::new("needle").unwrap();
+        let (matches, aborted) = grep_builtin(
+            &re,
+            tmp.path(),
+            ".",
+            None,
+            100,
+            &Arc::new(AtomicBool::new(false)),
+        );
+        assert!(!aborted);
+        assert!(
+            matches.iter().any(|m| m.contains("small.txt")),
+            "the small file must still match: {matches:?}"
+        );
+        assert!(
+            !matches.iter().any(|m| m.contains("big.txt")),
+            "the oversized file must be skipped: {matches:?}"
+        );
+    }
+
+    // ---- rg_available / grep_rg ----
+    /// The ripgrep probe must agree with reality: it is a pure "is `rg`
+    /// runnable" check, so it must match a direct invocation. Written to hold
+    /// on machines with and without ripgrep.
+    #[test]
+    fn rg_available_matches_a_direct_rg_invocation() {
+        let direct = std::process::Command::new("rg")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert_eq!(
+            rg_available(),
+            direct,
+            "the cached probe must agree with a direct `rg --version`"
+        );
+    }
+
+    /// The probe result is cached per process, so repeated calls must not
+    /// flip.
+    #[test]
+    fn rg_available_is_stable_across_calls() {
+        let first = rg_available();
+        let second = rg_available();
+        assert_eq!(first, second);
+    }
+
+    /// The rg engine: with ripgrep installed the matches carry the
+    /// `path:line:text` shape the builtin engine also produces; without
+    /// ripgrep the rg path must fail cleanly (a spawn error, not a panic)
+    /// and the builtin engine must still find the same match.
+    #[tokio::test]
+    async fn grep_rg_matches_match_the_builtin_engine_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("a.txt"), "alpha\nbeta\ngamma\n")
+            .await
+            .unwrap();
+
+        let rg_out = grep_rg("beta", tmp.path(), "a.txt", None, false, 100).await;
+        if rg_available() {
+            let (matches, truncated, engine) = rg_out.expect("rg must succeed");
+            assert_eq!(engine, "rg");
+            assert!(!truncated, "3 lines cannot be truncated at max=100");
+            assert!(
+                matches.iter().any(|m| m.contains(":2:beta")),
+                "rg must report path:line:text, got {matches:?}"
+            );
+        } else {
+            let err = rg_out.expect_err("rg must fail without ripgrep");
+            assert!(!err.is_empty(), "the spawn failure must be reported");
+            // Graceful degradation: the builtin engine finds the same match.
+            let re = Regex::new("beta").unwrap();
+            let (matches, aborted) = grep_builtin(
+                &re,
+                tmp.path(),
+                "a.txt",
+                None,
+                100,
+                &Arc::new(AtomicBool::new(false)),
+            );
+            assert!(!aborted);
+            assert_eq!(matches, vec!["a.txt:2:beta".to_string()]);
+        }
+    }
+
+    /// `max_count` caps the returned matches and the `truncated` flag
+    /// reports that more were available.
+    #[tokio::test]
+    async fn grep_rg_respects_max_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut body = String::new();
+        for _ in 0..10 {
+            body.push_str("hit\n");
+        }
+        tokio::fs::write(tmp.path().join("a.txt"), &body).await.unwrap();
+
+        let rg_out = grep_rg("hit", tmp.path(), "a.txt", None, false, 3).await;
+        if rg_available() {
+            let (matches, truncated, _) = rg_out.expect("rg must succeed");
+            assert_eq!(matches.len(), 3, "max_count must cap the matches");
+            assert!(truncated, "10 hits capped at 3 must be flagged truncated");
+        } else {
+            assert!(rg_out.is_err(), "rg must fail without ripgrep");
+            // The builtin engine enforces the same cap.
+            let re = Regex::new("hit").unwrap();
+            let (matches, aborted) = grep_builtin(
+                &re,
+                tmp.path(),
+                "a.txt",
+                None,
+                3,
+                &Arc::new(AtomicBool::new(false)),
+            );
+            assert!(!aborted);
+            assert_eq!(matches.len(), 3);
+        }
+    }
+
+    /// The case-insensitive flag must reach the engine.
+    #[tokio::test]
+    async fn grep_rg_honors_case_insensitivity() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("a.txt"), "MiXeD\n")
+            .await
+            .unwrap();
+
+        let rg_out = grep_rg("mixed", tmp.path(), "a.txt", None, true, 100).await;
+        if rg_available() {
+            let (matches, _, _) = rg_out.expect("rg must succeed");
+            assert!(
+                matches.iter().any(|m| m.contains("MiXeD")),
+                "case-insensitive search must match, got {matches:?}"
+            );
+        } else {
+            assert!(rg_out.is_err(), "rg must fail without ripgrep");
+            let re = RegexBuilder::new("mixed").case_insensitive(true).build().unwrap();
+            let (matches, _) = grep_builtin(
+                &re,
+                tmp.path(),
+                "a.txt",
+                None,
+                100,
+                &Arc::new(AtomicBool::new(false)),
+            );
+            assert!(
+                matches.iter().any(|m| m.contains("MiXeD")),
+                "case-insensitive search must match, got {matches:?}"
+            );
+        }
+    }
+
+    /// Error path: a broken regex makes ripgrep exit with code >= 2, which
+    /// the wrapper turns into an `Err`. Without ripgrep the spawn itself
+    /// fails — either way the rg path never returns a bogus match list.
+    #[tokio::test]
+    async fn grep_rg_reports_an_invalid_regex_as_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("a.txt"), "x\n").await.unwrap();
+        let res = grep_rg("(", tmp.path(), "a.txt", None, false, 100).await;
+        assert!(res.is_err(), "an invalid regex must not produce matches");
+    }
+
+    /// The glob filter must be honoured by the engine that runs.
+    #[tokio::test]
+    async fn grep_rg_honors_the_glob_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("a.txt"), "hit\n").await.unwrap();
+        tokio::fs::write(tmp.path().join("b.rs"), "hit\n").await.unwrap();
+
+        let rg_out = grep_rg("hit", tmp.path(), ".", Some("*.txt"), false, 100).await;
+        if rg_available() {
+            let (matches, _, _) = rg_out.expect("rg must succeed");
+            assert!(
+                matches.iter().any(|m| m.contains("a.txt")),
+                "the .txt file must match, got {matches:?}"
+            );
+            assert!(
+                !matches.iter().any(|m| m.contains("b.rs")),
+                "the glob must exclude b.rs, got {matches:?}"
+            );
+        } else {
+            assert!(rg_out.is_err(), "rg must fail without ripgrep");
+            // The builtin engine applies the same glob filter.
+            let re = Regex::new("hit").unwrap();
+            let pat = glob::Pattern::new("*.txt").unwrap();
+            let (matches, _) = grep_builtin(
+                &re,
+                tmp.path(),
+                ".",
+                Some(&pat),
+                100,
+                &Arc::new(AtomicBool::new(false)),
+            );
+            assert!(
+                matches.iter().any(|m| m.contains("a.txt")),
+                "the .txt file must match, got {matches:?}"
+            );
+            assert!(
+                !matches.iter().any(|m| m.contains("b.rs")),
+                "the glob must exclude b.rs, got {matches:?}"
+            );
+        }
+    }
 }

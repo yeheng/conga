@@ -1246,4 +1246,792 @@ mod tests {
         assert!(!store.remove_session("s1").await.unwrap());
         assert!(store.remove_session("../evil").await.is_err());
     }
+
+    // ── Session id validation ─────────────────────────────────────
+
+    #[test]
+    fn is_valid_session_id_accepts_plain_ids() {
+        assert!(is_valid_session_id("abc"));
+        assert!(is_valid_session_id("A1"));
+        assert!(is_valid_session_id("with-dash_and_underscore"));
+        assert!(is_valid_session_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_valid_session_id("0"));
+    }
+
+    #[test]
+    fn is_valid_session_id_accepts_the_maximum_length() {
+        assert!(is_valid_session_id(&"a".repeat(128)));
+    }
+
+    #[test]
+    fn is_valid_session_id_rejects_an_empty_id() {
+        assert!(!is_valid_session_id(""));
+    }
+
+    #[test]
+    fn is_valid_session_id_rejects_an_overlong_id() {
+        assert!(!is_valid_session_id(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn is_valid_session_id_rejects_path_traversal() {
+        for bad in [
+            "..",
+            "../evil",
+            "nested/s1",
+            "/etc",
+            "a/b",
+            "a\\b",
+            ".",
+            "a.b",
+        ] {
+            assert!(!is_valid_session_id(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn is_valid_session_id_rejects_whitespace_and_non_ascii() {
+        for bad in [
+            "with space",
+            "tab\there",
+            "newline\nhere",
+            "会话",
+            "emoji🙂",
+        ] {
+            assert!(!is_valid_session_id(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_session_id_accepts_a_valid_id() {
+        assert!(validate_session_id("s1").is_ok());
+    }
+
+    #[test]
+    fn validate_session_id_rejects_an_invalid_id() {
+        let err = validate_session_id("../evil").unwrap_err();
+        assert!(matches!(err, AgentError::InvalidSessionId(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("../evil"), "error must name the id: {msg}");
+    }
+
+    #[test]
+    fn validate_session_id_rejects_an_empty_id() {
+        assert!(matches!(
+            validate_session_id(""),
+            Err(AgentError::InvalidSessionId(_))
+        ));
+    }
+
+    // ── Paths ─────────────────────────────────────────────────────
+
+    #[test]
+    fn default_root_points_at_the_sessions_directory() {
+        let base = JsonlStorage::default_root().base_dir_clone();
+        assert_eq!(base.file_name().and_then(|s| s.to_str()), Some("sessions"));
+    }
+
+    #[test]
+    fn base_dir_clone_returns_the_configured_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonlStorage::new(tmp.path());
+        assert_eq!(store.base_dir_clone(), tmp.path());
+    }
+
+    #[test]
+    fn base_dir_clone_is_a_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonlStorage::new(tmp.path());
+        let mut clone = store.base_dir_clone();
+        clone.push("mutated");
+        assert_eq!(store.base_dir_clone(), tmp.path());
+    }
+
+    #[test]
+    fn jsonl_session_dir_is_under_the_store_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonlStorage::new(tmp.path());
+        assert_eq!(store.session_dir("s1"), tmp.path().join("s1"));
+        assert_eq!(
+            store.messages_path("s1"),
+            tmp.path().join("s1").join("messages.jsonl")
+        );
+    }
+
+    #[test]
+    fn event_storage_session_dir_is_under_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        assert_eq!(store.session_dir("s1"), tmp.path().join("s1"));
+        assert_eq!(
+            store.events_path("s1"),
+            tmp.path().join("s1").join("events.jsonl")
+        );
+    }
+
+    #[test]
+    fn events_tmp_path_is_the_staging_file_next_to_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        assert_eq!(
+            store.events_tmp_path("s1"),
+            tmp.path().join("s1").join("events.jsonl.tmp")
+        );
+    }
+
+    #[test]
+    fn meta_path_is_the_sidecar_next_to_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        assert_eq!(
+            store.meta_path("s1"),
+            tmp.path().join("s1").join("meta.json")
+        );
+    }
+
+    // ── append_line / append_line_sync ────────────────────────────
+
+    #[tokio::test]
+    async fn append_line_writes_one_terminated_json_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("out.jsonl");
+        let mut file = tokio::fs::File::create(&path).await.unwrap();
+        append_line(&mut file, &user_msg("hi")).await.unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw,
+            format!("{}\n", serde_json::to_string(&user_msg("hi")).unwrap())
+        );
+        assert!(raw.ends_with('\n'), "the line must be terminated");
+        assert_eq!(raw.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn append_line_appends_to_the_open_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("out.jsonl");
+        let mut file = tokio::fs::File::create(&path).await.unwrap();
+        append_line(&mut file, &user_msg("a")).await.unwrap();
+        append_line(&mut file, &user_msg("b")).await.unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 2);
+        assert_eq!(
+            raw,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&user_msg("a")).unwrap(),
+                serde_json::to_string(&user_msg("b")).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn append_line_sync_writes_one_terminated_json_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("out.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        append_line_sync(&mut file, &user_msg("hi")).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw,
+            format!("{}\n", serde_json::to_string(&user_msg("hi")).unwrap())
+        );
+        assert_eq!(raw.lines().count(), 1);
+    }
+
+    #[test]
+    fn append_line_sync_appends_to_the_open_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("out.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        append_line_sync(&mut file, &user_msg("a")).unwrap();
+        append_line_sync(&mut file, &user_msg("b")).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 2);
+    }
+
+    // ── parse_transcript ──────────────────────────────────────────
+
+    fn write_file(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[tokio::test]
+    async fn parse_transcript_reads_the_messages_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("messages.jsonl");
+        let a = raw_line(&user_msg("a"));
+        let b = raw_line(&user_msg("b"));
+        write_file(&path, &format!("{a}\n{b}\n"));
+        let msgs = parse_transcript(&path).await.unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0], user_msg("a"));
+        assert_eq!(msgs[1], user_msg("b"));
+    }
+
+    #[tokio::test]
+    async fn parse_transcript_on_a_missing_file_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nope.jsonl");
+        assert!(parse_transcript(&path).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_transcript_heals_a_torn_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("messages.jsonl");
+        let good = raw_line(&user_msg("ok"));
+        write_file(&path, &format!("{good}\n{}", &good[..good.len() / 2]));
+        let msgs = parse_transcript(&path).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{good}\n"));
+    }
+
+    #[tokio::test]
+    async fn parse_transcript_fails_on_mid_file_damage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("messages.jsonl");
+        let good = raw_line(&user_msg("ok"));
+        write_file(&path, &format!("{good}\nNOT_JSON\n{good}\n"));
+        let err = parse_transcript(&path).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("line 2"), "{msg}");
+        // The damaged file is left untouched.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{good}\nNOT_JSON\n{good}\n")
+        );
+    }
+
+    // ── scan_jsonl / scan_jsonl_sync ──────────────────────────────
+
+    #[tokio::test]
+    async fn scan_jsonl_reads_the_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        let good = raw_line(&user_msg("ok"));
+        write_file(&path, &format!("{good}\n"));
+        let rows = scan_jsonl::<AgentMessage>(&path, true, false)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![user_msg("ok")]);
+    }
+
+    #[tokio::test]
+    async fn scan_jsonl_on_a_missing_file_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nope.jsonl");
+        assert!(scan_jsonl::<AgentMessage>(&path, true, false)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_jsonl_with_repair_truncates_the_torn_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        let good = raw_line(&user_msg("ok"));
+        write_file(&path, &format!("{good}\n{}", &good[..good.len() / 2]));
+        let rows = scan_jsonl::<AgentMessage>(&path, true, false)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{good}\n"));
+    }
+
+    #[tokio::test]
+    async fn scan_jsonl_without_repair_keeps_the_torn_tail_on_disk() {
+        // repair_tail = false: the row is dropped from the result but the
+        // file keeps its damaged tail (read-only consumers).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        let good = raw_line(&user_msg("ok"));
+        let torn = format!("{good}\n{}", &good[..good.len() / 2]);
+        write_file(&path, &torn);
+        let rows = scan_jsonl::<AgentMessage>(&path, false, false)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), torn);
+    }
+
+    #[tokio::test]
+    async fn scan_jsonl_fails_closed_on_a_data_error() {
+        // A complete row the reader does not understand is version skew,
+        // not a crash artifact: the load fails and the file is untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        write_file(&path, "{\"role\":\"from_the_future\"}\n");
+        let err = scan_jsonl::<AgentMessage>(&path, true, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Transcript(_)));
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("from_the_future"),
+            "the unknown row must stay on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_jsonl_sync_reads_the_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        let good = raw_line(&user_msg("ok"));
+        write_file(&path, &format!("{good}\n"));
+        let rows = scan_jsonl_sync::<AgentMessage>(&path, true, false).unwrap();
+        assert_eq!(rows, vec![user_msg("ok")]);
+    }
+
+    #[tokio::test]
+    async fn scan_jsonl_sync_on_a_missing_file_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nope.jsonl");
+        assert!(scan_jsonl_sync::<AgentMessage>(&path, true, false)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_jsonl_sync_with_repair_truncates_the_torn_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        let good = raw_line(&user_msg("ok"));
+        write_file(&path, &format!("{good}\n{}", &good[..good.len() / 2]));
+        let rows = scan_jsonl_sync::<AgentMessage>(&path, true, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{good}\n"));
+    }
+
+    #[tokio::test]
+    async fn scan_jsonl_sync_without_repair_keeps_the_torn_tail_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        let good = raw_line(&user_msg("ok"));
+        let torn = format!("{good}\n{}", &good[..good.len() / 2]);
+        write_file(&path, &torn);
+        let rows = scan_jsonl_sync::<AgentMessage>(&path, false, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), torn);
+    }
+
+    #[tokio::test]
+    async fn scan_jsonl_sync_fails_closed_on_a_data_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        write_file(&path, "{\"role\":\"from_the_future\"}\n");
+        let err = scan_jsonl_sync::<AgentMessage>(&path, true, true).unwrap_err();
+        assert!(matches!(err, AgentError::Transcript(_)));
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("from_the_future"),
+            "the unknown row must stay on disk"
+        );
+    }
+
+    // ── warn_torn_tail ────────────────────────────────────────────
+
+    #[test]
+    fn warn_torn_tail_accepts_a_torn_tail_verdict() {
+        // The verdict only feeds the log line; it must never panic and it
+        // must not touch the file.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        write_file(&path, "{\"role\":\"user\"\n");
+        let err = serde_json::from_str::<AgentMessage>("{\"role\":").unwrap_err();
+        let torn = TornTail {
+            line_no: 1,
+            start: 0,
+            err,
+        };
+        warn_torn_tail(&path, &torn);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"role\":\"user\"\n",
+            "the warning must not modify the file"
+        );
+    }
+
+    // ── scan_jsonl_buffer ─────────────────────────────────────────
+
+    #[test]
+    fn scan_jsonl_buffer_reads_valid_rows() {
+        let good = raw_line(&user_msg("ok"));
+        let buf = format!("{good}\n{good}\n");
+        let (items, torn) =
+            scan_jsonl_buffer::<AgentMessage>(buf.as_bytes(), Path::new("f.jsonl"), false).unwrap();
+        assert_eq!(items, vec![user_msg("ok"), user_msg("ok")]);
+        assert!(torn.is_none());
+    }
+
+    #[test]
+    fn scan_jsonl_buffer_on_an_empty_buffer() {
+        let (items, torn) =
+            scan_jsonl_buffer::<AgentMessage>(b"", Path::new("f.jsonl"), false).unwrap();
+        assert!(items.is_empty());
+        assert!(torn.is_none());
+    }
+
+    #[test]
+    fn scan_jsonl_buffer_skips_blank_lines() {
+        let good = raw_line(&user_msg("ok"));
+        let buf = format!("\n\n{good}\n\n\n");
+        let (items, torn) =
+            scan_jsonl_buffer::<AgentMessage>(buf.as_bytes(), Path::new("f.jsonl"), false).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(torn.is_none());
+    }
+
+    #[test]
+    fn scan_jsonl_buffer_reports_the_torn_tail_offset() {
+        let good = raw_line(&user_msg("ok"));
+        let buf = format!("{good}\n{}", &good[..good.len() / 2]);
+        let (items, torn) =
+            scan_jsonl_buffer::<AgentMessage>(buf.as_bytes(), Path::new("f.jsonl"), false).unwrap();
+        assert_eq!(items.len(), 1);
+        let t = torn.expect("torn tail expected");
+        assert_eq!(t.line_no, 2);
+        assert_eq!(
+            t.start,
+            good.len() + 1,
+            "the offset is the torn line's start"
+        );
+    }
+
+    #[test]
+    fn scan_jsonl_buffer_treats_a_torn_complete_line_as_the_tail() {
+        // A garbage line that ends with a newline but has nothing after it
+        // is still the tail (crash after the terminator).
+        let good = raw_line(&user_msg("ok"));
+        let buf = format!("{good}\nNOT_JSON\n");
+        let (items, torn) =
+            scan_jsonl_buffer::<AgentMessage>(buf.as_bytes(), Path::new("f.jsonl"), false).unwrap();
+        assert_eq!(items.len(), 1);
+        let t = torn.expect("torn tail expected");
+        assert_eq!(t.line_no, 2);
+        assert_eq!(t.start, good.len() + 1);
+    }
+
+    #[test]
+    fn scan_jsonl_buffer_fails_on_mid_file_damage() {
+        let good = raw_line(&user_msg("ok"));
+        let buf = format!("NOT_JSON\n{good}\n");
+        let err =
+            match scan_jsonl_buffer::<AgentMessage>(buf.as_bytes(), Path::new("f.jsonl"), false) {
+                Ok(_) => panic!("mid-file damage must fail the scan"),
+                Err(e) => e,
+            };
+        let msg = err.to_string();
+        assert!(msg.contains("line 1"), "{msg}");
+        assert!(msg.contains("f.jsonl"), "{msg}");
+    }
+
+    #[test]
+    fn scan_jsonl_buffer_fails_on_two_consecutive_bad_lines() {
+        let buf = "NOT_JSON\nALSO_NOT_JSON\n";
+        let err =
+            match scan_jsonl_buffer::<AgentMessage>(buf.as_bytes(), Path::new("f.jsonl"), false) {
+                Ok(_) => panic!("two bad lines must fail the scan"),
+                Err(e) => e,
+            };
+        let msg = err.to_string();
+        assert!(msg.contains("line 1"), "{msg}");
+    }
+
+    #[test]
+    fn scan_jsonl_buffer_fails_closed_on_a_data_error() {
+        // A complete row with an unknown tag is version skew: it fails the
+        // scan instead of being healed away as a torn tail.
+        let buf = "{\"role\":\"from_the_future\"}\n";
+        let err =
+            match scan_jsonl_buffer::<AgentMessage>(buf.as_bytes(), Path::new("f.jsonl"), true) {
+                Ok(_) => panic!("an unknown variant must fail the scan"),
+                Err(e) => e,
+            };
+        assert!(matches!(err, AgentError::Transcript(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("line 1"), "{msg}");
+    }
+
+    #[test]
+    fn scan_jsonl_buffer_heals_a_data_error_when_not_failing_closed() {
+        // The legacy transcript policy: any unparseable last line heals.
+        let buf = "{\"role\":\"from_the_future\"}\n";
+        let (items, torn) =
+            scan_jsonl_buffer::<AgentMessage>(buf.as_bytes(), Path::new("f.jsonl"), false).unwrap();
+        assert!(items.is_empty());
+        assert!(torn.is_some(), "the unknown row heals as a torn tail");
+    }
+
+    #[test]
+    fn scan_jsonl_buffer_accepts_a_valid_last_line_without_a_terminator() {
+        let good = raw_line(&user_msg("ok"));
+        let buf = format!("{good}\n{good}");
+        let (items, torn) =
+            scan_jsonl_buffer::<AgentMessage>(buf.as_bytes(), Path::new("f.jsonl"), false).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(torn.is_none());
+    }
+
+    #[test]
+    fn scan_jsonl_buffer_handles_crlf_line_endings() {
+        let good = raw_line(&user_msg("ok"));
+        let buf = format!("{good}\r\n{good}\r\n");
+        let (items, torn) =
+            scan_jsonl_buffer::<AgentMessage>(buf.as_bytes(), Path::new("f.jsonl"), false).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(torn.is_none());
+    }
+
+    #[test]
+    fn scan_jsonl_buffer_handles_multibyte_utf8() {
+        let good = raw_line(&user_msg("会话 ✅"));
+        let buf = format!("{good}\n{good}\n");
+        let (items, torn) =
+            scan_jsonl_buffer::<AgentMessage>(buf.as_bytes(), Path::new("f.jsonl"), false).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(torn.is_none());
+        assert_eq!(items[0], user_msg("会话 ✅"));
+    }
+
+    // ── repair_torn_tail / repair_torn_tail_sync ──────────────────
+
+    #[tokio::test]
+    async fn repair_torn_tail_truncates_the_file_at_the_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        write_file(&path, "abc\ndef\n");
+        repair_torn_tail(&path, 4).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "abc\n");
+    }
+
+    #[tokio::test]
+    async fn repair_torn_tail_can_empt_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        write_file(&path, "abc\n");
+        repair_torn_tail(&path, 0).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn repair_torn_tail_sync_truncates_the_file_at_the_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        write_file(&path, "abc\ndef\n");
+        repair_torn_tail_sync(&path, 4).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "abc\n");
+    }
+
+    #[test]
+    fn repair_torn_tail_sync_can_empt_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.jsonl");
+        write_file(&path, "abc\n");
+        repair_torn_tail_sync(&path, 0).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    // ── load_events_sync ──────────────────────────────────────────
+
+    #[test]
+    fn load_events_sync_reads_the_events_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        let events = sample_events();
+        store.append_events_sync("s1", &events).unwrap();
+        let loaded = store.load_events_sync("s1").unwrap();
+        assert_eq!(loaded, events);
+    }
+
+    #[test]
+    fn load_events_sync_on_a_missing_session_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        assert!(store.load_events_sync("never-written").unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_events_sync_heals_a_torn_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        let good = serde_json::to_string(&SessionEvent::TurnStart).unwrap();
+        write_raw_events(
+            &store,
+            "s1",
+            &format!("{good}\n{}", &good[..good.len() / 2]),
+        );
+        let loaded = store.load_events_sync("s1").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(store.events_path("s1")).unwrap(),
+            format!("{good}\n")
+        );
+    }
+
+    #[test]
+    fn load_events_sync_rejects_an_invalid_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        assert!(matches!(
+            store.load_events_sync("../evil"),
+            Err(AgentError::InvalidSessionId(_))
+        ));
+    }
+
+    // ── delete_legacy ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_legacy_removes_only_the_legacy_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        let dir = tmp.path().join("s1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("messages.jsonl"), "legacy\n").unwrap();
+        std::fs::write(dir.join("events.jsonl"), "events\n").unwrap();
+        std::fs::write(dir.join("meta.json"), "{}").unwrap();
+
+        store.delete_legacy("s1").await.unwrap();
+        assert!(
+            !store.messages_path("s1").exists(),
+            "legacy file must be gone"
+        );
+        assert!(
+            store.events_path("s1").exists(),
+            "the event log must survive"
+        );
+        assert!(
+            store.meta_path("s1").exists(),
+            "the meta sidecar must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_legacy_on_a_missing_file_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        store.delete_legacy("s1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_legacy_rejects_an_invalid_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        assert!(matches!(
+            store.delete_legacy("../evil").await,
+            Err(AgentError::InvalidSessionId(_))
+        ));
+        assert!(!tmp.path().join("../evil").exists());
+    }
+
+    // ── load_meta_sync ────────────────────────────────────────────
+
+    #[test]
+    fn load_meta_sync_reads_the_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("s1")).unwrap();
+        std::fs::write(store.meta_path("s1"), "{\"name\":\"My chat\"}").unwrap();
+        let meta = store.load_meta_sync("s1").expect("meta must load");
+        assert_eq!(meta.name.as_deref(), Some("My chat"));
+    }
+
+    #[test]
+    fn load_meta_sync_on_a_missing_file_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        assert!(store.load_meta_sync("s1").is_none());
+    }
+
+    #[test]
+    fn load_meta_sync_on_a_corrupt_file_is_none() {
+        // Metadata is decoration: a broken sidecar must not break the load.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("s1")).unwrap();
+        std::fs::write(store.meta_path("s1"), "{not json").unwrap();
+        assert!(store.load_meta_sync("s1").is_none());
+    }
+
+    #[test]
+    fn load_meta_sync_defaults_an_empty_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("s1")).unwrap();
+        std::fs::write(store.meta_path("s1"), "{}").unwrap();
+        let meta = store.load_meta_sync("s1").expect("meta must load");
+        assert_eq!(meta.name, None);
+    }
+
+    #[test]
+    fn load_meta_sync_rejects_an_invalid_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path());
+        assert!(store.load_meta_sync("../evil").is_none());
+    }
+
+    // ── open_append_sync ──────────────────────────────────────────
+
+    #[test]
+    fn open_append_sync_creates_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        let mut file = open_append_sync(&path).expect("open must succeed");
+        append_line_sync(&mut file, &user_msg("a")).unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn open_append_sync_creates_the_missing_parent_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested/deeper/log.jsonl");
+        let file = open_append_sync(&path).expect("open must create the dirs");
+        drop(file);
+        assert!(path.exists());
+        assert!(path.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn open_append_sync_appends_instead_of_truncating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        std::fs::write(&path, "existing\n").unwrap();
+        let mut file = open_append_sync(&path).expect("open must succeed");
+        append_line_sync(&mut file, &user_msg("a")).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.starts_with("existing\n"), "{raw}");
+        assert_eq!(raw.lines().count(), 2);
+    }
+
+    #[test]
+    fn open_append_sync_writes_to_an_existing_file_without_truncating_it() {
+        // Two handles on the same file (the O_APPEND discipline): the
+        // second write must land after the first, not overwrite it.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        let mut first = open_append_sync(&path).unwrap();
+        append_line_sync(&mut first, &user_msg("a")).unwrap();
+        let mut second = open_append_sync(&path).unwrap();
+        append_line_sync(&mut second, &user_msg("b")).unwrap();
+        drop(first);
+        drop(second);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 2, "{raw}");
+        assert!(raw.contains("\"a\""), "{raw}");
+        assert!(raw.contains("\"b\""), "{raw}");
+    }
+
+    #[test]
+    fn open_append_sync_fails_when_the_parent_is_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let path = blocker.join("log.jsonl");
+        assert!(open_append_sync(&path).is_err());
+    }
 }

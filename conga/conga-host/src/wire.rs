@@ -262,6 +262,75 @@ mod tests {
         assert!(v.get("usage_in").is_none() && v.get("usage_cache_read").is_none());
     }
 
+    /// The base constructor: every other constructor starts here. Only the
+    /// `type` field is set - all optional fields stay absent and must NOT
+    /// appear in the serialized JSON.
+    #[test]
+    fn base_event_carries_only_the_type() {
+        let v = serde_json::to_value(OutgoingEvent::base("custom")).unwrap();
+        assert_eq!(v, serde_json::json!({"type": "custom"}));
+    }
+
+    #[test]
+    fn outgoing_event_shapes_carry_their_own_fields() {
+        let v = serde_json::to_value(OutgoingEvent::content("hi".into())).unwrap();
+        assert_eq!(v["type"], "content");
+        assert_eq!(v["content"], "hi");
+        assert!(v.get("message").is_none());
+
+        let v = serde_json::to_value(OutgoingEvent::thinking("hmm".into())).unwrap();
+        assert_eq!(v["type"], "thinking");
+        assert_eq!(v["content"], "hmm");
+
+        let v = serde_json::to_value(OutgoingEvent::busy("a turn is running".into())).unwrap();
+        assert_eq!(v["type"], "busy");
+        assert_eq!(v["content"], "a turn is running");
+        assert_eq!(v["message"], "a turn is running");
+
+        let v = serde_json::to_value(OutgoingEvent::queued("later".into())).unwrap();
+        assert_eq!(v["type"], "queued");
+        assert_eq!(v["message"], "later");
+        assert!(v.get("content").is_none(), "queued carries no content");
+    }
+
+    #[test]
+    fn approval_request_truncates_the_description_but_keeps_the_arguments() {
+        let args = serde_json::json!({"content": "x".repeat(1000)});
+        let ev = OutgoingEvent::approval_request(
+            "req1".into(),
+            "write".into(),
+            &args,
+            Some("--- a/x\n+++ b/x".into()),
+        );
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "approval_request");
+        assert_eq!(v["id"], "req1");
+        assert_eq!(v["tool_name"], "write");
+        assert_eq!(v["preview"], "--- a/x\n+++ b/x");
+        // The human-readable description is capped at 300 chars + "...".
+        let desc = v["description"].as_str().unwrap();
+        assert!(desc.ends_with("..."), "{desc}");
+        assert_eq!(desc.chars().count(), 303);
+        // The raw arguments keep the full payload.
+        assert_eq!(
+            v["arguments"].as_str().unwrap(),
+            args.to_string().as_str()
+        );
+    }
+
+    #[test]
+    fn approval_request_without_a_preview_omits_the_field() {
+        let ev = OutgoingEvent::approval_request(
+            "req2".into(),
+            "bash".into(),
+            &serde_json::json!({"cmd": "ls"}),
+            None,
+        );
+        let v = serde_json::to_value(&ev).unwrap();
+        assert!(v.get("preview").is_none());
+        assert_eq!(v["description"], "{\"cmd\":\"ls\"}");
+    }
+
     /// Golden NDJSON fixture shared with the TypeScript SDK
     /// (`sdk-ts/test/fixtures/wire-events.ndjson`): one line per wire
     /// event, covering every OutgoingEvent constructor. The SDK's tests

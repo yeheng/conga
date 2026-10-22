@@ -306,7 +306,478 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_incoming_defaults_missing_error_fields() {
+        // An error object without code/message → the documented defaults.
+        let line = r#"{"jsonrpc":"2.0","id":7,"error":{}}"#;
+        match parse_incoming(line, 7) {
+            IncomingMessage::Error { code, message, .. } => {
+                assert_eq!(code, -1);
+                assert_eq!(message, "unknown error");
+            }
+            _ => panic!("expected Error"),
+        }
+
+        // Neither result nor error → Other (nothing usable).
+        let line = r#"{"jsonrpc":"2.0","id":7}"#;
+        assert!(matches!(parse_incoming(line, 7), IncomingMessage::Other));
+    }
+
     // ── Integration test (Python mock server) ────────────────────
+
+    /// Write a python3 MCP server that answers `tools/call`:
+    /// - `echo`  → the arguments echoed back as text
+    /// - `boom`  → a JSON-RPC error
+    /// - `weird` → a result that is not a valid `CallResult`
+    /// Returns the script path; the temp dir is kept so it outlives the
+    /// call.
+    fn fixture_call_server_script() -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_call.py");
+        std::fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import sys, json
+
+def send(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method", "")
+    if method != "tools/call":
+        continue
+    name = msg.get("params", {}).get("name", "")
+    if name == "boom":
+        send({"jsonrpc": "2.0", "id": mid, "error": {
+            "code": -32602, "message": "invalid params"}})
+    elif name == "weird":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"content": "oops"}})
+    else:
+        args = msg.get("params", {}).get("arguments", {})
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text", "text": args.get("text", "")}],
+            "isError": False
+        }})
+"#,
+        )
+        .unwrap();
+        let kept = dir.keep();
+        kept.join("mcp_call.py").to_string_lossy().into_owned()
+    }
+
+    /// A bridge whose "server" is `cat`: every line written to its stdin is
+    /// echoed back on its stdout.
+    async fn echo_bridge(timeout: Duration) -> Arc<McpBridge> {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        Arc::new(McpBridge {
+            inner: Mutex::new(McpBridgeInner {
+                _child: child,
+                stdin,
+                stdout: BufReader::new(stdout),
+                next_id: 1,
+            }),
+            timeout,
+            server_name: "cat".to_string(),
+        })
+    }
+
+    /// A bridge whose server is the python fixture above.
+    async fn call_bridge(script: &str, timeout: Duration) -> Arc<McpBridge> {
+        let mut child = Command::new("python3")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        Arc::new(McpBridge {
+            inner: Mutex::new(McpBridgeInner {
+                _child: child,
+                stdin,
+                stdout: BufReader::new(stdout),
+                next_id: 1,
+            }),
+            timeout,
+            server_name: "fixture".to_string(),
+        })
+    }
+
+    // ── `write_request` / `write_notification` ────────────────────
+
+    #[tokio::test]
+    async fn write_request_writes_a_jsonrpc_frame_with_id_and_params() {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        write_request(
+            &mut stdin,
+            7,
+            "tools/list",
+            serde_json::json!({"cursor": "x"}),
+        )
+        .await
+        .expect("write request");
+
+        let mut line = String::new();
+        stdout.read_line(&mut line).await.unwrap();
+        assert!(line.ends_with('\n'), "a frame must be newline terminated");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["method"], "tools/list");
+        assert_eq!(v["params"], serde_json::json!({"cursor": "x"}));
+
+        drop(stdin);
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn write_request_fails_when_the_server_process_is_gone() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        // The child is gone: its end of the pipe is closed, so the write
+        // fails instead of silently succeeding.
+        let _ = child.wait().await;
+
+        let err = write_request(&mut stdin, 1, "initialize", serde_json::json!({}))
+            .await
+            .expect_err("writing to a dead process must fail");
+        assert!(
+            matches!(err, McpError::Io(_)),
+            "expected an io error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_notification_writes_a_frame_without_an_id() {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        write_notification(&mut stdin, "notifications/initialized")
+            .await
+            .expect("write notification");
+
+        let mut line = String::new();
+        stdout.read_line(&mut line).await.unwrap();
+        assert!(line.ends_with('\n'), "a frame must be newline terminated");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["method"], "notifications/initialized");
+        assert!(v.get("id").is_none(), "a notification carries no id: {v}");
+
+        drop(stdin);
+        let _ = child.wait().await;
+    }
+
+    // ── `recv_response` ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn recv_response_skips_noise_until_the_matching_response() {
+        let bridge = echo_bridge(Duration::from_secs(5)).await;
+        let mut guard = bridge.inner.lock().await;
+        {
+            let stdin = &mut guard.stdin;
+            stdin.write_all(b"not json at all\n").await.unwrap();
+            stdin.write_all(b"\n").await.unwrap();
+            stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n")
+                .await
+                .unwrap();
+            stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"wrong\":true}}\n")
+                .await
+                .unwrap();
+            stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"ok\":true}}\n")
+                .await
+                .unwrap();
+            stdin.flush().await.unwrap();
+        }
+
+        let result = bridge
+            .recv_response(&mut guard, 5)
+            .await
+            .expect("matching response");
+        assert_eq!(result["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn recv_response_reports_a_jsonrpc_error_frame() {
+        let bridge = echo_bridge(Duration::from_secs(5)).await;
+        let mut guard = bridge.inner.lock().await;
+        {
+            let stdin = &mut guard.stdin;
+            stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-32601,\"message\":\"not found\"}}\n")
+                .await
+                .unwrap();
+            stdin.flush().await.unwrap();
+        }
+
+        let err = bridge
+            .recv_response(&mut guard, 5)
+            .await
+            .expect_err("error frame");
+        match err {
+            McpError::ServerError { code, message } => {
+                assert_eq!(code, -32601);
+                assert_eq!(message, "not found");
+            }
+            other => panic!("expected a server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_response_fails_when_the_server_closes_stdout() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let bridge = Arc::new(McpBridge {
+            inner: Mutex::new(McpBridgeInner {
+                _child: child,
+                stdin,
+                stdout: BufReader::new(stdout),
+                next_id: 1,
+            }),
+            timeout: Duration::from_secs(5),
+            server_name: "dead".to_string(),
+        });
+        let mut guard = bridge.inner.lock().await;
+
+        let err = bridge
+            .recv_response(&mut guard, 1)
+            .await
+            .expect_err("a closed stdout is an error");
+        match err {
+            McpError::Protocol(msg) => assert!(msg.contains("server closed stdout"), "{msg}"),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_response_times_out_when_the_server_stays_silent() {
+        let bridge = echo_bridge(Duration::from_millis(50)).await;
+        let mut guard = bridge.inner.lock().await;
+
+        let err = bridge
+            .recv_response(&mut guard, 1)
+            .await
+            .expect_err("a silent server must time out");
+        match err {
+            McpError::Timeout(d) => assert_eq!(d, Duration::from_millis(50)),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    // ── `call_typed` ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_typed_maps_the_matching_response() {
+        let bridge = echo_bridge(Duration::from_secs(5)).await;
+        {
+            let mut guard = bridge.inner.lock().await;
+            guard
+                .stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"n\":3}}\n")
+                .await
+                .unwrap();
+            guard.stdin.flush().await.unwrap();
+        }
+
+        let n: u32 = bridge
+            .call_typed(5, |v| Ok(v["n"].as_u64().unwrap() as u32))
+            .await
+            .expect("call_typed");
+        assert_eq!(n, 3);
+    }
+
+    #[tokio::test]
+    async fn call_typed_propagates_the_mapper_error() {
+        let bridge = echo_bridge(Duration::from_secs(5)).await;
+        {
+            let mut guard = bridge.inner.lock().await;
+            guard
+                .stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}\n")
+                .await
+                .unwrap();
+            guard.stdin.flush().await.unwrap();
+        }
+
+        let err = bridge
+            .call_typed::<serde_json::Value, _>(5, |_v| Err(McpError::Protocol("bad shape".into())))
+            .await
+            .expect_err("the mapper error must surface");
+        match err {
+            McpError::Protocol(msg) => assert_eq!(msg, "bad shape"),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_typed_times_out_on_an_unmatched_id() {
+        let bridge = echo_bridge(Duration::from_millis(50)).await;
+        {
+            let mut guard = bridge.inner.lock().await;
+            guard
+                .stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n")
+                .await
+                .unwrap();
+            guard.stdin.flush().await.unwrap();
+        }
+
+        let err = bridge
+            .call_typed(5, |v| Ok(v))
+            .await
+            .expect_err("an unmatched id must not be accepted");
+        match err {
+            McpError::Timeout(d) => assert_eq!(d, Duration::from_millis(50)),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    // ── `call` ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_sends_tools_call_and_parses_the_call_result() {
+        let script = fixture_call_server_script();
+        let bridge = call_bridge(&script, Duration::from_secs(10)).await;
+
+        let result = bridge
+            .call("echo", &serde_json::json!({"text": "hello"}))
+            .await
+            .expect("tools/call");
+
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 1);
+        let blocks = super::super::types::content_to_blocks(&result.content);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "hello"));
+    }
+
+    #[tokio::test]
+    async fn call_reports_a_jsonrpc_error_from_the_server() {
+        let script = fixture_call_server_script();
+        let bridge = call_bridge(&script, Duration::from_secs(10)).await;
+
+        let err = bridge
+            .call("boom", &serde_json::json!({}))
+            .await
+            .expect_err("the server error must surface");
+        match err {
+            McpError::ServerError { code, message } => {
+                assert_eq!(code, -32602);
+                assert_eq!(message, "invalid params");
+            }
+            other => panic!("expected a server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_rejects_a_result_that_is_not_a_call_result() {
+        let script = fixture_call_server_script();
+        let bridge = call_bridge(&script, Duration::from_secs(10)).await;
+
+        let err = bridge
+            .call("weird", &serde_json::json!({}))
+            .await
+            .expect_err("a malformed result must surface");
+        match err {
+            McpError::Protocol(msg) => assert!(msg.contains("tools/call parse error"), "{msg}"),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_times_out_when_the_server_never_answers() {
+        // `cat` echoes the request back; the echo is not a response, so the
+        // call must run into its deadline.
+        let bridge = echo_bridge(Duration::from_millis(50)).await;
+
+        let err = bridge
+            .call("echo", &serde_json::json!({}))
+            .await
+            .expect_err("a silent server must time out");
+        match err {
+            McpError::Timeout(d) => assert_eq!(d, Duration::from_millis(50)),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    // ── `tool_definition` ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tool_definition_wraps_the_tool_and_dispatches_a_call() {
+        let script = fixture_call_server_script();
+        let bridge = call_bridge(&script, Duration::from_secs(10)).await;
+
+        let def = bridge.tool_definition(McpTool {
+            name: "echo".into(),
+            title: None,
+            description: "echo back the arguments".into(),
+            annotations: serde_json::json!({}),
+            input_schema: serde_json::json!({"type": "object"}),
+        });
+
+        assert_eq!(def.name, "mcp__fixture__echo");
+        assert_eq!(def.label, "fixture/echo");
+        assert_eq!(def.description, "echo back the arguments");
+        assert_eq!(def.parameters, serde_json::json!({"type": "object"}));
+        assert_eq!(def.risk, RiskLevel::High);
+
+        let result = (def.execute)(super::super::test_util::tool_call_ctx_for_test(
+            "c1",
+            serde_json::json!({"text": "hi"}),
+        ))
+        .await
+        .expect("execute");
+        assert!(!result.is_error);
+        assert!(matches!(
+            &result.content[0],
+            ContentBlock::Text { text } if text == "hi"
+        ));
+    }
 
     fn fixture_mcp_server_script() -> String {
         let dir = tempfile::tempdir().unwrap();

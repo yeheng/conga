@@ -622,4 +622,135 @@ path = {:?}
         );
         assert!(base.path().join("memory/p.md").exists(), "文件确实落盘");
     }
+
+    // --- memory_dir / display_path / format_hits ---
+
+    /// A config with one directory source, so `display_path` has a root to
+    /// join the source-relative hit paths with.
+    fn cfg_with_source(name: &str, root: &std::path::Path) -> conga_rag::config::RagConfig {
+        let mut cfg = conga_rag::config::RagConfig::default();
+        cfg.sources.insert(
+            name.to_string(),
+            conga_rag::config::SourceConfig {
+                kind: "dir".into(),
+                path: root.to_path_buf(),
+                include: vec!["**/*.md".into()],
+                exclude: Vec::new(),
+            },
+        );
+        cfg
+    }
+
+    fn hit(source: &str, path: &str, content: &str) -> conga_rag::store::Hit {
+        conga_rag::store::Hit {
+            source: source.into(),
+            path: path.into(),
+            ordinal: 0,
+            content: content.into(),
+            score: 0.5,
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_dir_is_the_memory_folder_under_the_builtin_base() {
+        let _g = env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("CONGA_RAG_BUILTIN_BASE", tmp.path());
+        let dir = memory_dir();
+        std::env::remove_var("CONGA_RAG_BUILTIN_BASE");
+        assert_eq!(dir, tmp.path().join("memory"));
+    }
+
+    #[tokio::test]
+    async fn memory_dir_falls_back_to_the_config_dir_when_builtins_are_disabled() {
+        let _g = env_lock().await;
+        // An empty builtin base means "builtins disabled": the write path
+        // still has to land under the real config dir, never scattered.
+        std::env::set_var("CONGA_RAG_BUILTIN_BASE", "");
+        let dir = memory_dir();
+        std::env::remove_var("CONGA_RAG_BUILTIN_BASE");
+        assert_eq!(dir, conga::storage::config_dir().join("memory"));
+        assert_eq!(dir.file_name().unwrap(), "memory");
+    }
+
+    #[test]
+    fn display_path_joins_a_relative_hit_with_its_source_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_source("notes", tmp.path());
+        let h = hit("notes", "sub/架构.md", "内容");
+        assert_eq!(
+            display_path(&cfg, &h),
+            tmp.path()
+                .join("sub/架构.md")
+                .to_string_lossy()
+                .into_owned()
+        );
+    }
+
+    #[test]
+    fn display_path_keeps_an_absolute_hit_path_as_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_source("notes", tmp.path());
+        let h = hit("notes", "/absolute/note.md", "内容");
+        assert_eq!(display_path(&cfg, &h), "/absolute/note.md");
+    }
+
+    #[test]
+    fn display_path_falls_back_to_the_raw_path_for_an_unknown_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_source("notes", tmp.path());
+        let h = hit("other-source", "note.md", "内容");
+        assert_eq!(display_path(&cfg, &h), "note.md");
+    }
+
+    #[test]
+    fn format_hits_lists_every_hit_with_score_and_ordinal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = cfg_with_source("notes", tmp.path());
+        cfg.embedding.base_url = Some("http://127.0.0.1:9".into());
+        cfg.embedding.api_key = Some("k".into());
+        cfg.embedding.model = Some("mock-model".into());
+        let hits = vec![
+            hit("notes", "a.md", "first body"),
+            hit("notes", "b.md", "second body"),
+        ];
+
+        let out = format_hits(&cfg, &hits);
+
+        assert!(out.contains("找到 2 条相关片段"), "{out}");
+        assert!(out.contains("索引模型 mock-model"), "{out}");
+        assert!(out.contains("[1] score=0.500"), "{out}");
+        assert!(out.contains("[2] score=0.500"), "{out}");
+        assert!(out.contains("片段 1"), "{out}");
+        assert!(out.contains("first body"), "{out}");
+        assert!(out.contains("second body"), "{out}");
+        assert!(out.contains("read 工具"), "{out}");
+    }
+
+    #[test]
+    fn format_hits_with_no_hits_reports_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_source("notes", tmp.path());
+        let out = format_hits(&cfg, &[]);
+        assert!(out.contains("找到 0 条相关片段"), "{out}");
+    }
+
+    #[test]
+    fn format_hits_truncates_a_long_hit_without_splitting_a_char() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_source("notes", tmp.path());
+        let long = "中".repeat(MAX_HIT_CHARS + 100);
+        let hits = vec![hit("notes", "a.md", &long)];
+
+        let out = format_hits(&cfg, &hits);
+
+        assert!(out.contains("…(片段过长已截断)"), "{out}");
+        assert!(
+            !out.contains(&long),
+            "the full (over-long) body must not be printed"
+        );
+        // The kept head is exactly MAX_HIT_CHARS chars.
+        let kept = "中".repeat(MAX_HIT_CHARS);
+        assert!(out.contains(&kept), "the head is kept verbatim");
+    }
 }

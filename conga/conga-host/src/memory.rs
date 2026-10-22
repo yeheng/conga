@@ -310,4 +310,194 @@ mod tests {
         let e = &load_entries(&root)[0];
         assert_eq!((e.title.as_str(), e.preview.as_str()), ("t", "Body text."));
     }
+
+    // ---- append_memory (production entry) ----
+
+    #[test]
+    fn append_memory_production_entry_reads_the_config_dir() {
+        // The production entry points at the machine's real config dir
+        // (~/.conga/memory), which cannot be redirected without mutating the
+        // process environment. Assert the structural contract instead: the
+        // base prompt survives and any appended catalog is well-formed.
+        let out = append_memory("BASE");
+        assert!(out.starts_with("BASE"), "{out}");
+        if out.len() > "BASE".len() {
+            assert!(out.contains("## Memory"), "{out}");
+            assert!(out.contains("(source: "), "{out}");
+            assert!(out.contains("`read`"), "{out}");
+        }
+    }
+
+    // ---- catalog_entries ----
+
+    #[test]
+    fn catalog_entries_is_empty_for_a_missing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(catalog_entries(&tmp.path().join("memory")).is_empty());
+    }
+
+    #[test]
+    fn catalog_entries_is_sorted_by_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("memory");
+        std::fs::create_dir_all(&root).unwrap();
+        write(
+            &root,
+            "b.md",
+            "---\ntitle: beta\ntags: [t]\ncreated: 1\nsource_session: s\n---\nBody b.\n",
+        );
+        write(
+            &root,
+            "a.md",
+            "---\ntitle: alpha\ntags: [t]\ncreated: 1\nsource_session: s\n---\nBody a.\n",
+        );
+        let titles: Vec<String> = catalog_entries(&root).keys().cloned().collect();
+        assert_eq!(titles, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn catalog_entries_is_capped_at_max_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("memory");
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..(MAX_ENTRIES + 6) {
+            write(
+                &root,
+                format!("{i:03}.md").as_str(),
+                &format!(
+                    "---\ntitle: t{i:03}\ntags: [t]\ncreated: 1\nsource_session: s\n---\nBody {i}.\n"
+                ),
+            );
+        }
+        let entries = catalog_entries(&root);
+        assert_eq!(entries.len(), MAX_ENTRIES, "the catalog is capped");
+        // The cap keeps the first (sorted) titles.
+        assert!(entries.contains_key("t000"));
+        assert!(!entries.contains_key(&format!("t{:03}", MAX_ENTRIES)));
+    }
+
+    // ---- parse_entry ----
+
+    #[test]
+    fn parse_entry_reads_title_tags_and_preview() {
+        assert_eq!(
+            parse_entry("---\ntitle: t\ntags: [a, b]\n---\nFirst line.\nsecond line\n"),
+            Some((
+                "t".to_string(),
+                vec!["a".to_string(), "b".to_string()],
+                "First line.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_entry_requires_a_non_empty_title() {
+        assert_eq!(
+            parse_entry("---\ntags: [a]\n---\nbody\n"),
+            None,
+            "a missing title skips the entry"
+        );
+        assert_eq!(
+            parse_entry("---\ntitle:\ntags: [a]\n---\nbody\n"),
+            None,
+            "an empty title skips the entry"
+        );
+    }
+
+    #[test]
+    fn parse_entry_rejects_a_missing_or_unterminated_frontmatter_block() {
+        assert_eq!(parse_entry("no frontmatter at all"), None);
+        assert_eq!(parse_entry("---\ntitle: t\ntags: [a]\n"), None);
+    }
+
+    #[test]
+    fn parse_entry_defaults_missing_tags_to_an_empty_list() {
+        let (title, tags, _) = parse_entry("---\ntitle: t\n---\nbody\n").unwrap();
+        assert_eq!(title, "t");
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn parse_entry_strips_quotes_from_the_title_and_tags() {
+        let (title, tags, _) =
+            parse_entry("---\ntitle: \"quoted\"\ntags: [\"a\", 'b']\n---\nbody\n").unwrap();
+        assert_eq!(title, "quoted");
+        assert_eq!(tags, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parse_entry_preview_is_the_first_non_empty_body_line() {
+        let (_, _, preview) =
+            parse_entry("---\ntitle: t\n---\n\n   \n  first line  \nsecond\n").unwrap();
+        assert_eq!(preview, "first line");
+    }
+
+    #[test]
+    fn parse_entry_preview_is_empty_without_a_body() {
+        let (_, _, preview) = parse_entry("---\ntitle: t\n---\n").unwrap();
+        assert_eq!(preview, "");
+    }
+
+    #[test]
+    fn parse_entry_preview_is_bounded() {
+        let long = "x".repeat(MAX_PREVIEW_CHARS + 40);
+        let (_, _, preview) = parse_entry(&format!("---\ntitle: t\n---\n{long}\n")).unwrap();
+        assert_eq!(preview.chars().count(), MAX_PREVIEW_CHARS + 1);
+        assert!(preview.ends_with('…'));
+    }
+
+    // ---- bound_chars ----
+
+    #[test]
+    fn bound_chars_keeps_a_short_string_unchanged() {
+        assert_eq!(bound_chars("abc", 10), "abc");
+        assert_eq!(bound_chars("", 10), "");
+    }
+
+    #[test]
+    fn bound_chars_truncates_and_appends_an_ellipsis() {
+        assert_eq!(bound_chars("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn bound_chars_at_the_limit_is_unchanged() {
+        assert_eq!(bound_chars("abc", 3), "abc");
+    }
+
+    #[test]
+    fn bound_chars_does_not_split_a_multibyte_char() {
+        // A byte-wise truncation would panic or produce invalid UTF-8 here.
+        let out = bound_chars("中文测试", 3);
+        assert_eq!(out, "中文测…");
+    }
+
+    #[test]
+    fn bound_chars_with_a_zero_limit_is_just_the_ellipsis() {
+        assert_eq!(bound_chars("abc", 0), "…");
+    }
+
+    // ---- unquote ----
+
+    #[test]
+    fn unquote_removes_one_balanced_quote_pair() {
+        assert_eq!(unquote("\"abc\""), "abc");
+        assert_eq!(unquote("'abc'"), "abc");
+    }
+
+    #[test]
+    fn unquote_keeps_unbalanced_or_mismatched_quotes() {
+        assert_eq!(unquote("\"abc"), "\"abc");
+        assert_eq!(unquote("abc\""), "abc\"");
+        assert_eq!(unquote("\"abc'"), "\"abc'");
+    }
+
+    #[test]
+    fn unquote_of_an_empty_string_is_empty() {
+        assert_eq!(unquote(""), "");
+    }
+
+    #[test]
+    fn unquote_strips_only_the_outermost_pair() {
+        assert_eq!(unquote("\"\"abc\"\""), "\"abc\"");
+    }
 }

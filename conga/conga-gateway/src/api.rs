@@ -256,6 +256,11 @@ mod tests {
     use dashmap::DashMap;
     use tower::util::ServiceExt;
 
+    use crate::state::WsSession;
+    use axum::extract::ws::WebSocketUpgrade;
+    use futures_util::StreamExt;
+    use tokio::sync::Mutex;
+
     fn user_event(text: &str) -> SessionEvent {
         SessionEvent::User(AgentMessage::User(UserMessage {
             content: vec![ContentBlock::text(text)],
@@ -559,5 +564,274 @@ mod tests {
         let app = authed_router(authed_state(tmp.path().to_path_buf(), "secret"));
         let res = app.oneshot(get_uri("/ping")).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // ── Slash-command catalog ──────────────────────────────────
+
+    #[tokio::test]
+    async fn get_commands_lists_the_supported_slash_commands() {
+        let Json(v) = get_commands().await;
+        let arr = v.as_array().expect("an array of commands");
+        let names: Vec<&str> = arr
+            .iter()
+            .map(|c| c["name"].as_str().expect("a command name"))
+            .collect();
+        assert_eq!(names, vec!["clear", "help"]);
+        assert_eq!(arr[0]["description"], "Clear the conversation history");
+        assert_eq!(arr[0]["aliases"], serde_json::json!([]));
+        assert_eq!(arr[1]["aliases"], serde_json::json!(["?"]));
+        // Every entry must carry a description: the frontend renders it.
+        for c in arr {
+            assert!(
+                c["description"].as_str().is_some_and(|d| !d.is_empty()),
+                "command without description: {c}"
+            );
+        }
+    }
+
+    // ── Error mapping ──────────────────────────────────────────
+
+    async fn body_json(body: Body) -> Value {
+        let bytes = to_bytes(body, usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).expect("a JSON body")
+    }
+
+    #[tokio::test]
+    async fn err_response_maps_every_error_kind_to_its_status() {
+        let cases = [
+            (
+                SessionApiError::BadRequest("bad".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SessionApiError::NotFound("gone".into()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                SessionApiError::Internal("boom".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (err, status) in cases {
+            let resp = err_response(&err);
+            assert_eq!(resp.status(), status, "for {err}");
+            let v = body_json(resp.into_body()).await;
+            assert_eq!(v["error"], err.to_string());
+        }
+    }
+
+    // ── Context stats ──────────────────────────────────────────
+
+    /// A live `WsSession`: the server side of a real WebSocket handshake.
+    /// The client stream is returned as well and must stay alive for the
+    /// lifetime of the session.
+    async fn live_ws_session() -> (
+        Arc<Mutex<WsSession>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| {
+                // Clone the sender so the handler stays a plain `Fn` clone
+                // (axum handlers must be `Clone`).
+                let tx = tx.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        let _ = tx.send(socket);
+                        futures_util::future::pending::<()>().await;
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("the handshake succeeds");
+        let socket = rx.recv().await.expect("the server hands over its socket");
+        let (sender, _stream) = socket.split();
+        let session = Arc::new(Mutex::new(WsSession {
+            sender,
+            usage_in: 0,
+            usage_out: 0,
+            cache_read: 0,
+            cache_write: 0,
+            last_input_tokens: 0,
+            turn_start: None,
+        }));
+        (session, client)
+    }
+
+    #[tokio::test]
+    async fn stats_of_reports_zeros_for_an_unknown_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path().to_path_buf());
+        let stats = stats_of(&state, "never-connected").await;
+        assert_eq!(stats["current_tokens"], 0);
+        assert_eq!(stats["cumulative_in"], 0);
+        assert_eq!(stats["cumulative_out"], 0);
+        assert_eq!(stats["cache_read_tokens"], 0);
+        assert_eq!(stats["cache_write_tokens"], 0);
+        assert_eq!(stats["usage_percent"], 0.0);
+        assert!(
+            stats["max_tokens"].as_u64().unwrap() > 0,
+            "the context window is always reported: {stats}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_of_reports_the_live_connection_counters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path().to_path_buf());
+        let (session, _client) = live_ws_session().await;
+        {
+            let mut s = session.lock().await;
+            s.usage_in = 120;
+            s.usage_out = 30;
+            s.cache_read = 10;
+            s.cache_write = 5;
+            s.last_input_tokens = 1000;
+        }
+        state.sessions.insert("live".to_string(), session);
+
+        let stats = stats_of(&state, "live").await;
+
+        assert_eq!(stats["current_tokens"], 1000);
+        assert_eq!(stats["cumulative_in"], 120);
+        assert_eq!(stats["cumulative_out"], 30);
+        assert_eq!(stats["cache_read_tokens"], 10);
+        assert_eq!(stats["cache_write_tokens"], 5);
+        let max = stats["max_tokens"].as_u64().unwrap();
+        let percent = stats["usage_percent"].as_f64().unwrap();
+        assert!(
+            (percent - (1000.0 / max as f64) * 100.0).abs() < 1e-9,
+            "the percentage is derived from the window: {percent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_context_wraps_the_stats_in_context_stats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path().to_path_buf());
+        let Json(v) = get_context(State(state.clone()), Path("k".to_string())).await;
+        assert!(v["context_stats"].is_object(), "{v}");
+        assert_eq!(v["context_stats"]["current_tokens"], 0);
+    }
+
+    #[tokio::test]
+    async fn compact_context_returns_the_same_stats_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path().to_path_buf());
+        let Json(v) = compact_context(State(state.clone()), Path("k".to_string())).await;
+        assert!(v["context_stats"].is_object(), "{v}");
+        assert_eq!(
+            v["context_stats"]["max_tokens"],
+            stats_of(&state, "k").await["max_tokens"]
+        );
+    }
+
+    #[tokio::test]
+    async fn context_routes_answer_over_http() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = Router::new()
+            .route("/api/sessions/{key}/context", get(get_context))
+            .route(
+                "/api/sessions/{key}/context/compact",
+                axum::routing::post(compact_context),
+            )
+            .with_state(test_state(tmp.path().to_path_buf()));
+
+        let res = app
+            .clone()
+            .oneshot(get_uri("/api/sessions/sess-a/context"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res.into_body()).await;
+        assert!(v["context_stats"].is_object(), "{v}");
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/sess-a/context/compact")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res.into_body()).await;
+        assert!(v["context_stats"].is_object(), "{v}");
+    }
+
+    // ── LLM settings ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_settings_returns_the_masked_view_only() {
+        let Json(v) = get_settings().await;
+        for key in ["llm", "fastLlm", "systemPrompt", "maxTokens"] {
+            assert!(v.get(key).is_some(), "missing {key} in {v}");
+        }
+        // The raw key must never cross the API.
+        let group = &v["llm"];
+        if group.is_object() {
+            assert!(
+                group.get("api_key").is_none() && group.get("apiKey").is_none(),
+                "the raw api key must not be serialized: {group}"
+            );
+            assert!(group.get("apiKeySet").is_some(), "{group}");
+            assert!(group.get("apiKeyHint").is_some(), "{group}");
+        }
+    }
+
+    #[tokio::test]
+    async fn put_settings_rejects_an_invalid_llm_group() {
+        let resp = put_settings(Json(json!({
+            "llm": {
+                "baseUrl": "ftp://example.com",
+                "model": "m",
+                "api": "openai",
+                "apiKey": "k"
+            }
+        })))
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp.into_body()).await;
+        let msg = v["error"].as_str().expect("an error message");
+        assert!(
+            msg.contains("base_url must start with http:// or https://"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_settings_rejects_an_unknown_api_and_a_bad_max_tokens() {
+        let resp = put_settings(Json(json!({
+            "llm": {
+                "baseUrl": "http://example.com",
+                "model": "m",
+                "api": "bogus",
+                "apiKey": "k"
+            }
+        })))
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp.into_body()).await;
+        let msg = v["error"].as_str().expect("an error message");
+        assert!(msg.contains("api must be openai or anthropic"), "{msg}");
+
+        let resp = put_settings(Json(json!({ "maxTokens": 10 }))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp.into_body()).await;
+        let msg = v["error"].as_str().expect("an error message");
+        assert!(msg.contains("maxTokens"), "{msg}");
+        assert!(msg.contains("between 1024 and 2000000"), "{msg}");
     }
 }

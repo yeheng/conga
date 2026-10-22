@@ -415,6 +415,62 @@ for line in sys.stdin:
         kept.join("echo_tool.py").to_string_lossy().into_owned()
     }
 
+    /// A python helper that answers every request with the given raw line
+    /// (used for the protocol / deserialization error paths).
+    fn fixture_raw_response(body: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw_tool.py");
+        // A JSON string literal is also a valid Python string literal.
+        let literal = serde_json::to_string(body).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/usr/bin/env python3
+import sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    print({literal}, flush=True)
+"#
+            ),
+        )
+        .unwrap();
+        let kept = dir.keep();
+        kept.join("raw_tool.py").to_string_lossy().into_owned()
+    }
+
+    /// A python helper that never answers — used for the timeout path.
+    fn fixture_silent() -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silent_tool.py");
+        std::fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import sys, time
+time.sleep(30)
+"#,
+        )
+        .unwrap();
+        let kept = dir.keep();
+        kept.join("silent_tool.py").to_string_lossy().into_owned()
+    }
+
+    /// Build a tool-call context for the `execute` closures.
+    fn call_ctx(args: serde_json::Value) -> conga::ToolCallCtx {
+        conga::ToolCallCtx {
+            tool_call_id: "c1".into(),
+            args,
+            signal: Arc::new(AtomicBool::new(false)),
+            ctx: conga::ToolContext {
+                cwd: ".".into(),
+                env: HashMap::new(),
+                session_id: "t".into(),
+                state_dir: ".".into(),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn list_and_call_echo() {
         let script = fixture_script();
@@ -535,6 +591,289 @@ for line in sys.stdin:
         assert_eq!(
             effective_risk(Some(RiskLevel::High), RiskLevel::Low),
             RiskLevel::Low
+        );
+    }
+
+    // ── defaults and risk ordering ──
+
+    #[test]
+    fn empty_object_is_the_default_parameters_schema() {
+        let v = empty_object();
+        assert_eq!(v["type"], "object");
+        assert_eq!(v["properties"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn risk_rank_orders_the_three_levels() {
+        assert_eq!(risk_rank(RiskLevel::Low), 0);
+        assert_eq!(risk_rank(RiskLevel::Medium), 1);
+        assert_eq!(risk_rank(RiskLevel::High), 2);
+        assert!(risk_rank(RiskLevel::Low) < risk_rank(RiskLevel::Medium));
+        assert!(risk_rank(RiskLevel::Medium) < risk_rank(RiskLevel::High));
+    }
+
+    // ── the stdio protocol ──
+
+    #[tokio::test]
+    async fn list_returns_the_tools_the_process_reports() {
+        let script = fixture_script();
+        let (bridge, _tools) = ExternalToolBridge::spawn("python3", &[&script])
+            .await
+            .expect("spawn");
+        let listed = bridge.list().await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "echo");
+        assert_eq!(listed[0].description, "echo args");
+        assert_eq!(listed[0].risk.as_deref(), Some("low"));
+        assert_eq!(listed[0].parameters["properties"]["text"]["type"], "string");
+    }
+
+    #[tokio::test]
+    async fn call_sends_the_name_and_args_and_returns_the_response() {
+        let script = fixture_script();
+        let (bridge, _tools) = ExternalToolBridge::spawn("python3", &[&script])
+            .await
+            .expect("spawn");
+        let resp = bridge
+            .call("c9", "echo", &serde_json::json!({"text": "hi"}))
+            .await
+            .expect("call");
+        assert_eq!(resp.id, "c9");
+        assert!(!resp.is_error);
+        assert_eq!(resp.content.len(), 1);
+        assert_eq!(resp.content[0].kind, "text");
+        assert_eq!(resp.content[0].text, "hi");
+    }
+
+    #[tokio::test]
+    async fn roundtrip_writes_one_request_line_and_reads_one_response_line() {
+        let script = fixture_script();
+        let (bridge, _tools) = ExternalToolBridge::spawn("python3", &[&script])
+            .await
+            .expect("spawn");
+        let line = bridge
+            .roundtrip(r#"{"op":"list"}"#)
+            .await
+            .expect("roundtrip");
+        assert!(
+            !line.contains('\n'),
+            "the newline must be stripped: {line:?}"
+        );
+        assert!(!line.contains('\r'));
+        let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert!(v["tools"].is_array(), "got: {v}");
+    }
+
+    #[tokio::test]
+    async fn roundtrip_reports_an_empty_response_line() {
+        let script = fixture_raw_response("");
+        let err = match ExternalToolBridge::spawn("python3", &[&script]).await {
+            Err(e) => e,
+            Ok(_) => panic!("an empty response line must be a protocol error"),
+        };
+        match err {
+            ExternalToolError::Protocol(msg) => {
+                assert!(msg.contains("empty response line"), "got: {msg}")
+            }
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_reports_a_malformed_response_as_a_serde_error() {
+        let script = fixture_raw_response("not json");
+        let err = match ExternalToolBridge::spawn("python3", &[&script]).await {
+            Err(e) => e,
+            Ok(_) => panic!("a malformed response must fail the load"),
+        };
+        assert!(
+            matches!(err, ExternalToolError::Serde(_)),
+            "expected a serde error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_times_out_when_the_process_never_answers() {
+        let script = fixture_silent();
+        let err = match ExternalToolBridge::spawn_with_timeout(
+            "python3",
+            &[&script],
+            None,
+            Duration::from_millis(100),
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a silent process must time out"),
+        };
+        assert!(
+            matches!(err, ExternalToolError::Timeout),
+            "expected a timeout, got {err:?}"
+        );
+    }
+
+    // ── tool definition mapping ──
+
+    #[tokio::test]
+    async fn tool_definition_maps_the_listed_tool_onto_a_conga_tool() {
+        let script = fixture_script();
+        let (bridge, _tools) = ExternalToolBridge::spawn("python3", &[&script])
+            .await
+            .expect("spawn");
+        let listed = ListedTool {
+            name: "echo".into(),
+            description: "d".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            label: None,
+            risk: Some("low".into()),
+        };
+        let def = bridge.tool_definition(listed);
+        assert_eq!(def.name, "echo");
+        assert_eq!(def.label, "echo", "the label defaults to the name");
+        assert_eq!(def.description, "d");
+        assert_eq!(def.parameters["type"], "object");
+        // Self-reported "low" without an operator vouch → High.
+        assert_eq!(def.risk, RiskLevel::High);
+    }
+
+    #[tokio::test]
+    async fn tool_definition_keeps_an_explicit_label_and_the_vouched_risk() {
+        let script = fixture_script();
+        let (bridge, _tools) = ExternalToolBridge::spawn_with_timeout(
+            "python3",
+            &[&script],
+            Some(RiskLevel::Low),
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .expect("spawn");
+        let listed = ListedTool {
+            name: "echo".into(),
+            description: "d".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            label: Some("Echo!".into()),
+            risk: Some("low".into()),
+        };
+        let def = bridge.tool_definition(listed);
+        assert_eq!(def.label, "Echo!");
+        assert_eq!(def.risk, RiskLevel::Low);
+    }
+
+    #[tokio::test]
+    async fn tool_definition_execute_short_circuits_when_the_call_is_aborted() {
+        let script = fixture_script();
+        let (bridge, _tools) = ExternalToolBridge::spawn("python3", &[&script])
+            .await
+            .expect("spawn");
+        let listed = ListedTool {
+            name: "echo".into(),
+            description: "d".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            label: None,
+            risk: Some("low".into()),
+        };
+        let def = bridge.tool_definition(listed);
+        let mut ctx = call_ctx(serde_json::json!({"text": "hi"}));
+        ctx.signal = Arc::new(AtomicBool::new(true));
+        let result = (def.execute)(ctx).await.unwrap();
+        assert!(result.is_error);
+        match &result.content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "aborted"),
+            other => panic!("expected a text block, got {other:?}"),
+        }
+    }
+
+    // ── env parsing ──
+
+    #[test]
+    fn commands_from_env_reads_the_process_environment() {
+        let expected = commands_from(&|k| std::env::var(k));
+        assert_eq!(commands_from_env(), expected);
+    }
+
+    #[test]
+    fn parse_entry_extracts_the_trailing_risk_vouch() {
+        let e = parse_entry("python3 /tmp/a.py @low");
+        assert_eq!(e.argv, vec!["python3".to_string(), "/tmp/a.py".to_string()]);
+        assert_eq!(e.risk, Some(RiskLevel::Low));
+
+        let e = parse_entry("./bin/x");
+        assert_eq!(e.argv, vec!["./bin/x".to_string()]);
+        assert_eq!(e.risk, None);
+
+        // An unknown level token stays a literal argument.
+        let e = parse_entry("./bin/y @tier");
+        assert_eq!(e.argv, vec!["./bin/y".to_string(), "@tier".to_string()]);
+        assert_eq!(e.risk, None);
+
+        // An empty entry yields no argv at all.
+        let e = parse_entry("");
+        assert!(e.argv.is_empty());
+        assert_eq!(e.risk, None);
+    }
+
+    #[test]
+    fn parse_level_recognizes_only_the_known_levels() {
+        assert_eq!(parse_level("low"), Some(RiskLevel::Low));
+        assert_eq!(parse_level("MEDIUM"), Some(RiskLevel::Medium));
+        assert_eq!(parse_level("High"), Some(RiskLevel::High));
+        assert_eq!(parse_level("tier"), None);
+        assert_eq!(parse_level(""), None);
+        assert_eq!(parse_level("low medium"), None);
+    }
+
+    #[test]
+    fn shell_words_splits_on_whitespace_only() {
+        assert_eq!(shell_words("a b c"), vec!["a", "b", "c"]);
+        assert_eq!(shell_words("  a   b  "), vec!["a", "b"]);
+        assert_eq!(shell_words("a\tb"), vec!["a", "b"]);
+        assert_eq!(shell_words("a\nb"), vec!["a", "b"]);
+        assert!(shell_words("").is_empty());
+        assert!(shell_words("   ").is_empty());
+        // Quotes are NOT interpreted: the split is whitespace-only, so a
+        // space inside quotes still separates words and the quote
+        // characters stay in the tokens.
+        assert_eq!(shell_words("\"a b\""), vec!["\"a", "b\""]);
+        assert_eq!(shell_words("a 'b c'"), vec!["a", "'b", "c'"]);
+    }
+
+    // ── bulk loading ──
+
+    #[tokio::test]
+    async fn load_all_spawns_every_command_and_collects_the_tools() {
+        let script = fixture_script();
+        let cmds = vec![ExternalCommand {
+            argv: vec!["python3".to_string(), script],
+            risk: None,
+        }];
+        let tools = load_all(&cmds).await.expect("load");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+    }
+
+    #[tokio::test]
+    async fn load_all_rejects_an_empty_argv() {
+        let cmds = vec![ExternalCommand {
+            argv: Vec::new(),
+            risk: None,
+        }];
+        let err = load_all(&cmds).await.expect_err("must fail");
+        assert!(
+            matches!(err, ExternalToolError::Empty),
+            "expected the Empty error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_all_reports_a_spawn_failure() {
+        let cmds = vec![ExternalCommand {
+            argv: vec!["conga-no-such-external-tool-binary".to_string()],
+            risk: None,
+        }];
+        let err = load_all(&cmds).await.expect_err("must fail");
+        assert!(
+            matches!(err, ExternalToolError::Io(_)),
+            "expected an io error, got {err:?}"
         );
     }
 }

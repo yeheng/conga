@@ -193,6 +193,25 @@ mod tests {
         }))
     }
 
+    /// An assistant event carrying provider usage (the rows `cache_stats`
+    /// folds).
+    fn assistant_event_with_usage(
+        input_tokens: u64,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+    ) -> SessionEvent {
+        use conga::{AgentMessage, Usage};
+        SessionEvent::Assistant {
+            message: AgentMessage::assistant_text("ok"),
+            usage: Some(Usage {
+                input_tokens,
+                output_tokens: 1,
+                cache_read_tokens,
+                cache_write_tokens,
+            }),
+        }
+    }
+
     #[tokio::test]
     async fn messages_none_for_unknown_session_some_after_write() {
         let tmp = tempfile::tempdir().unwrap();
@@ -258,5 +277,183 @@ mod tests {
             SEEN.lock().unwrap().contains(&"sess-hook".to_string()),
             "delete must run cleanup hooks for the removed session"
         );
+    }
+
+    // ---- SessionApiError::fmt ----
+
+    #[test]
+    fn session_api_error_displays_only_its_message() {
+        assert_eq!(
+            SessionApiError::BadRequest("invalid session id".into()).to_string(),
+            "invalid session id"
+        );
+        assert_eq!(
+            SessionApiError::NotFound("no such session".into()).to_string(),
+            "no such session"
+        );
+        assert_eq!(
+            SessionApiError::Internal("disk on fire".into()).to_string(),
+            "disk on fire"
+        );
+        // The variant name must not leak into the message: transports map the
+        // variant to a status code, the message goes to the user.
+        let rendered = SessionApiError::BadRequest("invalid session id".into()).to_string();
+        assert!(!rendered.contains("BadRequest"), "{rendered}");
+        assert!(!rendered.contains("SessionApiError"), "{rendered}");
+    }
+
+    #[test]
+    fn session_api_error_displays_an_empty_message() {
+        assert_eq!(SessionApiError::Internal(String::new()).to_string(), "");
+    }
+
+    // ---- session_cache_stats ----
+
+    #[tokio::test]
+    async fn cache_stats_are_none_for_a_session_without_on_disk_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            session_cache_stats(tmp.path(), "ghost")
+                .await
+                .unwrap()
+                .is_none(),
+            "no on-disk data means no stats (not zeroed stats)"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_stats_fold_the_usage_rows_of_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path().to_path_buf());
+        store
+            .append_event(
+                "sess-1",
+                &assistant_event_with_usage(100, Some(40), Some(10)),
+            )
+            .await
+            .unwrap();
+        store
+            .append_event("sess-1", &assistant_event_with_usage(50, None, None))
+            .await
+            .unwrap();
+        let stats = session_cache_stats(tmp.path(), "sess-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.input_tokens, 150);
+        assert_eq!(stats.cache_read_tokens, 40);
+        assert_eq!(stats.cache_write_tokens, 10);
+        assert_eq!(stats.calls, 2);
+        assert_eq!(
+            stats.cache_reporting_calls, 1,
+            "only the row that reported cache fields counts"
+        );
+        assert_eq!(stats.hit_rate(), Some(40.0 / 150.0));
+    }
+
+    #[tokio::test]
+    async fn cache_stats_of_a_session_without_usage_are_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        EventStorage::new(tmp.path().to_path_buf())
+            .append_event("sess-1", &user_event("hello"))
+            .await
+            .unwrap();
+        let stats = session_cache_stats(tmp.path(), "sess-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.calls, 0);
+        assert_eq!(stats.input_tokens, 0);
+        assert_eq!(stats.hit_rate(), None, "no usage → no hit rate");
+    }
+
+    #[tokio::test]
+    async fn cache_stats_ignore_rows_before_a_cleared_marker() {
+        // The scope matches the conversation: a `/clear` restarts the count.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStorage::new(tmp.path().to_path_buf());
+        store
+            .append_event(
+                "sess-1",
+                &assistant_event_with_usage(100, Some(40), Some(10)),
+            )
+            .await
+            .unwrap();
+        store
+            .append_event("sess-1", &SessionEvent::Cleared)
+            .await
+            .unwrap();
+        store
+            .append_event("sess-1", &assistant_event_with_usage(10, None, None))
+            .await
+            .unwrap();
+        let stats = session_cache_stats(tmp.path(), "sess-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.input_tokens, 10);
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.cache_read_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn cache_stats_of_a_corrupt_log_are_an_internal_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sess-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Mid-file damage (not a torn tail) must fail loud.
+        let good = serde_json::to_string(&user_event("ok")).unwrap();
+        std::fs::write(
+            dir.join("events.jsonl"),
+            format!("{good}\nNOT_JSON\n{good}\n"),
+        )
+        .unwrap();
+        let err = session_cache_stats(tmp.path(), "sess-1").await.unwrap_err();
+        assert!(
+            matches!(err, SessionApiError::Internal(_)),
+            "a corrupt log must surface as Internal, got {err:?}"
+        );
+    }
+
+    // ---- search_sessions ----
+
+    #[cfg(feature = "session-index")]
+    #[tokio::test]
+    async fn search_sessions_rejects_a_blank_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("index.db");
+        assert!(
+            matches!(
+                search_sessions(tmp.path(), &db, "   ", 10).await,
+                Err(SessionApiError::BadRequest(_))
+            ),
+            "a blank query must be rejected before touching the index"
+        );
+        assert!(matches!(
+            search_sessions(tmp.path(), &db, "", 10).await,
+            Err(SessionApiError::BadRequest(_))
+        ));
+    }
+
+    #[cfg(feature = "session-index")]
+    #[tokio::test]
+    async fn search_sessions_finds_the_matching_sessions() {
+        let store_root = tempfile::tempdir().unwrap();
+        let db_root = tempfile::tempdir().unwrap();
+        let db = db_root.path().join("index.db");
+        EventStorage::new(store_root.path().to_path_buf())
+            .append_event("sess-1", &user_event("the flaky test failed"))
+            .await
+            .unwrap();
+        EventStorage::new(store_root.path().to_path_buf())
+            .append_event("sess-2", &user_event("unrelated chatter"))
+            .await
+            .unwrap();
+        let hits = search_sessions(store_root.path(), &db, "flaky", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "sess-1");
+        assert!(hits[0].snippet.contains("flaky"));
     }
 }

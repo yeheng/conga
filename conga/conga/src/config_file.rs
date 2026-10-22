@@ -615,4 +615,541 @@ key = ""
             assert!(names.iter().any(|(n, _)| n == k), "missing {k}");
         }
     }
+
+    // ---- push_str / push_num / push_bool -------------------------------
+
+    /// `push_str` skips a missing value and an EMPTY string (templates may
+    /// ship placeholder blanks), but keeps any other string - including
+    /// whitespace-only ones.
+    #[test]
+    fn push_str_skips_missing_and_empty_values() {
+        let mut out = Vec::new();
+        push_str(&mut out, "CONGA_MISSING", &None);
+        push_str(&mut out, "CONGA_EMPTY", &Some(String::new()));
+        push_str(&mut out, "CONGA_BLANK", &Some("   ".to_string()));
+        push_str(&mut out, "CONGA_SET", &Some("value".to_string()));
+        assert_eq!(
+            out,
+            vec![
+                ("CONGA_BLANK".to_string(), "   ".to_string()),
+                ("CONGA_SET".to_string(), "value".to_string()),
+            ]
+        );
+    }
+
+    /// `push_num` renders the number as its decimal string; zero is a real
+    /// value (not "unset") and is kept.
+    #[test]
+    fn push_num_renders_zero_and_max() {
+        let mut out = Vec::new();
+        push_num(&mut out, "CONGA_NONE", &None);
+        push_num(&mut out, "CONGA_ZERO", &Some(0));
+        push_num(&mut out, "CONGA_MAX", &Some(u64::MAX));
+        assert_eq!(
+            out,
+            vec![
+                ("CONGA_ZERO".to_string(), "0".to_string()),
+                ("CONGA_MAX".to_string(), u64::MAX.to_string()),
+            ]
+        );
+    }
+
+    /// `push_bool` renders `true` as "1" and `false` as "0" - the form every
+    /// parse site checks.
+    #[test]
+    fn push_bool_renders_one_and_zero() {
+        let mut out = Vec::new();
+        push_bool(&mut out, "CONGA_NONE", &None);
+        push_bool(&mut out, "CONGA_TRUE", &Some(true));
+        push_bool(&mut out, "CONGA_FALSE", &Some(false));
+        assert_eq!(
+            out,
+            vec![
+                ("CONGA_TRUE".to_string(), "1".to_string()),
+                ("CONGA_FALSE".to_string(), "0".to_string()),
+            ]
+        );
+    }
+
+    /// A duplicate key inside one TOML table is a parse error, not a
+    /// silent "last one wins".
+    #[test]
+    fn duplicate_key_in_one_table_fails_loud() {
+        let e = toml::from_str::<ConfigFile>(
+            "[llm]\nbase_url = \"https://a\"\nbase_url = \"https://b\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string().contains("base_url"),
+            "must name the duplicated key: {e}"
+        );
+    }
+
+    /// Every section pushes its own env names - checked directly on the
+    /// section helpers, not only through `env_pairs`.
+    #[test]
+    fn every_section_pushes_its_own_env_names() {
+        let mut out = Vec::new();
+        LlmSection {
+            base_url: Some("u".into()),
+            key: Some("k".into()),
+            model: Some("m".into()),
+            api: Some("anthropic".into()),
+        }
+        .push(&mut out, "CONGA_LLM");
+        assert_eq!(
+            out,
+            vec![
+                ("CONGA_LLM_BASE_URL".to_string(), "u".to_string()),
+                ("CONGA_LLM_KEY".to_string(), "k".to_string()),
+                ("CONGA_LLM_MODEL".to_string(), "m".to_string()),
+                ("CONGA_LLM_API".to_string(), "anthropic".to_string()),
+            ]
+        );
+
+        let mut out = Vec::new();
+        ProxySection {
+            llm: Some("http://p".into()),
+            llm_http: None,
+            llm_https: None,
+            tool: Some("socks5://t".into()),
+        }
+        .push(&mut out);
+        assert_eq!(
+            out,
+            vec![
+                ("CONGA_LLM_PROXY".to_string(), "http://p".to_string()),
+                ("CONGA_TOOL_PROXY".to_string(), "socks5://t".to_string()),
+            ]
+        );
+
+        let mut out = Vec::new();
+        TunablesSection {
+            max_turns: Some(1),
+            max_tool_calls: None,
+            max_tokens: Some(2),
+            retry_max: None,
+            retry_initial_ms: None,
+            retry_max_ms: None,
+            tool_timeout_s: None,
+        }
+        .push(&mut out);
+        assert_eq!(
+            out,
+            vec![
+                ("CONGA_MAX_TURNS".to_string(), "1".to_string()),
+                ("CONGA_MAX_TOKENS".to_string(), "2".to_string()),
+            ]
+        );
+
+        let mut out = Vec::new();
+        GatewaySection {
+            port: Some(3000),
+            host: Some("0.0.0.0".into()),
+            mode: Some("plan".into()),
+            approval_timeout_s: None,
+            token: None,
+            cors_origins: None,
+        }
+        .push(&mut out);
+        assert_eq!(
+            out,
+            vec![
+                ("CONGA_GATEWAY_PORT".to_string(), "3000".to_string()),
+                ("CONGA_GATEWAY_HOST".to_string(), "0.0.0.0".to_string()),
+                ("CONGA_GATEWAY_MODE".to_string(), "plan".to_string()),
+            ]
+        );
+
+        let mut out = Vec::new();
+        CompactSection {
+            context_window: Some(64000),
+            threshold_pct: None,
+            target_pct: None,
+            max_messages: None,
+        }
+        .push(&mut out);
+        assert_eq!(
+            out,
+            vec![("CONGA_CONTEXT_WINDOW".to_string(), "64000".to_string())]
+        );
+
+        let mut out = Vec::new();
+        ToolsSection {
+            external_tools: None,
+            mcp_config: None,
+            mcp_call_timeout_s: Some(90),
+            fetch_allow_private_net: Some(false),
+            sandbox: Some(true),
+            project_dir: None,
+        }
+        .push(&mut out);
+        assert_eq!(
+            out,
+            vec![
+                ("CONGA_MCP_CALL_TIMEOUT_S".to_string(), "90".to_string()),
+                ("CONGA_FETCH_ALLOW_PRIVATE_NET".to_string(), "0".to_string()),
+                ("CONGA_SANDBOX".to_string(), "1".to_string()),
+            ]
+        );
+
+        let mut out = Vec::new();
+        SearchSection {
+            provider: Some("brave".into()),
+            brave_api_key: Some("bk".into()),
+            tavily_api_key: None,
+            serper_api_key: None,
+            serpapi_api_key: None,
+            exa_api_key: None,
+            firecrawl_api_key: None,
+        }
+        .push(&mut out);
+        assert_eq!(
+            out,
+            vec![
+                ("CONGA_SEARCH_PROVIDER".to_string(), "brave".to_string()),
+                ("CONGA_BRAVE_API_KEY".to_string(), "bk".to_string()),
+            ]
+        );
+
+        let mut out = Vec::new();
+        RagSection {
+            config: None,
+            embed_base_url: None,
+            embed_key: None,
+            embed_model: None,
+            embed_batch: Some(8),
+            store_path: None,
+        }
+        .push(&mut out);
+        assert_eq!(
+            out,
+            vec![("CONGA_RAG_EMBED_BATCH".to_string(), "8".to_string())]
+        );
+    }
+
+    // ---- apply() ---------------------------------------------------------
+
+    /// Env vars the child probe reports back to the parent test.
+    const PROBE_ENV_KEYS: &[&str] = &[
+        "CONGA_PROJECT_DIR",
+        "CONGA_MAX_TURNS",
+        "CONGA_SANDBOX",
+        "CONGA_LLM_MODEL",
+    ];
+
+    /// What the child process reported about its `apply()` call.
+    struct ApplyReport {
+        /// `ok:<path>`, `ok:none` or `err:<message>`.
+        outcome: String,
+        /// The env vars the child saw after `apply()` ran.
+        env: Vec<(String, String)>,
+    }
+
+    impl ApplyReport {
+        fn env_of(&self, key: &str) -> Option<&str> {
+            self.env
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// `apply()` mutates the *process* environment and reads the user's home
+    /// directory, so exercising it in-process would leak state into the rest
+    /// of the test binary. The probe therefore runs in a hermetic child
+    /// process (fresh HOME, fresh working directory, cleared environment)
+    /// and prints a machine-readable report the parent asserts on.
+    #[test]
+    #[ignore = "helper spawned as a child process by the apply_* tests"]
+    fn apply_probe() {
+        // The parent marks the child through the environment; without the
+        // marker this test does nothing.
+        if std::env::var("CONGA_TEST_APPLY_PROBE").is_err() {
+            return;
+        }
+        let outcome = match apply() {
+            Ok(Some(path)) => format!("ok:{}", path.display()),
+            Ok(None) => "ok:none".to_string(),
+            Err(e) => format!("err:{e}"),
+        };
+        println!("APPLY_OUTCOME={outcome}");
+        for key in PROBE_ENV_KEYS {
+            let value = std::env::var(key).unwrap_or_else(|_| "<unset>".to_string());
+            println!("APPLY_ENV {key}={value}");
+        }
+    }
+
+    /// Run `apply()` in a hermetic child process and collect its report.
+    fn run_apply_in_child(home: &Path, cwd: &Path, env: &[(&str, &str)]) -> ApplyReport {
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "--ignored",
+            "--exact",
+            "config_file::tests::apply_probe",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        // A cleared environment: no inherited CONGA_* vars, no HOME leak.
+        .env_clear()
+        .env("HOME", home)
+        .env("CONGA_TEST_APPLY_PROBE", "1")
+        .current_dir(cwd);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("spawn apply probe");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success(),
+            "apply probe failed ({:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            out.status
+        );
+        let mut env_out = Vec::new();
+        for line in stdout.lines() {
+            if let Some(idx) = line.find("APPLY_ENV ") {
+                let rest = &line[idx + "APPLY_ENV ".len()..];
+                if let Some((k, v)) = rest.split_once('=') {
+                    env_out.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+        // The outcome may span several lines (a TOML parse error prints a
+        // snippet), so it runs until the first env marker.
+        let outcome = match stdout.find("APPLY_OUTCOME=") {
+            Some(idx) => {
+                let rest = &stdout[idx + "APPLY_OUTCOME=".len()..];
+                let end = rest.find("\nAPPLY_ENV ").unwrap_or(rest.len());
+                rest[..end].trim().to_string()
+            }
+            None => panic!(
+                "apply probe must print APPLY_OUTCOME\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            ),
+        };
+        ApplyReport {
+            outcome,
+            env: env_out,
+        }
+    }
+
+    /// Write a config file and return its path.
+    fn write_config(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Happy path: the config file is applied to the process environment.
+    #[test]
+    fn apply_sets_config_values_into_the_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cfg = write_config(
+            tmp.path(),
+            "config.toml",
+            "[tools]\nproject_dir = \"/tmp/proj\"\nsandbox = true\n\n[tunables]\nmax_turns = 7\n",
+        );
+
+        let report = run_apply_in_child(
+            &home,
+            &cwd,
+            &[("CONGA_CONFIG", cfg.to_str().unwrap())],
+        );
+        assert_eq!(
+            report.outcome,
+            format!("ok:{}", cfg.display()),
+            "apply must report the file it applied"
+        );
+        assert_eq!(report.env_of("CONGA_PROJECT_DIR"), Some("/tmp/proj"));
+        assert_eq!(report.env_of("CONGA_MAX_TURNS"), Some("7"));
+        assert_eq!(report.env_of("CONGA_SANDBOX"), Some("1"));
+    }
+
+    /// The real process environment wins over the file: an already-set var
+    /// is never overwritten.
+    #[test]
+    fn apply_keeps_an_already_set_env_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cfg = write_config(
+            tmp.path(),
+            "config.toml",
+            "[tools]\nproject_dir = \"/tmp/from-file\"\n",
+        );
+
+        let report = run_apply_in_child(
+            &home,
+            &cwd,
+            &[
+                ("CONGA_CONFIG", cfg.to_str().unwrap()),
+                ("CONGA_PROJECT_DIR", "/tmp/from-env"),
+            ],
+        );
+        assert!(report.outcome.starts_with("ok:"), "{}", report.outcome);
+        assert_eq!(
+            report.env_of("CONGA_PROJECT_DIR"),
+            Some("/tmp/from-env"),
+            "an already-set env var must not be overwritten by the file"
+        );
+    }
+
+    /// A missing `CONGA_CONFIG` file fails loud - it never falls back to the
+    /// project/home discovery.
+    #[test]
+    fn apply_fails_loud_when_the_explicit_config_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        // A project-level file exists but must NOT be used as a fallback.
+        write_config(&cwd, ".conga/config.toml", "[tools]\nproject_dir = \"/p\"\n");
+        let missing = tmp.path().join("no-such-config.toml");
+
+        let report = run_apply_in_child(
+            &home,
+            &cwd,
+            &[("CONGA_CONFIG", missing.to_str().unwrap())],
+        );
+        assert!(report.outcome.starts_with("err:"), "{}", report.outcome);
+        assert!(
+            report.outcome.contains("CONGA_CONFIG"),
+            "must name the var: {}",
+            report.outcome
+        );
+        assert!(
+            report.outcome.contains("no-such-config.toml"),
+            "must name the path: {}",
+            report.outcome
+        );
+    }
+
+    /// A malformed config file is a parse error naming the file.
+    #[test]
+    fn apply_fails_loud_on_an_invalid_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cfg = write_config(tmp.path(), "config.toml", "[llm]\nbase_urL = \"typo\"\n");
+
+        let report = run_apply_in_child(
+            &home,
+            &cwd,
+            &[("CONGA_CONFIG", cfg.to_str().unwrap())],
+        );
+        assert!(report.outcome.starts_with("err:"), "{}", report.outcome);
+        assert!(
+            report.outcome.contains("invalid config.toml"),
+            "must name the failure: {}",
+            report.outcome
+        );
+        assert!(
+            report.outcome.contains("base_urL"),
+            "must name the offending key: {}",
+            report.outcome
+        );
+    }
+
+    /// No config file anywhere: `apply()` is a no-op that reports "nothing
+    /// found" instead of failing.
+    #[test]
+    fn apply_is_a_noop_without_any_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let report = run_apply_in_child(&home, &cwd, &[]);
+        assert_eq!(report.outcome, "ok:none");
+        assert_eq!(report.env_of("CONGA_PROJECT_DIR"), Some("<unset>"));
+    }
+
+    /// Discovery order: explicit file > project file > home file.
+    #[test]
+    fn apply_prefers_explicit_then_project_then_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(home.join(".conga")).unwrap();
+        std::fs::create_dir_all(cwd.join(".conga")).unwrap();
+        let explicit = write_config(
+            tmp.path(),
+            "explicit.toml",
+            "[tools]\nproject_dir = \"/explicit\"\n",
+        );
+        write_config(&cwd, ".conga/config.toml", "[tools]\nproject_dir = \"/project\"\n");
+        write_config(
+            &home,
+            ".conga/config.toml",
+            "[tools]\nproject_dir = \"/home\"\n",
+        );
+
+        // 1. explicit wins
+        let report = run_apply_in_child(
+            &home,
+            &cwd,
+            &[("CONGA_CONFIG", explicit.to_str().unwrap())],
+        );
+        assert_eq!(report.outcome, format!("ok:{}", explicit.display()));
+        assert_eq!(report.env_of("CONGA_PROJECT_DIR"), Some("/explicit"));
+
+        // 2. project beats home
+        let report = run_apply_in_child(&home, &cwd, &[]);
+        assert!(
+            report.outcome.ends_with(".conga/config.toml"),
+            "project file must win: {}",
+            report.outcome
+        );
+        assert_eq!(report.env_of("CONGA_PROJECT_DIR"), Some("/project"));
+
+        // 3. home is the last fallback
+        let empty_cwd = tmp.path().join("empty-cwd");
+        std::fs::create_dir_all(&empty_cwd).unwrap();
+        let report = run_apply_in_child(&home, &empty_cwd, &[]);
+        assert!(
+            report.outcome.ends_with(".conga/config.toml"),
+            "home file must be the fallback: {}",
+            report.outcome
+        );
+        assert_eq!(report.env_of("CONGA_PROJECT_DIR"), Some("/home"));
+    }
+
+    /// An empty config file changes nothing (no env var is invented).
+    #[test]
+    fn apply_of_an_empty_file_sets_no_variables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cfg = write_config(tmp.path(), "config.toml", "");
+
+        let report = run_apply_in_child(
+            &home,
+            &cwd,
+            &[("CONGA_CONFIG", cfg.to_str().unwrap())],
+        );
+        assert_eq!(report.outcome, format!("ok:{}", cfg.display()));
+        for key in PROBE_ENV_KEYS {
+            assert_eq!(
+                report.env_of(key),
+                Some("<unset>"),
+                "an empty config must not set {key}"
+            );
+        }
+    }
 }

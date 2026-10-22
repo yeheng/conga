@@ -322,6 +322,112 @@ mod tests {
     }
 
     #[test]
+    fn find_project_doc_returns_nothing_without_a_doc() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(find_project_doc(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn find_project_doc_returns_the_path_and_the_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("AGENTS.md");
+        std::fs::write(&file, "# Rules\nBe terse.").unwrap();
+        let (path, content) = find_project_doc(tmp.path()).unwrap();
+        assert_eq!(path, file);
+        assert!(content.contains("Be terse."));
+    }
+
+    #[test]
+    fn find_project_doc_prefers_agents_md_over_claude_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "agents-wins").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "claude-loses").unwrap();
+        let (path, content) = find_project_doc(tmp.path()).unwrap();
+        assert_eq!(path.file_name().unwrap(), "AGENTS.md");
+        assert!(content.contains("agents-wins"));
+    }
+
+    #[test]
+    fn find_project_doc_skips_a_blank_file_and_keeps_walking_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        // A whitespace-only doc is not a doc: the search continues.
+        std::fs::write(sub.join("AGENTS.md"), "   \n\t\n").unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "from-parent").unwrap();
+        let (path, content) = find_project_doc(&sub).unwrap();
+        assert_eq!(path, tmp.path().join("AGENTS.md"));
+        assert!(content.contains("from-parent"));
+    }
+
+    #[test]
+    fn find_project_doc_stops_after_eight_levels() {
+        // The walk-up is capped at 8 directories (the start dir + 7
+        // ancestors): a doc that sits 8 levels above the start is NOT found.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut deep = tmp.path().to_path_buf();
+        for _ in 0..8 {
+            deep = deep.join("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "too-far").unwrap();
+        assert!(find_project_doc(&deep).is_none(), "the 8-level cap must hold");
+        // One level less is still found.
+        let mut near = tmp.path().to_path_buf();
+        for _ in 0..7 {
+            near = near.join("d");
+        }
+        std::fs::create_dir_all(&near).unwrap();
+        assert!(find_project_doc(&near).is_some());
+    }
+
+    #[tokio::test]
+    async fn git_output_returns_none_outside_a_git_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(git_output(tmp.path(), &["status", "--porcelain"], 64, "omitted")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn git_output_returns_none_for_a_failing_command() {
+        let cwd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Inside the repo, but the ref does not exist -> nonzero exit.
+        assert!(git_output(cwd, &["rev-parse", "--verify", "no-such-ref"], 64, "omitted")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn git_output_returns_an_empty_string_for_empty_output() {
+        let cwd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = git_output(cwd, &["log", "--oneline", "-n", "0"], 10, "omitted")
+            .await
+            .unwrap();
+        assert_eq!(out, "");
+    }
+
+    #[tokio::test]
+    async fn git_output_caps_the_line_count_and_appends_the_note() {
+        let cwd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = git_output(cwd, &["log", "--oneline", "-n", "5"], 2, "log lines omitted")
+            .await
+            .unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "2 kept lines + the omission note: {out}");
+        assert!(lines[2].contains("[... 3 log lines omitted ...]"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn git_output_keeps_short_output_verbatim() {
+        let cwd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = git_output(cwd, &["rev-parse", "--is-inside-work-tree"], 64, "omitted")
+            .await
+            .unwrap();
+        assert_eq!(out, "true");
+    }
+
+    #[test]
     fn civil_from_days_epoch() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));

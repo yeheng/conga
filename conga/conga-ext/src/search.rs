@@ -613,6 +613,163 @@ pub fn register(api: &mut dyn ExtensionApi) {
 mod tests {
     use super::*;
 
+    // ── Local HTTP fixtures ─────────────────────────────────────
+    // Every test in this module talks to a LOCAL server (127.0.0.1) or to a
+    // local capture proxy: no test ever reaches a real search vendor.
+    // `no_proxy()` is mandatory here: the machine runs with
+    // HTTP_PROXY/HTTPS_PROXY set, and a proxied request would leave the
+    // machine (and hit the real vendor through the proxy).
+
+    /// A request as the fake server saw it.
+    #[derive(Debug, Default)]
+    struct CapturedRequest {
+        method: String,
+        target: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl CapturedRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// A client that never uses the ambient proxy configuration.
+    fn local_client() -> Client {
+        Client::builder().no_proxy().build().expect("client builds")
+    }
+
+    fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Serve exactly one request with `status`/`body`, and hand the captured
+    /// request back over a oneshot channel.
+    async fn spawn_http_server(
+        status: u16,
+        body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<CapturedRequest>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let head_end = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(p) = find_sub(&buf, b"\r\n\r\n") {
+                    break p + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let mut lines = head.lines();
+            let request_line = lines.next().unwrap_or_default().to_string();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_string();
+            let target = parts.next().unwrap_or_default().to_string();
+            let mut headers: Vec<(String, String)> = Vec::new();
+            let mut content_length = 0usize;
+            for line in lines {
+                if let Some((k, v)) = line.split_once(':') {
+                    let k = k.trim().to_string();
+                    let v = v.trim().to_string();
+                    if k.eq_ignore_ascii_case("content-length") {
+                        content_length = v.parse().unwrap_or(0);
+                    }
+                    headers.push((k, v));
+                }
+            }
+            let mut body_bytes = buf[head_end..].to_vec();
+            while body_bytes.len() < content_length {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                body_bytes.extend_from_slice(&tmp[..n]);
+            }
+            let _ = tx.send(CapturedRequest {
+                method,
+                target,
+                headers,
+                body: String::from_utf8_lossy(&body_bytes).to_string(),
+            });
+            let resp = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// A local proxy that records the request line of the first connection.
+    /// Used to observe WHICH host a provider function talks to without any
+    /// traffic leaving the machine: the proxy grants the CONNECT tunnel and
+    /// closes, so the client's TLS handshake fails right after.
+    async fn spawn_capture_proxy() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = String::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.push_str(&String::from_utf8_lossy(&tmp[..n]));
+                if head.contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(head.clone());
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await;
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// Run a provider function against the capture proxy and return the
+    /// request line the proxy saw plus the error the function reported.
+    async fn probe_provider<F, Fut>(f: F) -> (String, String)
+    where
+        F: FnOnce(Client) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<SearchHit>, ToolError>>,
+    {
+        let (proxy_url, rx) = spawn_capture_proxy().await;
+        // An explicit proxy disables the ambient system proxy (reqwest).
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(&proxy_url).unwrap())
+            .build()
+            .expect("client builds");
+        let err = match f(client).await {
+            Ok(_) => panic!("expected the tunnel-less proxy to fail the request"),
+            Err(e) => e.to_string(),
+        };
+        let head = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("proxy never saw the request")
+            .expect("proxy task died");
+        (head, err)
+    }
+
     // ── Vendor JSON shape contracts ──────────────────────────────
     // Each test pins the serde field mapping against a canned response in the
     // vendor's real shape. A vendor renaming a field fails here, not in prod.
@@ -863,5 +1020,358 @@ mod tests {
             head.starts_with("CONNECT html.duckduckgo.com:443 HTTP/1.1"),
             "proxy saw: {head}"
         );
+    }
+
+    // ── Shared HTTP helpers (send_get / send_post_json / check_status) ──
+
+    #[tokio::test]
+    async fn send_get_sends_method_target_and_auth_header() {
+        let (base, rx) = spawn_http_server(
+            200,
+            r#"{"organic":[{"title":"Rust Lang","snippet":"A language","link":"https://rust-lang.org"}]}"#,
+        )
+        .await;
+        let client = local_client();
+        let url = format!("{base}/search?q=rust&count=3");
+
+        let resp: SerperSearchResponse =
+            send_get(&client, &url, Some(("X-API-KEY", "secret-key")), "Serper")
+                .await
+                .expect("provider response parses");
+
+        assert_eq!(resp.organic.len(), 1);
+        assert_eq!(resp.organic[0].title, "Rust Lang");
+
+        let req = rx.await.expect("server task died");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.target, "/search?q=rust&count=3");
+        assert_eq!(req.header("x-api-key"), Some("secret-key"));
+        assert_eq!(req.header("accept"), Some("application/json"));
+        assert_eq!(req.body, "", "a GET carries no body");
+    }
+
+    #[tokio::test]
+    async fn send_get_without_auth_header_sends_none() {
+        let (base, rx) = spawn_http_server(200, r#"{"organic_results":[]}"#).await;
+        let client = local_client();
+        let url = format!("{base}/search?api_key=k&engine=google&q=rust&num=5");
+
+        let resp: SerpApiSearchResponse = send_get(&client, &url, None, "SerpAPI")
+            .await
+            .expect("provider response parses");
+        assert!(resp.organic_results.is_empty());
+
+        let req = rx.await.expect("server task died");
+        assert_eq!(req.method, "GET");
+        assert_eq!(
+            req.target, "/search?api_key=k&engine=google&q=rust&num=5",
+            "the query string is forwarded verbatim"
+        );
+        assert_eq!(req.header("authorization"), None);
+    }
+
+    #[tokio::test]
+    async fn send_get_reports_http_error_status() {
+        let (base, _rx) = spawn_http_server(500, "{}").await;
+        let client = local_client();
+        let err =
+            send_get::<SerperSearchResponse>(&client, &format!("{base}/search"), None, "Serper")
+                .await
+                .expect_err("a 500 must fail");
+        assert!(
+            err.to_string().contains("Serper API error (status 500"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_get_reports_parse_error() {
+        let (base, _rx) = spawn_http_server(200, "this is not json").await;
+        let client = local_client();
+        let err =
+            send_get::<SerperSearchResponse>(&client, &format!("{base}/search"), None, "Serper")
+                .await
+                .expect_err("a broken body must fail");
+        assert!(
+            err.to_string()
+                .contains("Failed to parse Serper API response"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_get_reports_transport_error() {
+        // A port nobody listens on: the connection is refused locally.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = local_client();
+        let err = send_get::<SerperSearchResponse>(
+            &client,
+            &format!("http://{addr}/search"),
+            None,
+            "Serper",
+        )
+        .await
+        .expect_err("an unreachable host must fail");
+        assert!(
+            err.to_string().contains("Serper API request failed"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_post_json_sends_body_content_type_and_auth_header() {
+        let (base, rx) = spawn_http_server(
+            200,
+            r#"{"results":[{"title":"T","content":"C","url":"https://v.example"}]}"#,
+        )
+        .await;
+        let client = local_client();
+        let body = serde_json::json!({
+            "api_key": "k",
+            "query": "rust 语言",
+            "max_results": 3,
+            "search_depth": "basic"
+        });
+
+        let resp: TavilySearchResponse =
+            send_post_json(&client, &format!("{base}/search"), &body, None, "Tavily")
+                .await
+                .expect("provider response parses");
+        assert_eq!(resp.results[0].title, "T");
+
+        let req = rx.await.expect("server task died");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.target, "/search");
+        assert_eq!(req.header("content-type"), Some("application/json"));
+        let sent: serde_json::Value = serde_json::from_str(&req.body).expect("body is JSON");
+        assert_eq!(sent, body, "the JSON body is forwarded verbatim");
+        assert_eq!(
+            sent["query"], "rust 语言",
+            "unicode survives the round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_post_json_reports_http_error_status() {
+        let (base, _rx) = spawn_http_server(400, "{}").await;
+        let client = local_client();
+        let err = send_post_json::<TavilySearchResponse>(
+            &client,
+            &format!("{base}/search"),
+            &serde_json::json!({"query": "x"}),
+            None,
+            "Tavily",
+        )
+        .await
+        .expect_err("a 400 must fail");
+        assert!(
+            err.to_string().contains("Tavily API error (status 400"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_post_json_reports_parse_error() {
+        let (base, _rx) = spawn_http_server(200, "<html>nope</html>").await;
+        let client = local_client();
+        let err = send_post_json::<TavilySearchResponse>(
+            &client,
+            &format!("{base}/search"),
+            &serde_json::json!({"query": "x"}),
+            None,
+            "Tavily",
+        )
+        .await
+        .expect_err("a broken body must fail");
+        assert!(
+            err.to_string()
+                .contains("Failed to parse Tavily API response"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_status_accepts_success_and_rejects_failures() {
+        let client = local_client();
+        let (ok_base, _rx) = spawn_http_server(200, "{}").await;
+        let resp = client.get(format!("{ok_base}/ok")).send().await.unwrap();
+        assert!(check_status(&resp, "Brave").await.is_ok());
+
+        let (missing_base, _rx2) = spawn_http_server(404, "{}").await;
+        let resp = client
+            .get(format!("{missing_base}/missing"))
+            .send()
+            .await
+            .unwrap();
+        let err = check_status(&resp, "Brave")
+            .await
+            .expect_err("404 must fail");
+        assert!(
+            err.to_string().contains("Brave API error (status 404"),
+            "{err}"
+        );
+
+        let (boom_base, _rx3) = spawn_http_server(503, "{}").await;
+        let resp = client
+            .get(format!("{boom_base}/boom"))
+            .send()
+            .await
+            .unwrap();
+        let err = check_status(&resp, "Brave")
+            .await
+            .expect_err("503 must fail");
+        assert!(
+            err.to_string().contains("Brave API error (status 503"),
+            "{err}"
+        );
+    }
+
+    // ── API-key handling ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn with_api_key_reports_a_missing_env_var() {
+        let res = with_api_key("CONGA_TEST_UNSET_API_KEY_PROBE", |_key| async {
+            Ok(Vec::new())
+        })
+        .await;
+        // `SearchHit` has no Debug impl: unwrap the error by hand.
+        let err = match res {
+            Ok(_) => panic!("an unset key must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("CONGA_TEST_UNSET_API_KEY_PROBE not set"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_api_key_hands_the_env_value_to_the_provider() {
+        // PATH is always set: reading it proves the value is forwarded
+        // verbatim without touching the process environment.
+        let expected = std::env::var("PATH").expect("PATH is set");
+        let hits = with_api_key("PATH", |key| async move {
+            Ok(vec![SearchHit {
+                title: key,
+                snippet: "s".into(),
+                url: "u".into(),
+            }])
+        })
+        .await
+        .expect("a set key must be forwarded");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, expected);
+    }
+
+    // ── Provider entry points ───────────────────────────────────
+    // The vendor hosts are hard-coded and https-only, so the happy path
+    // cannot be reached without a TLS server. These tests pin the observable
+    // contract that IS reachable locally: which host each provider targets
+    // and which provider name appears in the failure.
+
+    #[tokio::test]
+    async fn search_duckduckgo_targets_duckduckgo_with_an_encoded_query() {
+        let (head, err) =
+            probe_provider(
+                |client| async move { search_duckduckgo(&client, "rust 语言", 3).await },
+            )
+            .await;
+        assert!(
+            head.starts_with("CONNECT html.duckduckgo.com:443 HTTP/1.1"),
+            "proxy saw: {head}"
+        );
+        assert!(err.contains("DuckDuckGo request failed"), "{err}");
+        assert!(
+            err.contains("html.duckduckgo.com/html/?q=rust%20"),
+            "the query is percent-encoded: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_brave_targets_brave_and_names_the_provider() {
+        let (head, err) =
+            probe_provider(|client| async move { search_brave(&client, "k", "q", 3).await }).await;
+        assert!(
+            head.starts_with("CONNECT api.search.brave.com:443 HTTP/1.1"),
+            "proxy saw: {head}"
+        );
+        assert!(err.contains("Brave API request failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_tavily_targets_tavily_and_names_the_provider() {
+        let (head, err) =
+            probe_provider(|client| async move { search_tavily(&client, "k", "q", 3).await }).await;
+        assert!(
+            head.starts_with("CONNECT api.tavily.com:443 HTTP/1.1"),
+            "proxy saw: {head}"
+        );
+        assert!(err.contains("Tavily API request failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_exa_targets_exa_and_names_the_provider() {
+        let (head, err) =
+            probe_provider(|client| async move { search_exa(&client, "k", "q", 3).await }).await;
+        assert!(
+            head.starts_with("CONNECT api.exa.ai:443 HTTP/1.1"),
+            "proxy saw: {head}"
+        );
+        assert!(err.contains("Exa API request failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_firecrawl_targets_firecrawl_and_names_the_provider() {
+        let (head, err) =
+            probe_provider(|client| async move { search_firecrawl(&client, "k", "q", 3).await })
+                .await;
+        assert!(
+            head.starts_with("CONNECT api.firecrawl.dev:443 HTTP/1.1"),
+            "proxy saw: {head}"
+        );
+        assert!(err.contains("Firecrawl API request failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_serper_targets_serper_and_names_the_provider() {
+        let (head, err) =
+            probe_provider(|client| async move { search_serper(&client, "k", "q", 3).await }).await;
+        assert!(
+            head.starts_with("CONNECT google.serper.dev:443 HTTP/1.1"),
+            "proxy saw: {head}"
+        );
+        assert!(err.contains("Serper API request failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_serpapi_targets_serpapi_and_names_the_provider() {
+        let (head, err) =
+            probe_provider(|client| async move { search_serpapi(&client, "k", "q", 3).await })
+                .await;
+        assert!(
+            head.starts_with("CONNECT serpapi.com:443 HTTP/1.1"),
+            "proxy saw: {head}"
+        );
+        assert!(err.contains("SerpAPI API request failed"), "{err}");
+    }
+
+    // ── Tool registration ───────────────────────────────────────
+
+    #[test]
+    fn register_exposes_the_web_search_tool() {
+        use conga::{ExtensionApiImpl, RiskLevel};
+
+        let mut api = ExtensionApiImpl::new();
+        register(&mut api);
+        assert_eq!(api.tools.len(), 1);
+        let tool = &api.tools[0];
+        assert_eq!(tool.name, "web_search");
+        // Searching the web is egress: it must never be auto-approved.
+        assert!(matches!(tool.risk, RiskLevel::High));
+        assert_eq!(tool.parameters["required"][0], "query");
+        assert_eq!(tool.parameters["properties"]["count"]["default"], 5);
     }
 }

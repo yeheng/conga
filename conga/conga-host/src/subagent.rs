@@ -1012,4 +1012,244 @@ mod tests {
             }))
         }
     }
+
+    // ── panic payload rendering ──
+
+    #[test]
+    fn panic_message_reads_both_string_payloads() {
+        let borrowed: &str = "borrowed boom";
+        let p: &(dyn std::any::Any + Send) = &borrowed;
+        assert_eq!(panic_message(p), "borrowed boom");
+
+        let owned = String::from("owned boom");
+        let p: &(dyn std::any::Any + Send) = &owned;
+        assert_eq!(panic_message(p), "owned boom");
+    }
+
+    #[test]
+    fn panic_message_degrades_for_a_non_string_payload() {
+        let number = 42u32;
+        let p: &(dyn std::any::Any + Send) = &number;
+        assert_eq!(panic_message(p), "unknown panic payload");
+    }
+
+    // ── AgentEvent → SubagentEvent mapping ──
+
+    fn assistant_msg(text: &str, stop_reason: conga::StopReason) -> conga::AssistantMessage {
+        conga::AssistantMessage {
+            content: vec![ContentBlock::text(text)],
+            model: "m".into(),
+            stop_reason,
+            usage: None,
+            timestamp: 1,
+            stream_indices: Vec::new(),
+        }
+    }
+
+    fn tool_result_msg(tool_name: &str, text: &str) -> conga::ToolResultMessage {
+        conga::ToolResultMessage {
+            tool_call_id: "tc1".into(),
+            tool_name: tool_name.into(),
+            content: vec![ContentBlock::text(text)],
+            is_error: false,
+            timestamp: 1,
+        }
+    }
+
+    #[test]
+    fn map_agent_event_maps_text_and_thinking_deltas() {
+        let ev = AgentEvent::MessageUpdate {
+            delta: ContentDelta::TextDelta("hi".into()),
+        };
+        match map_agent_event("s1", &ev) {
+            Some(SubagentEvent::Content { id, content }) => {
+                assert_eq!(id, "s1");
+                assert_eq!(content, "hi");
+            }
+            other => panic!("expected Content, got {other:?}"),
+        }
+
+        let ev = AgentEvent::MessageUpdate {
+            delta: ContentDelta::ThinkingDelta("hmm".into()),
+        };
+        match map_agent_event("s1", &ev) {
+            Some(SubagentEvent::Thinking { id, content }) => {
+                assert_eq!(id, "s1");
+                assert_eq!(content, "hmm");
+            }
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_agent_event_ignores_a_tool_call_delta() {
+        let ev = AgentEvent::MessageUpdate {
+            delta: ContentDelta::ToolCallDelta {
+                id: "t1".into(),
+                name: Some("bash".into()),
+                args_delta: "{}".into(),
+            },
+        };
+        assert!(
+            map_agent_event("s1", &ev).is_none(),
+            "a tool-call delta has no SubagentEvent counterpart"
+        );
+    }
+
+    #[test]
+    fn map_agent_event_maps_tool_start_and_end() {
+        let ev = AgentEvent::ToolExecutionStart {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+        };
+        match map_agent_event("s1", &ev) {
+            Some(SubagentEvent::ToolStart {
+                id,
+                name,
+                arguments,
+            }) => {
+                assert_eq!(id, "s1");
+                assert_eq!(name, "bash");
+                let args: serde_json::Value =
+                    serde_json::from_str(&arguments.expect("arguments must be set")).unwrap();
+                assert_eq!(args["command"], "ls");
+            }
+            other => panic!("expected ToolStart, got {other:?}"),
+        }
+
+        let ev = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tc1".into(),
+            result: tool_result_msg("bash", "done"),
+            is_error: false,
+        };
+        match map_agent_event("s1", &ev) {
+            Some(SubagentEvent::ToolEnd { id, name, output }) => {
+                assert_eq!(id, "s1");
+                assert_eq!(name, "bash");
+                assert_eq!(output.as_deref(), Some("done"));
+            }
+            other => panic!("expected ToolEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_agent_event_maps_provider_usage_and_drops_unreported_usage() {
+        let mut response = assistant_msg("x", conga::StopReason::EndTurn);
+        response.usage = Some(conga::Usage {
+            input_tokens: 5,
+            output_tokens: 2,
+            cache_read_tokens: None,
+            cache_write_tokens: Some(3),
+        });
+        let ev = AgentEvent::AfterProviderResponse {
+            model: "m".into(),
+            response,
+        };
+        match map_agent_event("s1", &ev) {
+            Some(SubagentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read,
+                cache_write,
+            }) => {
+                assert_eq!(input_tokens, 5);
+                assert_eq!(output_tokens, 2);
+                assert_eq!(cache_read, 0, "unreported cache reads are 0");
+                assert_eq!(cache_write, 3);
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+
+        // No usage reported → no event at all.
+        let ev = AgentEvent::AfterProviderResponse {
+            model: "m".into(),
+            response: assistant_msg("x", conga::StopReason::EndTurn),
+        };
+        assert!(map_agent_event("s1", &ev).is_none());
+    }
+
+    #[test]
+    fn map_agent_event_ignores_lifecycle_events() {
+        assert!(map_agent_event("s1", &AgentEvent::AgentStart).is_none());
+        assert!(map_agent_event("s1", &AgentEvent::TurnStart).is_none());
+        assert!(map_agent_event("s1", &AgentEvent::AgentEnd).is_none());
+        assert!(map_agent_event("s1", &AgentEvent::MessageStart).is_none());
+    }
+
+    // ── summary / output extraction ──
+
+    #[test]
+    fn extract_summary_tools_output_on_empty_input() {
+        let (summary, tool_count, output) = extract_summary_tools_output(&[]);
+        assert_eq!(summary, "");
+        assert_eq!(tool_count, 0);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn extract_summary_tools_output_counts_tools_and_joins_the_transcript() {
+        let msgs = vec![
+            AgentMessage::user("u"),
+            AgentMessage::Assistant(assistant_msg("hello", conga::StopReason::EndTurn)),
+            AgentMessage::ToolResult(tool_result_msg("f", "ok")),
+            AgentMessage::Assistant(assistant_msg("world", conga::StopReason::EndTurn)),
+        ];
+        let (summary, tool_count, output) = extract_summary_tools_output(&msgs);
+        assert_eq!(tool_count, 1);
+        assert_eq!(output, "hello\n\nworld");
+        assert_eq!(summary, "world", "the summary is the last assistant text");
+    }
+
+    #[test]
+    fn extract_summary_tools_output_ignores_non_text_blocks() {
+        let mut a = assistant_msg("", conga::StopReason::EndTurn);
+        a.content = vec![ContentBlock::Thinking {
+            thinking: "secret reasoning".into(),
+        }];
+        let msgs = vec![AgentMessage::Assistant(a)];
+        let (summary, tool_count, output) = extract_summary_tools_output(&msgs);
+        assert_eq!(summary, "");
+        assert_eq!(output, "", "thinking blocks are not part of the output");
+        assert_eq!(tool_count, 0);
+    }
+
+    #[test]
+    fn extract_summary_tools_output_marks_turn_limit_exhaustion() {
+        // No text at all → the placeholder names the turn limit.
+        let msgs = vec![AgentMessage::Assistant(assistant_msg(
+            "",
+            conga::StopReason::ToolUse,
+        ))];
+        let (summary, _, _) = extract_summary_tools_output(&msgs);
+        assert_eq!(summary, "(reached turn limit without a final answer)");
+
+        // With text → the text is kept but flagged as incomplete.
+        let msgs = vec![AgentMessage::Assistant(assistant_msg(
+            "partial work",
+            conga::StopReason::ToolUse,
+        ))];
+        let (summary, _, _) = extract_summary_tools_output(&msgs);
+        assert!(summary.starts_with("partial work"), "got: {summary}");
+        assert!(
+            summary.contains("reached turn limit, result may be incomplete"),
+            "got: {summary}"
+        );
+    }
+
+    #[test]
+    fn extract_summary_tools_output_truncates_the_summary_but_not_the_output() {
+        let long = "x".repeat(500);
+        let msgs = vec![AgentMessage::Assistant(assistant_msg(
+            &long,
+            conga::StopReason::EndTurn,
+        ))];
+        let (summary, _, output) = extract_summary_tools_output(&msgs);
+        assert_eq!(summary.chars().count(), 200, "the summary is capped");
+        assert_eq!(
+            output.chars().count(),
+            500,
+            "the parent reasons over the FULL transcript"
+        );
+    }
 }

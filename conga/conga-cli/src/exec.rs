@@ -261,4 +261,27 @@ mod tests {
             130
         );
     }
+
+    // ── run() ───────────────────────────────────────────────────
+    // Only the paths that fail BEFORE the host is assembled are exercised
+    // here: a successful run needs a live LLM provider, which a unit test
+    // must never talk to.
+
+    #[tokio::test]
+    async fn run_rejects_an_unknown_flag_with_the_usage_exit_code() {
+        let code = run(&s(&["--wat", "task"])).await;
+        assert_eq!(code, 2, "a usage error must exit with 2");
+    }
+
+    #[tokio::test]
+    async fn run_rejects_an_unknown_mode_with_the_usage_exit_code() {
+        let code = run(&s(&["--mode=bogus", "task"])).await;
+        assert_eq!(code, 2, "a usage error must exit with 2");
+    }
+
+    #[tokio::test]
+    async fn run_without_a_task_exits_with_the_usage_code() {
+        let code = run(&s(&["--json"])).await;
+        assert_eq!(code, 2, "a missing task must exit with 2");
+    }
 }

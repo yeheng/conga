@@ -159,4 +159,147 @@ mod tests {
         assert_eq!(local.command.as_deref(), Some("npx"));
         assert!(local.url.is_none());
     }
+
+    // ── `load_config` / `mcp_config_path` ──────────────────────────
+
+    /// Serializes the tests that mutate `CONGA_MCP_CONFIG` (read by
+    /// `mcp_config_path` with no injectable lookup).
+    fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::mcp::test_util::ENV_LOCK.blocking_lock()
+    }
+
+    /// Restore an env var to the value it had before the test.
+    fn restore_env(key: &str, saved: Option<String>) {
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn mcp_config_path_prefers_the_env_override() {
+        let _g = env_lock();
+        let saved = std::env::var("CONGA_MCP_CONFIG").ok();
+        std::env::set_var("CONGA_MCP_CONFIG", "/tmp/custom-mcp.json");
+        assert_eq!(
+            mcp_config_path(),
+            std::path::PathBuf::from("/tmp/custom-mcp.json")
+        );
+        restore_env("CONGA_MCP_CONFIG", saved);
+    }
+
+    #[test]
+    fn mcp_config_path_defaults_to_mcp_json_in_the_config_dir() {
+        let _g = env_lock();
+        let saved = std::env::var("CONGA_MCP_CONFIG").ok();
+        std::env::remove_var("CONGA_MCP_CONFIG");
+        assert_eq!(
+            mcp_config_path(),
+            conga::storage::config_dir().join("mcp.json")
+        );
+        restore_env("CONGA_MCP_CONFIG", saved);
+    }
+
+    #[test]
+    fn load_config_reads_the_env_configured_file() {
+        let _g = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"github":{"command":"npx","args":["-y","server-github"]}}}"#,
+        )
+        .unwrap();
+        let saved = std::env::var("CONGA_MCP_CONFIG").ok();
+        std::env::set_var("CONGA_MCP_CONFIG", &path);
+
+        let cfg = load_config().expect("load config");
+
+        restore_env("CONGA_MCP_CONFIG", saved);
+        assert_eq!(cfg.len(), 1);
+        let (name, server) = &cfg[0];
+        assert_eq!(name, "github");
+        assert_eq!(server.command.as_deref(), Some("npx"));
+    }
+
+    #[test]
+    fn load_config_missing_file_returns_empty() {
+        let _g = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope.json");
+        let saved = std::env::var("CONGA_MCP_CONFIG").ok();
+        std::env::set_var("CONGA_MCP_CONFIG", &missing);
+
+        let cfg = load_config().expect("missing file is not an error");
+
+        restore_env("CONGA_MCP_CONFIG", saved);
+        assert!(cfg.is_empty());
+    }
+
+    #[test]
+    fn load_config_invalid_json_returns_error() {
+        let _g = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let saved = std::env::var("CONGA_MCP_CONFIG").ok();
+        std::env::set_var("CONGA_MCP_CONFIG", &path);
+
+        let err = load_config().expect_err("broken json must fail");
+
+        restore_env("CONGA_MCP_CONFIG", saved);
+        assert!(
+            matches!(err, McpError::Json(_)),
+            "expected a json error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("json error"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_without_mcp_servers_key_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(&path, "{}").unwrap();
+        let cfg = load_config_from(&path).expect("empty config is valid");
+        assert!(cfg.is_empty());
+    }
+
+    #[test]
+    fn load_config_with_empty_servers_object_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let cfg = load_config_from(&path).expect("empty server list is valid");
+        assert!(cfg.is_empty());
+    }
+
+    #[test]
+    fn load_config_ignores_unknown_fields_and_defaults_missing_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{"bare":{"unknownField":42}}}"#).unwrap();
+        let cfg = load_config_from(&path).expect("config with unknown fields");
+        assert_eq!(cfg.len(), 1);
+        let (_, server) = &cfg[0];
+        assert!(server.command.is_none());
+        assert!(server.url.is_none());
+        assert!(server.args.is_empty());
+        assert!(server.env.is_empty());
+        assert!(server.headers.is_empty());
+        assert!(!server.is_http());
+    }
+
+    #[test]
+    fn load_config_from_a_directory_returns_io_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = load_config_from(tmp.path()).expect_err("a directory is not a file");
+        assert!(
+            matches!(err, McpError::Io(_)),
+            "expected an io error, got {err:?}"
+        );
+        assert!(err.to_string().contains("io error"), "{err}");
+    }
 }

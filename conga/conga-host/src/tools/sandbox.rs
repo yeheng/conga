@@ -257,6 +257,102 @@ mod tests {
             "{p}"
         );
     }
+
+    /// Seatbelt applies the LAST matching rule, so the blanket deny must
+    /// come BEFORE the per-path allows — otherwise the allows would be
+    /// dead text and every write would be refused.
+    #[test]
+    fn profile_denies_writes_before_allowing_the_whitelisted_roots() {
+        let p = seatbelt_profile("/tmp/cwd", "/tmp/dir", "/private/var/tmp");
+        let deny = p.find("(deny file-write*)").expect("deny rule");
+        for sub in ["/tmp/cwd", "/tmp/dir", "/private/var/tmp"] {
+            let allow = p
+                .find(&format!("(allow file-write* (subpath \"{sub}\"))"))
+                .unwrap_or_else(|| panic!("no allow rule for {sub}: {p}"));
+            assert!(
+                deny < allow,
+                "the deny rule must precede the allow for {sub}: {p}"
+            );
+        }
+    }
+
+    /// Exactly three write roots are whitelisted — no more, no less.
+    #[test]
+    fn profile_whitelists_exactly_the_three_write_roots() {
+        let p = seatbelt_profile("/a", "/b", "/c");
+        assert_eq!(p.matches("(allow file-write*").count(), 3, "{p}");
+        assert_eq!(p.matches("(deny file-write*)").count(), 1, "{p}");
+        assert!(p.contains("(subpath \"/a\")"), "{p}");
+        assert!(p.contains("(subpath \"/b\")"), "{p}");
+        assert!(p.contains("(subpath \"/c\")"), "{p}");
+    }
+
+    /// The capability probe is cached per process: repeated calls must give
+    /// the same verdict, and a refusal must say why (and name the flag that
+    /// asked for it).
+    #[test]
+    fn seatbelt_usable_is_cached_and_explains_a_refusal() {
+        let first = seatbelt_usable();
+        let second = seatbelt_usable();
+        assert_eq!(first.is_ok(), second.is_ok(), "the probe must be stable");
+        if let Err(e) = &first {
+            assert!(e.contains("sandbox"), "{e}");
+            assert!(e.contains("CONGA_SANDBOX=1"), "{e}");
+        }
+    }
+
+    /// `confine` rewrites the command to run under `sandbox-exec` with the
+    /// generated profile, keeping the original program and arguments. When
+    /// the platform cannot confine, it must fail closed (an `Err` that
+    /// names the sandbox) instead of running the command unguarded.
+    #[test]
+    fn confine_rewrites_the_command_to_sandbox_exec() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("echo hi");
+        if let Err(e) = confine(&mut cmd, cwd.path()) {
+            // Seatbelt cannot confine on this machine: fail closed, loudly.
+            assert!(e.contains("sandbox"), "{e}");
+            assert!(e.contains("CONGA_SANDBOX=1"), "{e}");
+            return;
+        }
+        let std_cmd = cmd.as_std();
+        assert_eq!(std_cmd.get_program(), "sandbox-exec");
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "-p");
+        let profile = &args[1];
+        assert!(profile.contains("(deny file-write*)"), "{profile}");
+        let cwd_canon = cwd.path().canonicalize().unwrap().display().to_string();
+        assert!(
+            profile.contains(&cwd_canon),
+            "the profile must whitelist the cwd {cwd_canon}: {profile}"
+        );
+        // The original program and arguments survive the rewrite.
+        assert_eq!(args[2], "sh");
+        assert_eq!(args[3], "-c");
+        assert_eq!(args[4], "echo hi");
+    }
+
+    /// Error path: a cwd that does not exist cannot be confined, so the
+    /// caller must fail closed instead of running the command.
+    #[test]
+    fn confine_rejects_a_missing_cwd() {
+        if seatbelt_usable().is_err() {
+            // Without a working Seatbelt the capability check fires first —
+            // also a fail-closed refusal, but with a different reason.
+            let mut cmd = tokio::process::Command::new("true");
+            let err = confine(&mut cmd, std::path::Path::new("/conga-no-such-dir-xyz"))
+                .unwrap_err();
+            assert!(err.contains("sandbox"), "{err}");
+            return;
+        }
+        let mut cmd = tokio::process::Command::new("true");
+        let err = confine(&mut cmd, std::path::Path::new("/conga-no-such-dir-xyz")).unwrap_err();
+        assert!(err.contains("cwd not accessible"), "{err}");
+    }
 }
 
 // The env-flag logic is cross-platform, so it gets its own non-gated test
@@ -271,6 +367,22 @@ mod flag_tests {
         assert!(!sandbox_enabled(&env));
         env.insert("CONGA_SANDBOX".to_string(), "0".to_string());
         assert!(!sandbox_enabled(&env));
+        env.insert("CONGA_SANDBOX".to_string(), "1".to_string());
+        assert!(sandbox_enabled(&env));
+    }
+
+    /// Boundary: only the exact string "1" enables the sandbox — no
+    /// truthy-string guessing, no surrounding whitespace.
+    #[test]
+    fn sandbox_enabled_rejects_truthy_lookalikes() {
+        let mut env = std::collections::HashMap::new();
+        for value in ["true", "TRUE", "yes", "1 ", " 1", "01", "1.0", ""] {
+            env.insert("CONGA_SANDBOX".to_string(), value.to_string());
+            assert!(
+                !sandbox_enabled(&env),
+                "{value:?} must not enable the sandbox"
+            );
+        }
         env.insert("CONGA_SANDBOX".to_string(), "1".to_string());
         assert!(sandbox_enabled(&env));
     }
@@ -289,6 +401,29 @@ mod landlock_tests {
         // per-thread and libtest spawns one thread per test), and the ruleset
         // grants rw beneath the tempdir, so the test runner is unaffected.
         assert!(landlock_ruleset(cwd.path(), std::path::Path::new("/tmp")).is_ok());
+    }
+
+    /// `confine_landlock` installs the ruleset in `pre_exec` (between fork
+    /// and exec), so installing it must succeed without touching this
+    /// process — the confinement applies to the spawned child only.
+    #[test]
+    fn confine_landlock_installs_the_ruleset_for_existing_paths() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut cmd = tokio::process::Command::new("true");
+        assert!(
+            confine_landlock(&mut cmd, cwd.path()).is_ok(),
+            "installing the ruleset must succeed"
+        );
+    }
+
+    /// Error path: a cwd that does not exist cannot be confined — the
+    /// caller has to fail closed rather than run the command unguarded.
+    #[test]
+    fn confine_landlock_rejects_a_missing_cwd() {
+        let mut cmd = tokio::process::Command::new("true");
+        let err = confine_landlock(&mut cmd, std::path::Path::new("/conga-no-such-dir-xyz"))
+            .unwrap_err();
+        assert!(err.contains("cwd not accessible"), "{err}");
     }
 }
 

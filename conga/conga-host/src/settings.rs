@@ -701,4 +701,165 @@ mod tests {
         assert_eq!(resolve_max_tokens(None, &env_missing()), 128_000);
         assert_eq!(resolve_max_tokens(None, &env_ok("not-a-number")), 128_000);
     }
+
+    // ── LlmGroup::to_provider ───────────────────────────────────
+
+    #[test]
+    fn to_provider_maps_api_and_trims_fields() {
+        let p = group("  https://a.x/v1  ", "sk-1", "  m1  ", "")
+            .to_provider()
+            .unwrap();
+        assert_eq!(p.base_url, "https://a.x/v1");
+        assert_eq!(p.model, "m1");
+        assert_eq!(p.api_key, "sk-1");
+        assert_eq!(p.api, conga::ProviderApi::OpenAiCompat);
+
+        let p = group("https://a.x/v1", "sk-2", "m2", "anthropic")
+            .to_provider()
+            .unwrap();
+        assert_eq!(p.api, conga::ProviderApi::Anthropic);
+    }
+
+    #[test]
+    fn to_provider_falls_back_to_openai_for_an_unknown_api() {
+        // NOTE: `to_provider` does NOT reject an unknown api string - it
+        // maps everything that is not "anthropic" onto the OpenAI-compat
+        // provider. Only `LlmGroup::validate` rejects it, and validate()
+        // runs on the save/merge path.
+        let p = group("https://a.x/v1", "sk-1", "m1", "bogus")
+            .to_provider()
+            .unwrap();
+        assert_eq!(p.api, conga::ProviderApi::OpenAiCompat);
+    }
+
+    #[test]
+    fn to_provider_does_not_validate_the_group_fields() {
+        // NOTE: `to_provider` never runs `validate()`: an empty base URL or
+        // model still yields a provider. `effective_provider`'s
+        // "invalid group -> fall back to env" branch is therefore
+        // unreachable for a hand-edited settings file.
+        let p = group("", "k", "", "").to_provider().unwrap();
+        assert_eq!(p.base_url, "");
+        assert_eq!(p.model, "");
+    }
+
+    // ── settings_path / loaders / saver ──────────────────────────
+
+    #[test]
+    fn settings_path_is_settings_json_in_the_config_dir() {
+        // `config_dir()` is read lazily and may be pinned to an arbitrary
+        // scratch path (`CONGA_CONFIG_DIR`, used by the headless host), so
+        // hold the env lock and assert the CONTRACT — settings.json lives IN
+        // the config dir — instead of the directory's name.
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p = settings_path();
+        assert_eq!(p.file_name().unwrap(), "settings.json");
+        assert_eq!(p.parent().unwrap(), conga::storage::config_dir());
+    }
+
+    #[test]
+    fn load_settings_reads_the_config_path() {
+        // The real config dir may or may not hold a settings.json; the
+        // loader must agree with an explicit read of the very same path.
+        assert_eq!(load_settings(), load_settings_at(&settings_path()));
+    }
+
+    #[tokio::test]
+    async fn load_settings_async_reads_the_config_path() {
+        assert_eq!(
+            load_settings_async().await,
+            load_settings_at_async(&settings_path()).await
+        );
+    }
+
+    #[test]
+    fn save_settings_rejects_invalid_groups_before_touching_disk() {
+        // The real settings path must NOT be written by a failing save:
+        // validation runs before any file I/O.
+        let bad_llm = EnvSettings {
+            llm: Some(group("not-a-url", "k", "m", "")),
+            ..EnvSettings::default()
+        };
+        let err = save_settings(&bad_llm).unwrap_err();
+        assert!(err.starts_with("llm:"), "{err}");
+
+        let bad_fast = EnvSettings {
+            fast_llm: Some(group("not-a-url", "k", "m", "")),
+            ..EnvSettings::default()
+        };
+        let err = save_settings(&bad_fast).unwrap_err();
+        assert!(err.starts_with("fastLlm:"), "{err}");
+
+        let bad_tokens = EnvSettings {
+            max_tokens: Some(10),
+            ..EnvSettings::default()
+        };
+        let err = save_settings(&bad_tokens).unwrap_err();
+        assert!(err.starts_with("maxTokens:"), "{err}");
+    }
+
+    #[test]
+    fn save_settings_at_writes_atomically_without_leaving_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let s = EnvSettings {
+            llm: Some(group("https://a.x/v1", "sk-1", "m1", "openai")),
+            ..EnvSettings::default()
+        };
+        save_settings_at(&path, &s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"baseUrl\""), "{raw}");
+        assert_eq!(load_settings_at(&path), s);
+        // Only the target file remains: the tmp+rename left no residue.
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "settings.json")
+            .collect();
+        assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
+    }
+
+    #[test]
+    fn save_settings_at_reports_an_unwritable_target_without_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+        let err = save_settings_at(&blocker.join("settings.json"), &EnvSettings::default())
+            .unwrap_err();
+        assert!(!err.is_empty());
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["not-a-dir".to_string()], "{names:?}");
+    }
+
+    // ── validate_max_tokens / effective_max_tokens ───────────────
+
+    #[test]
+    fn validate_max_tokens_accepts_the_bounds_and_rejects_outside() {
+        assert!(validate_max_tokens(None).is_ok(), "None = no override");
+        assert!(validate_max_tokens(Some(MIN_MAX_TOKENS)).is_ok());
+        assert!(validate_max_tokens(Some(MAX_MAX_TOKENS)).is_ok());
+        for bad in [0u64, 1, MIN_MAX_TOKENS - 1, MAX_MAX_TOKENS + 1, u64::MAX] {
+            let err = validate_max_tokens(Some(bad)).unwrap_err();
+            assert!(err.contains("between 1024 and 2000000"), "n={bad}: {err}");
+            assert!(err.contains(&bad.to_string()), "n={bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn effective_max_tokens_reads_the_settings_file_then_the_env() {
+        // settings.json wins over CONGA_CONTEXT_WINDOW; both are absent in
+        // a plain checkout, so the 128k default applies.
+        let expected = load_settings().max_tokens.unwrap_or_else(|| {
+            std::env::var("CONGA_CONTEXT_WINDOW")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(128_000)
+        });
+        assert_eq!(effective_max_tokens(), expected);
+    }
 }

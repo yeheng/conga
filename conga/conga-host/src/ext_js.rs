@@ -802,4 +802,628 @@ conga.registerTool({
         };
         assert!(err.contains("require"), "got: {err}");
     }
+
+    // ── helpers for the direct (private API) tests ──
+
+    /// A fresh QuickJS runtime with the sandbox prelude loaded.
+    fn new_context() -> (rquickjs::Runtime, rquickjs::Context) {
+        let rt = rquickjs::Runtime::new().unwrap();
+        rt.set_memory_limit(SANDBOX_MEMORY_LIMIT);
+        rt.set_max_stack_size(SANDBOX_STACK_LIMIT);
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(PRELUDE).unwrap();
+        });
+        (rt, ctx)
+    }
+
+    /// The tool-context subset a script receives.
+    fn js_tool_ctx() -> JsToolCtx {
+        JsToolCtx {
+            cwd: PathBuf::from("/tmp"),
+            session_id: "sess".into(),
+            state_dir: PathBuf::from("/tmp/state"),
+        }
+    }
+
+    fn text_of(result: &ToolResult) -> String {
+        match result.content.first() {
+            Some(ContentBlock::Text { text }) => text.clone(),
+            other => panic!("expected a text block, got {other:?}"),
+        }
+    }
+
+    // ── JSON ↔ JS value conversion ──
+
+    #[test]
+    fn json_to_js_converts_every_json_kind() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            let v = json_to_js(
+                &ctx,
+                &serde_json::json!({
+                    "num": 1.5,
+                    "str": "text",
+                    "bool": true,
+                    "nil": null,
+                    "arr": [1.5, "x", null],
+                    "obj": {"k": "v"}
+                }),
+            )
+            .unwrap();
+            let back = js_to_json(&v);
+            assert_eq!(back["num"], 1.5);
+            assert_eq!(back["str"], "text");
+            assert_eq!(back["bool"], true);
+            assert!(back["nil"].is_null());
+            assert_eq!(back["arr"][0], 1.5);
+            assert_eq!(back["arr"][1], "x");
+            assert!(back["arr"][2].is_null());
+            assert_eq!(back["obj"]["k"], "v");
+        });
+    }
+
+    #[test]
+    fn json_to_js_preserves_unicode_strings() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            let v = json_to_js(&ctx, &serde_json::json!("你好 🌍")).unwrap();
+            assert_eq!(js_to_json(&v), serde_json::json!("你好 🌍"));
+        });
+    }
+
+    /// KNOWN LIMITATION (reported, not fixed): every JSON number is bridged
+    /// into JS through `f64`, so integers come back as floats and integers
+    /// beyond 2^53 lose precision. This matters for the paths that round-trip
+    /// JSON through JS: a before-hook's `modify` verdict and a tool result's
+    /// `details`.
+    ///
+    /// This test pins the CURRENT behaviour; it must be updated when the
+    /// bridge is fixed.
+    #[test]
+    fn json_numbers_travel_through_the_bridge_as_f64_known_limit() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            let v = json_to_js(
+                &ctx,
+                &serde_json::json!({"n": 42, "big": 9007199254740993u64}),
+            )
+            .unwrap();
+            let back = js_to_json(&v);
+            assert_eq!(back["n"], 42.0, "integers come back as floats");
+            assert_eq!(
+                back["big"], 9007199254740992.0,
+                "integers beyond 2^53 lose precision"
+            );
+        });
+    }
+
+    #[test]
+    fn js_to_json_maps_the_javascript_types() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            let v = ctx
+                .eval::<rquickjs::Value, _>("({a: 1, b: 'x', c: true, d: null, e: [1, 2]})")
+                .unwrap();
+            let j = js_to_json(&v);
+            assert_eq!(j["a"], 1);
+            assert_eq!(j["b"], "x");
+            assert_eq!(j["c"], true);
+            assert!(j["d"].is_null());
+            assert_eq!(j["e"].as_array().map(|a| a.len()), Some(2));
+        });
+    }
+
+    #[test]
+    fn js_to_json_of_undefined_is_null() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            let v = ctx.eval::<rquickjs::Value, _>("undefined").unwrap();
+            assert!(js_to_json(&v).is_null());
+        });
+    }
+
+    #[test]
+    fn js_debug_renders_strings_and_values() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            let s = ctx.eval::<rquickjs::Value, _>("'hello'").unwrap();
+            assert_eq!(js_debug(&s), "hello");
+            let n = ctx.eval::<rquickjs::Value, _>("42").unwrap();
+            assert_eq!(js_debug(&n), "42");
+            let b = ctx.eval::<rquickjs::Value, _>("true").unwrap();
+            assert_eq!(js_debug(&b), "true");
+            let o = ctx.eval::<rquickjs::Value, _>("({a: 1})").unwrap();
+            assert!(js_debug(&o).contains("\"a\":1"), "got: {}", js_debug(&o));
+        });
+    }
+
+    // ── misc helpers ──
+
+    #[test]
+    fn risk_name_maps_the_three_levels() {
+        assert_eq!(risk_name(RiskLevel::Low), "low");
+        assert_eq!(risk_name(RiskLevel::Medium), "medium");
+        assert_eq!(risk_name(RiskLevel::High), "high");
+    }
+
+    #[test]
+    fn error_string_reads_a_pending_js_exception() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            let err = ctx
+                .eval::<(), _>("throw new Error('boom')")
+                .expect_err("must throw");
+            let msg = error_string(&ctx, err);
+            assert!(msg.contains("boom"), "got: {msg}");
+        });
+    }
+
+    #[test]
+    fn error_string_passes_a_non_exception_error_through() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            let msg = error_string(&ctx, rquickjs::Error::Allocation);
+            assert!(!msg.is_empty());
+        });
+    }
+
+    // ── registration collection ──
+
+    #[test]
+    fn registry_collect_reads_the_registered_tools_and_hooks() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+conga.registerTool({
+    name: "t1", label: "L1", description: "D1", risk: "low",
+    parameters: { type: "object", properties: { a: { type: "string" } } },
+    execute(args) { return "ok"; },
+});
+conga.registerBeforeToolCall((p) => ({ block: "no" }));
+conga.registerAfterToolCall((p) => ({ text: "x" }));
+"#,
+            )
+            .unwrap();
+            let registry = Registry::collect(&ctx).unwrap();
+            assert_eq!(registry.tools.len(), 1);
+            let t = &registry.tools[0];
+            assert_eq!(t.name, "t1");
+            assert_eq!(t.label, "L1");
+            assert_eq!(t.description, "D1");
+            assert_eq!(t.risk, RiskLevel::Low);
+            assert_eq!(t.parameters["properties"]["a"]["type"], "string");
+            assert_eq!(registry.before.len(), 1);
+            assert_eq!(registry.after.len(), 1);
+        });
+    }
+
+    #[test]
+    fn registry_collect_defaults_the_missing_metadata() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+conga.registerTool({ name: "bare", execute() { return 1; } });
+"#,
+            )
+            .unwrap();
+            let registry = Registry::collect(&ctx).unwrap();
+            let t = &registry.tools[0];
+            assert_eq!(t.name, "bare");
+            assert_eq!(t.label, "", "a missing label stays empty");
+            assert_eq!(t.description, "");
+            assert_eq!(t.risk, RiskLevel::High, "anything unexpected is High");
+            assert_eq!(t.parameters["type"], "object");
+            assert_eq!(t.parameters["properties"], serde_json::json!({}));
+            assert!(registry.before.is_empty());
+            assert!(registry.after.is_empty());
+        });
+    }
+
+    // ── tool execution ──
+
+    #[test]
+    fn call_tool_runs_the_registered_function() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+conga.registerTool({
+    name: "greet", label: "G", description: "D", risk: "low",
+    execute(args) { return "hi " + (args.name ?? "world"); },
+});
+"#,
+            )
+            .unwrap();
+            let registry = Registry::collect(&ctx).unwrap();
+            let out = call_tool(
+                &ctx,
+                &registry,
+                "greet",
+                serde_json::json!({"name": "conga"}),
+                js_tool_ctx(),
+            )
+            .unwrap();
+            assert!(!out.is_error);
+            assert_eq!(text_of(&out), "hi conga");
+        });
+    }
+
+    #[test]
+    fn call_tool_reports_an_unknown_tool() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            let registry = Registry::collect(&ctx).unwrap();
+            let err = call_tool(
+                &ctx,
+                &registry,
+                "nope",
+                serde_json::json!({}),
+                js_tool_ctx(),
+            )
+            .expect_err("must fail");
+            assert!(err.contains("no such js tool: nope"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn call_tool_maps_a_thrown_error_to_an_error_result() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+conga.registerTool({ name: "boom", execute() { throw new Error("kaboom"); } });
+"#,
+            )
+            .unwrap();
+            let registry = Registry::collect(&ctx).unwrap();
+            let out = call_tool(
+                &ctx,
+                &registry,
+                "boom",
+                serde_json::json!({}),
+                js_tool_ctx(),
+            )
+            .unwrap();
+            assert!(out.is_error, "a JS throw is an error result");
+            assert!(text_of(&out).contains("kaboom"), "got: {}", text_of(&out));
+        });
+    }
+
+    #[test]
+    fn tool_result_from_js_reads_strings_objects_and_undefined() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            let v = ctx.eval::<rquickjs::Value, _>("'plain'").unwrap();
+            let r = tool_result_from_js(&ctx, v).unwrap();
+            assert_eq!(text_of(&r), "plain");
+            assert!(!r.is_error);
+            assert!(r.details.is_null());
+
+            let v = ctx
+                .eval::<rquickjs::Value, _>("({content: 'c', isError: true, details: {n: 1}})")
+                .unwrap();
+            let r = tool_result_from_js(&ctx, v).unwrap();
+            assert_eq!(text_of(&r), "c");
+            assert!(r.is_error);
+            assert_eq!(r.details["n"], 1);
+
+            let v = ctx.eval::<rquickjs::Value, _>("undefined").unwrap();
+            let r = tool_result_from_js(&ctx, v).unwrap();
+            assert_eq!(text_of(&r), "");
+            assert!(!r.is_error);
+        });
+    }
+
+    // ── hooks ──
+
+    #[test]
+    fn run_before_hooks_allows_blocks_and_modifies() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+conga.registerBeforeToolCall(({ toolName }) => {
+    if (toolName === "bash") return { block: "no bash" };
+    if (toolName === "fetch") return { modify: { url: "https://example.com" } };
+    return "allow";
+});
+"#,
+            )
+            .unwrap();
+            let registry = Registry::collect(&ctx).unwrap();
+
+            match run_before_hooks(
+                &ctx,
+                &registry,
+                "bash",
+                serde_json::json!({}),
+                RiskLevel::High,
+            ) {
+                ToolCallVerdict::Block(reason) => assert_eq!(reason, "no bash"),
+                other => panic!("expected Block, got {other:?}"),
+            }
+            match run_before_hooks(
+                &ctx,
+                &registry,
+                "fetch",
+                serde_json::json!({"url": "https://evil.com"}),
+                RiskLevel::Medium,
+            ) {
+                ToolCallVerdict::Modify(args) => assert_eq!(args["url"], "https://example.com"),
+                other => panic!("expected Modify, got {other:?}"),
+            }
+            assert!(matches!(
+                run_before_hooks(
+                    &ctx,
+                    &registry,
+                    "read",
+                    serde_json::json!({}),
+                    RiskLevel::Low
+                ),
+                ToolCallVerdict::Allow
+            ));
+        });
+    }
+
+    #[test]
+    fn run_before_hooks_survives_a_throwing_hook() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+conga.registerBeforeToolCall(() => { throw new Error("hook exploded"); });
+"#,
+            )
+            .unwrap();
+            let registry = Registry::collect(&ctx).unwrap();
+            // The hook failed → the verdict stays Allow (the policy still applies).
+            assert!(matches!(
+                run_before_hooks(
+                    &ctx,
+                    &registry,
+                    "bash",
+                    serde_json::json!({}),
+                    RiskLevel::High
+                ),
+                ToolCallVerdict::Allow
+            ));
+        });
+    }
+
+    #[test]
+    fn run_after_hooks_rewrites_the_text_and_the_error_flag() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+conga.registerAfterToolCall(({ isError }) =>
+    isError ? { text: "[redacted]", isError: true } : { text: "kept" });
+"#,
+            )
+            .unwrap();
+            let registry = Registry::collect(&ctx).unwrap();
+            let make = |text: &str, is_error: bool| ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                tool_name: "bash".into(),
+                content: vec![ContentBlock::text(text)],
+                is_error,
+                timestamp: 0,
+            };
+            let rewritten = run_after_hooks(&ctx, &registry, "bash", make("secret", true));
+            assert_eq!(rewritten.content[0], ContentBlock::text("[redacted]"));
+            assert!(rewritten.is_error);
+
+            let kept = run_after_hooks(&ctx, &registry, "bash", make("fine", false));
+            assert_eq!(kept.content[0], ContentBlock::text("kept"));
+            assert!(!kept.is_error);
+        });
+    }
+
+    #[test]
+    fn run_after_hooks_ignores_a_non_object_return() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+conga.registerAfterToolCall(() => "not an object");
+"#,
+            )
+            .unwrap();
+            let registry = Registry::collect(&ctx).unwrap();
+            let result = ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                tool_name: "bash".into(),
+                content: vec![ContentBlock::text("unchanged")],
+                is_error: false,
+                timestamp: 0,
+            };
+            let out = run_after_hooks(&ctx, &registry, "bash", result);
+            assert_eq!(out.content[0], ContentBlock::text("unchanged"));
+        });
+    }
+
+    // ── bridging into the public types ──
+
+    #[test]
+    fn build_extensions_turns_the_registry_into_tools_and_hooks() {
+        let (_rt, ctx) = new_context();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+conga.registerTool({ name: "t1", label: "L1", description: "D1", risk: "medium",
+                     execute() { return "ok"; } });
+conga.registerBeforeToolCall(() => ({ block: "no" }));
+conga.registerAfterToolCall(() => ({ text: "x" }));
+"#,
+            )
+            .unwrap();
+            let registry = Registry::collect(&ctx).unwrap();
+            let (tx, _rx) = mpsc::channel::<JsRequest>();
+            let ext = build_extensions(&registry, tx);
+            assert_eq!(ext.tools.len(), 1);
+            assert_eq!(ext.tools[0].name, "t1");
+            assert_eq!(ext.tools[0].label, "L1");
+            assert_eq!(ext.tools[0].description, "D1");
+            assert_eq!(ext.tools[0].risk, RiskLevel::Medium);
+        });
+    }
+
+    #[tokio::test]
+    async fn build_extensions_fails_open_when_the_runtime_is_gone() {
+        let (_rt, ctx) = new_context();
+        let ext = ctx.with(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+conga.registerBeforeToolCall(() => ({ block: "no" }));
+conga.registerAfterToolCall(() => ({ text: "x" }));
+"#,
+            )
+            .unwrap();
+            let registry = Registry::collect(&ctx).unwrap();
+            let (tx, rx) = mpsc::channel::<JsRequest>();
+            let ext = build_extensions(&registry, tx);
+            drop(rx); // the runtime thread is gone
+            ext
+        });
+
+        // The before hook cannot reach the runtime → fail open.
+        let verdict = ext
+            .hooks
+            .before_tool_call("tc", "bash", &serde_json::json!({}), RiskLevel::High)
+            .await;
+        assert!(matches!(verdict, ToolCallVerdict::Allow));
+
+        // The after hook cannot reach the runtime → the result is kept.
+        let result = ToolResultMessage {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            content: vec![ContentBlock::text("unchanged")],
+            is_error: false,
+            timestamp: 0,
+        };
+        let out = ext.hooks.after_tool_call("tc", &result);
+        assert_eq!(out.content[0], ContentBlock::text("unchanged"));
+    }
+
+    #[tokio::test]
+    async fn make_tool_execute_dispatches_to_the_runtime_thread() {
+        let (tx, rx) = mpsc::channel::<JsRequest>();
+        let responder = std::thread::spawn(move || {
+            let req = rx.recv().expect("a request must arrive");
+            match req {
+                JsRequest::CallTool { name, reply, .. } => {
+                    let _ = reply.send(Ok(ToolResult::text("from js")));
+                    name
+                }
+                _ => panic!("expected a CallTool request"),
+            }
+        });
+        let exec = make_tool_execute(tx, "t1".to_string());
+        let out = (exec)(tool_call_ctx(serde_json::json!({"a": 1})))
+            .await
+            .expect("must succeed");
+        assert_eq!(out.content[0], ContentBlock::text("from js"));
+        assert_eq!(
+            responder.join().unwrap(),
+            "t1",
+            "the tool name is dispatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn make_tool_execute_short_circuits_an_aborted_call() {
+        let (tx, _rx) = mpsc::channel::<JsRequest>();
+        let exec = make_tool_execute(tx, "t1".to_string());
+        let mut ctx = tool_call_ctx(serde_json::json!({}));
+        ctx.signal = Arc::new(AtomicBool::new(true));
+        let out = (exec)(ctx).await.expect("must succeed");
+        assert!(out.is_error);
+        assert_eq!(out.content[0], ContentBlock::text("aborted"));
+    }
+
+    #[tokio::test]
+    async fn make_tool_execute_reports_a_dead_runtime() {
+        let (tx, rx) = mpsc::channel::<JsRequest>();
+        drop(rx);
+        let exec = make_tool_execute(tx, "t1".to_string());
+        let err = (exec)(tool_call_ctx(serde_json::json!({})))
+            .await
+            .expect_err("must fail");
+        assert!(
+            err.to_string().contains("ext-js runtime unavailable"),
+            "got: {err}"
+        );
+    }
+
+    // ── the runtime thread ──
+
+    #[test]
+    fn js_thread_reports_a_failing_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(&dir, "bad.js", "throw new Error('nope');");
+        let (tx, rx) = mpsc::channel::<JsRequest>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<JsExtensions, String>>();
+        let handle = std::thread::spawn(move || js_thread(vec![script], tx, rx, ready_tx));
+        let reported = ready_rx.recv().expect("the thread must report back");
+        let err = match reported {
+            Err(e) => e,
+            Ok(_) => panic!("a throwing script must fail the load"),
+        };
+        assert!(err.contains("bad.js"), "got: {err}");
+        assert!(err.contains("nope"), "got: {err}");
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn js_thread_reports_the_registrations_and_serves_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(
+            &dir,
+            "tool.js",
+            r#"
+conga.registerTool({ name: "x", label: "X", description: "D", risk: "low",
+    execute() { return "ran"; } });
+"#,
+        );
+        let (tx, rx) = mpsc::channel::<JsRequest>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<JsExtensions, String>>();
+        let handle = std::thread::spawn(move || js_thread(vec![script], tx, rx, ready_tx));
+        let ext = ready_rx
+            .recv()
+            .expect("the thread must report back")
+            .expect("the script must load");
+        assert_eq!(ext.tools.len(), 1);
+        assert_eq!(ext.tools[0].name, "x");
+        assert_eq!(ext.tools[0].risk, RiskLevel::Low);
+
+        // The runtime is alive: the tool call round-trips through the thread.
+        let out = (ext.tools[0].execute)(tool_call_ctx(serde_json::json!({})))
+            .await
+            .expect("must succeed");
+        assert!(!out.is_error);
+        assert_eq!(out.content[0], ContentBlock::text("ran"));
+
+        // The runtime thread lives until its senders drop; detach it.
+        drop(handle);
+    }
+
+    #[test]
+    fn load_scripts_with_no_scripts_returns_no_tools() {
+        let ext = load_scripts(&[]).expect("must load");
+        assert!(ext.tools.is_empty());
+    }
+
+    #[test]
+    fn load_scripts_reports_a_missing_script_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.js");
+        let err = match load_scripts(&[missing]) {
+            Err(e) => e,
+            Ok(_) => panic!("a missing script file must fail the load"),
+        };
+        assert!(err.contains("missing.js"), "got: {err}");
+    }
 }

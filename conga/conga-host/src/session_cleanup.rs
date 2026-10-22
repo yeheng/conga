@@ -54,4 +54,72 @@ mod tests {
         run_hooks("sess-x");
         assert!(SEEN.lock().unwrap().contains(&"sess-x".to_string()));
     }
+
+    // ---- cleanup_session_resources ----
+
+    #[tokio::test]
+    async fn cleanup_session_resources_runs_the_hooks_for_that_session() {
+        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        register_hook(Arc::new(|sid| SEEN.lock().unwrap().push(sid.to_string())));
+        cleanup_session_resources("sess-cleanup-1").await;
+        cleanup_session_resources("sess-cleanup-2").await;
+        let seen = SEEN.lock().unwrap();
+        assert!(
+            seen.contains(&"sess-cleanup-1".to_string()),
+            "the hook must be called with the cleaned session id"
+        );
+        assert!(
+            seen.contains(&"sess-cleanup-2".to_string()),
+            "each cleanup runs the hooks with its own id"
+        );
+        assert!(
+            !seen.contains(&"sess-cleanup-never-issued".to_string()),
+            "cleanup must not invent session ids: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_session_resources_for_an_unknown_session_is_a_no_op() {
+        // Safe to call for sessions that never had any process-global state.
+        cleanup_session_resources("sess-never-existed").await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_session_resources_evicts_the_session_shell() {
+        // The persistent shell is process-global state keyed by session id:
+        // cleanup must kill it, so the next command starts a fresh shell.
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = format!("cleanup-shell-{}", uuid::Uuid::new_v4());
+        let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+
+        let first = crate::tools::shell::run(
+            &sid,
+            "cd /",
+            std::time::Duration::from_secs(30),
+            tmp.path(),
+            &env,
+            None,
+        )
+        .await;
+        assert!(first.output.contains("[exit 0]"), "{:?}", first.output);
+
+        cleanup_session_resources(&sid).await;
+
+        let second = crate::tools::shell::run(
+            &sid,
+            "pwd",
+            std::time::Duration::from_secs(30),
+            tmp.path(),
+            &env,
+            None,
+        )
+        .await;
+        assert!(second.output.contains("[exit 0]"), "{:?}", second.output);
+        assert_ne!(
+            second.output.lines().next().unwrap().trim(),
+            "/",
+            "the shell must be respawned after cleanup (cwd reset), got: {:?}",
+            second.output
+        );
+    }
 }

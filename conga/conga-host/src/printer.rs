@@ -157,4 +157,88 @@ mod tests {
             "cache must be omitted when unreported: {s:?}"
         );
     }
+
+    #[test]
+    fn tool_execution_start_prints_the_tool_and_its_args() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut p = EventPrinter::new(&mut buf);
+        p.on_event(&AgentEvent::ToolExecutionStart {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            args: serde_json::json!({"cmd": "ls"}),
+        });
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("\n-> bash "), "{s:?}");
+        assert!(s.contains("ls"), "{s:?}");
+        assert!(s.ends_with('\n'), "{s:?}");
+    }
+
+    #[test]
+    fn tool_execution_end_prints_the_first_line_with_a_status_tag() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut p = EventPrinter::new(&mut buf);
+        let result = conga::ToolResultMessage {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            content: vec![conga::ContentBlock::text("first line\nsecond line")],
+            is_error: false,
+            timestamp: 0,
+        };
+        p.on_event(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tc1".into(),
+            result,
+            is_error: false,
+        });
+        assert_eq!(String::from_utf8(buf).unwrap(), "   [ok] first line\n");
+
+        // An errored call is tagged ERR; an empty result still prints a line.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut p = EventPrinter::new(&mut buf);
+        let result = conga::ToolResultMessage {
+            tool_call_id: "tc2".into(),
+            tool_name: "bash".into(),
+            content: vec![],
+            is_error: true,
+            timestamp: 0,
+        };
+        p.on_event(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tc2".into(),
+            result,
+            is_error: true,
+        });
+        assert_eq!(String::from_utf8(buf).unwrap(), "   [ERR] \n");
+    }
+
+    #[test]
+    fn thinking_deltas_and_usage_less_responses_print_nothing() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut p = EventPrinter::new(&mut buf);
+        p.on_event(&AgentEvent::MessageUpdate {
+            delta: ContentDelta::ThinkingDelta("hmm".into()),
+        });
+        p.on_event(&AgentEvent::MessageUpdate {
+            delta: ContentDelta::ToolCallDelta {
+                id: "x".into(),
+                name: None,
+                args_delta: "{}".into(),
+            },
+        });
+        // A provider response without usage must not print a usage line.
+        p.on_event(&AgentEvent::AfterProviderResponse {
+            model: "m".into(),
+            response: conga::AssistantMessage::new(&"m".to_string()),
+        });
+        assert_eq!(String::from_utf8(buf).unwrap(), "");
+    }
+
+    #[test]
+    fn turn_end_prints_a_single_newline() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut p = EventPrinter::new(&mut buf);
+        p.on_event(&AgentEvent::TurnEnd {
+            message: conga::AssistantMessage::new(&"m".to_string()),
+            tool_results: vec![],
+        });
+        assert_eq!(String::from_utf8(buf).unwrap(), "\n");
+    }
 }

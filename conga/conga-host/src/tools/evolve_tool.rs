@@ -137,4 +137,52 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("unavailable"));
     }
+
+    /// The audit trail under the one-line summary: every outcome class gets
+    /// its own marker, in a fixed order.
+    #[test]
+    fn details_lists_every_outcome_class_with_its_marker() {
+        let out = crate::evolve::EvolveOutcome {
+            added_insights: vec!["insight-a".into()],
+            added_skills: vec!["skill-a".into()],
+            updated_skills: vec!["skill-b".into()],
+            retired: vec!["skill-c".into()],
+            rejected: vec!["insight-b".into()],
+            skipped: vec!["insight-c".into()],
+        };
+        let rendered = details(&out);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "+ insight-a",
+                "+ skill-a",
+                "~ skill-b",
+                "- skill-c",
+                "! insight-b",
+                "! insight-c",
+            ]
+        );
+    }
+
+    /// Boundary: nothing happened -> no detail lines at all (not even a
+    /// blank one), so the summary stays clean.
+    #[test]
+    fn details_is_empty_for_empty_outcome() {
+        let out = crate::evolve::EvolveOutcome::default();
+        assert_eq!(details(&out), "");
+    }
+
+    /// The tool's schema advertises the optional session id.
+    #[test]
+    fn tool_schema_exposes_optional_session_id() {
+        let t = tool(None);
+        assert_eq!(t.label, "Evolve");
+        assert!(t.parameters.is_object());
+        assert!(
+            t.parameters["properties"]["session_id"]["type"] == "string",
+            "{:?}",
+            t.parameters
+        );
+    }
 }

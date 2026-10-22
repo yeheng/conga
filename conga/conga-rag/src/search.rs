@@ -91,4 +91,57 @@ mod tests {
             .unwrap()
             .expect("ingest must not fail under concurrency");
     }
+
+    /// A source filter that matches nothing must yield no hit — the query
+    /// embedding succeeds, only the payload filter is empty.
+    #[tokio::test]
+    async fn search_with_an_unknown_source_returns_no_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let (base, _req) = crate::testsupport::spawn_mock_embeddings(0).await;
+        let cfg =
+            crate::pipeline::tests::cfg_with_store(dir.path(), &dbdir.path().join("t.db"), &base);
+        std::fs::write(dir.path().join("m.md"), "match target").unwrap();
+        crate::pipeline::run_ingest(&cfg, None, false)
+            .await
+            .unwrap();
+
+        let hits = run_search(&cfg, "match", 5, Some("no-such-source")).await.unwrap();
+        assert!(hits.is_empty(), "an unknown source must not match: {hits:?}");
+    }
+
+    /// k = 0 asks for no result at all: the search must stay empty instead
+    /// of failing or returning the whole index.
+    #[tokio::test]
+    async fn search_with_k_zero_returns_no_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let (base, _req) = crate::testsupport::spawn_mock_embeddings(0).await;
+        let cfg =
+            crate::pipeline::tests::cfg_with_store(dir.path(), &dbdir.path().join("t.db"), &base);
+        std::fs::write(dir.path().join("m.md"), "match target").unwrap();
+        crate::pipeline::run_ingest(&cfg, None, false)
+            .await
+            .unwrap();
+
+        let hits = run_search(&cfg, "match", 0, None).await.unwrap();
+        assert!(hits.is_empty(), "k = 0 must not return hits: {hits:?}");
+    }
+
+    /// A config without an embedding model cannot even embed the query:
+    /// the search must surface the config error.
+    #[tokio::test]
+    async fn search_fails_when_the_embedding_is_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::pipeline::tests::cfg_with_store(
+            dir.path(),
+            &dbdir.path().join("t.db"),
+            "http://127.0.0.1:1/v1",
+        );
+        cfg.embedding.model = None;
+        let err = run_search(&cfg, "match", 2, None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("embedding.model"), "msg: {msg}");
+    }
 }

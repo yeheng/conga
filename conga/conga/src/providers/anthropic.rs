@@ -725,4 +725,425 @@ mod tests {
         assert_eq!(roles(&body), vec!["user", "assistant", "user"]);
         assert_eq!(body["messages"][2]["content"].as_array().unwrap().len(), 1);
     }
+
+    // ── Construction & Debug ───────────────────────────────────────
+
+    #[test]
+    fn with_client_keeps_the_base_url() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let p = AnthropicProvider::with_client("http://127.0.0.1:1234/v1", "sk-test", client);
+        let out = format!("{p:?}");
+        assert!(out.contains("AnthropicProvider"), "{out}");
+        assert!(out.contains("http://127.0.0.1:1234/v1"), "{out}");
+    }
+
+    #[test]
+    fn debug_format_never_leaks_the_api_key() {
+        let p = AnthropicProvider::new("sk-super-secret");
+        let out = format!("{p:?}");
+        assert!(
+            !out.contains("sk-super-secret"),
+            "the api key must not reach the logs: {out}"
+        );
+    }
+
+    #[test]
+    fn with_base_url_overrides_the_default_endpoint() {
+        let p = AnthropicProvider::new("k").with_base_url("http://127.0.0.1:9999/v1");
+        let out = format!("{p:?}");
+        assert!(out.contains("http://127.0.0.1:9999/v1"), "{out}");
+        assert!(!out.contains("api.anthropic.com"), "{out}");
+    }
+
+    #[test]
+    fn from_config_uses_the_configured_base_url() {
+        use crate::test_util::fake_env;
+        let cfg = crate::providers::ProviderConfig::from_env_with(&fake_env(&[
+            ("CONGA_LLM_BASE_URL", "https://api.anthropic.com/v1"),
+            ("CONGA_LLM_KEY", "sk-test"),
+            ("CONGA_LLM_MODEL", "claude-sonnet"),
+            ("CONGA_LLM_API", "anthropic"),
+        ]))
+        .unwrap();
+        let p = AnthropicProvider::from_config(&cfg);
+        let out = format!("{p:?}");
+        assert!(out.contains("https://api.anthropic.com/v1"), "{out}");
+        assert!(!out.contains("sk-test"), "{out}");
+    }
+
+    // ── StreamFn::stream ───────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_posts_an_anthropic_request_and_parses_the_sse_response() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 1024];
+            // Read the head (up to the blank line that ends it).
+            let head_end = loop {
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let content_len: usize = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    if k.eq_ignore_ascii_case("content-length") {
+                        v.trim().parse().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            // Read the body.
+            while buf.len() - head_end < content_len {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            sock.write_all(
+                b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            )
+            .await
+            .unwrap();
+            sock.write_all(
+                b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let provider = AnthropicProvider::with_client(
+            format!("http://{addr}/v1"),
+            "sk-test",
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        );
+        let model = ModelSpec {
+            id: "claude".into(),
+            api: crate::types::context::ProviderApi::Anthropic,
+            max_tokens: 64,
+        };
+        let mut stream = provider.stream(&model, &[AgentMessage::user("hi")], "sys", &[], None);
+        let mut chunks = Vec::new();
+        while let Some(c) = stream.next().await {
+            chunks.push(c);
+        }
+        server.await.unwrap();
+
+        // The request the provider actually put on the wire.
+        let req = rx.await.unwrap();
+        assert!(req.starts_with("POST /v1/messages"), "{req}");
+        assert!(
+            req.to_lowercase().contains("x-api-key: sk-test"),
+            "missing api key header: {req}"
+        );
+        assert!(
+            req.to_lowercase().contains("anthropic-version: 2023-06-01"),
+            "missing version header: {req}"
+        );
+        let body_start = req.find("\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_str(&req[body_start..]).unwrap();
+        assert_eq!(body["model"], "claude");
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["max_tokens"], json!(64));
+        assert_eq!(body["system"][0]["text"], "sys");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hi");
+
+        // The response frames map to chunks.
+        assert_eq!(chunks[0], StreamChunk::TextDelta("Hi".into()));
+        assert_eq!(chunks[1], StreamChunk::Stop(StopReason::EndTurn));
+        assert_eq!(
+            chunks[2],
+            StreamChunk::Usage {
+                input: 0,
+                output: 3,
+                cache_read: 0,
+                cache_write: 0
+            }
+        );
+        assert_eq!(chunks.last(), Some(&StreamChunk::Done));
+    }
+
+    // ── convert_message ────────────────────────────────────────────
+
+    #[test]
+    fn convert_message_drops_a_user_message_without_text() {
+        let empty = AgentMessage::User(UserMessage {
+            content: vec![],
+            timestamp: 0,
+        });
+        assert!(convert_message(&empty).is_none());
+    }
+
+    #[test]
+    fn convert_message_keeps_every_text_block_of_a_user_message() {
+        let msg = AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::text("a"), ContentBlock::text("b")],
+            timestamp: 0,
+        });
+        let v = convert_message(&msg).expect("user converts");
+        assert_eq!(v["role"], "user");
+        let blocks = v["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "a");
+        assert_eq!(blocks[1]["text"], "b");
+    }
+
+    #[test]
+    fn convert_message_drops_an_assistant_message_without_text_or_tool_calls() {
+        let empty = AgentMessage::Assistant(AssistantMessage {
+            content: vec![],
+            model: "claude".into(),
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+            timestamp: 0,
+            stream_indices: Vec::new(),
+        });
+        assert!(convert_message(&empty).is_none());
+    }
+
+    #[test]
+    fn convert_message_drops_an_assistant_message_with_thinking_only() {
+        // Thinking blocks are not part of the Anthropic wire format here.
+        let msg = AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Thinking {
+                thinking: "hmm".into(),
+            }],
+            model: "claude".into(),
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+            timestamp: 0,
+            stream_indices: Vec::new(),
+        });
+        assert!(convert_message(&msg).is_none());
+    }
+
+    #[test]
+    fn convert_message_maps_an_assistant_tool_call_to_tool_use() {
+        let msg = AgentMessage::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::text("thinking out loud"),
+                ContentBlock::ToolCall {
+                    tool_call: ToolCall {
+                        id: "toolu_1".into(),
+                        function: FunctionCall {
+                            name: "bash".into(),
+                            arguments: r#"{"cmd":"ls"}"#.into(),
+                        },
+                    },
+                },
+            ],
+            model: "claude".into(),
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+            timestamp: 0,
+            stream_indices: Vec::new(),
+        });
+        let v = convert_message(&msg).expect("assistant converts");
+        assert_eq!(v["role"], "assistant");
+        let blocks = v["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "toolu_1");
+        assert_eq!(blocks[1]["name"], "bash");
+        assert_eq!(blocks[1]["input"]["cmd"], "ls");
+    }
+
+    #[test]
+    fn convert_message_falls_back_to_an_empty_input_for_broken_arguments() {
+        // A tool call with unparseable arguments must still convert: the
+        // input degrades to `{}` instead of dropping the whole call.
+        let msg = AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall {
+                tool_call: ToolCall {
+                    id: "toolu_1".into(),
+                    function: FunctionCall {
+                        name: "bash".into(),
+                        arguments: "{not json".into(),
+                    },
+                },
+            }],
+            model: "claude".into(),
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+            timestamp: 0,
+            stream_indices: Vec::new(),
+        });
+        let v = convert_message(&msg).expect("assistant converts");
+        let blocks = v["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["input"], json!({}));
+    }
+
+    #[test]
+    fn convert_message_maps_a_tool_result_to_a_user_tool_result_block() {
+        let msg = tool_result("t1", "out1");
+        let v = convert_message(&msg).expect("tool result converts");
+        assert_eq!(v["role"], "user");
+        let blocks = v["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "t1");
+        assert_eq!(blocks[0]["content"], "out1");
+        assert_eq!(blocks[0]["is_error"], json!(false));
+    }
+
+    #[test]
+    fn convert_message_marks_an_errored_tool_result() {
+        let mut msg = tool_result("t1", "boom");
+        if let AgentMessage::ToolResult(tr) = &mut msg {
+            tr.is_error = true;
+        }
+        let v = convert_message(&msg).expect("tool result converts");
+        assert_eq!(v["content"][0]["is_error"], json!(true));
+    }
+
+    #[test]
+    fn convert_message_drops_a_custom_message() {
+        let custom = AgentMessage::Custom(crate::types::message::CustomMessage {
+            custom_type: "x".into(),
+            content: json!({}),
+            timestamp: 0,
+        });
+        assert!(convert_message(&custom).is_none());
+    }
+
+    // ── fold_same_role ─────────────────────────────────────────────
+
+    #[test]
+    fn fold_same_role_on_an_empty_list() {
+        assert!(fold_same_role(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn fold_same_role_keeps_a_single_message() {
+        let folded = fold_same_role(vec![json!({"role": "user", "content": []})]);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0]["role"], "user");
+    }
+
+    #[test]
+    fn fold_same_role_merges_two_user_messages() {
+        let folded = fold_same_role(vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "a"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "b"}]}),
+        ]);
+        assert_eq!(folded.len(), 1);
+        let blocks = folded[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "a");
+        assert_eq!(blocks[1]["text"], "b");
+    }
+
+    #[test]
+    fn fold_same_role_merges_three_messages_of_the_same_role() {
+        let folded = fold_same_role(vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "a"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "b"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "c"}]}),
+        ]);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0]["content"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn fold_same_role_keeps_alternating_roles_apart() {
+        let folded = fold_same_role(vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "a"}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "b"}]}),
+        ]);
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0]["role"], "user");
+        assert_eq!(folded[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn fold_same_role_merges_a_tool_result_into_the_preceding_user_message() {
+        // Both are `role: "user"` on the wire: the tool_result block must
+        // join the user message, not become a second user turn.
+        let folded = fold_same_role(vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "q"}]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1"}]}),
+        ]);
+        assert_eq!(folded.len(), 1);
+        let blocks = folded[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["type"], "tool_result");
+    }
+
+    #[test]
+    fn fold_same_role_does_not_merge_a_message_without_a_content_array() {
+        // Nothing to concatenate: the messages must stay separate.
+        let folded = fold_same_role(vec![json!({"role": "user"}), json!({"role": "user"})]);
+        assert_eq!(folded.len(), 2);
+    }
+
+    // ── tool_to_anthropic ──────────────────────────────────────────
+
+    #[test]
+    fn tool_to_anthropic_maps_the_definition() {
+        let tool = ToolDefinition {
+            name: "read".into(),
+            label: "Read".into(),
+            description: "read a file".into(),
+            parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            risk: crate::types::tool::RiskLevel::Low,
+            execute: std::sync::Arc::new(|_c: crate::types::tool::ToolCallCtx| {
+                Box::pin(async { Ok(crate::types::tool::ToolResult::text("")) })
+            }),
+        };
+        let v = tool_to_anthropic(&tool);
+        assert_eq!(v["name"], "read");
+        assert_eq!(v["description"], "read a file");
+        assert_eq!(v["input_schema"]["type"], "object");
+        assert_eq!(v["input_schema"]["properties"]["path"]["type"], "string");
+        // The Anthropic wire format uses `input_schema`, not `parameters`.
+        assert!(v.get("parameters").is_none(), "{v}");
+        // Internal fields must not leak.
+        assert!(v.get("label").is_none());
+        assert!(v.get("risk").is_none());
+    }
+
+    #[test]
+    fn tool_to_anthropic_with_empty_parameters() {
+        let tool = ToolDefinition {
+            name: "ping".into(),
+            label: "Ping".into(),
+            description: String::new(),
+            parameters: json!({}),
+            risk: crate::types::tool::RiskLevel::Low,
+            execute: std::sync::Arc::new(|_c: crate::types::tool::ToolCallCtx| {
+                Box::pin(async { Ok(crate::types::tool::ToolResult::text("")) })
+            }),
+        };
+        let v = tool_to_anthropic(&tool);
+        assert_eq!(v["name"], "ping");
+        assert_eq!(v["description"], "");
+        assert_eq!(v["input_schema"], json!({}));
+    }
 }

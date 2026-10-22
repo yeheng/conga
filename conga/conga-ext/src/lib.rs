@@ -52,6 +52,26 @@ mod tests {
         assert_eq!(names, expected);
     }
 
+    /// `register_all` is the CLI/demo composition root: the production set
+    /// plus the `hello` demo tool.
+    #[test]
+    fn register_all_adds_hello_on_top_of_the_production_set() {
+        let mut api = conga::ExtensionApiImpl::new();
+        register_all(&mut api);
+        let names: Vec<_> = api.tools.iter().map(|t| t.name.clone()).collect();
+        let mut expected: Vec<&str> = vec!["web_search"];
+        if cfg!(feature = "rag") {
+            expected.push("rag_search");
+            expected.push("rag_remember");
+        }
+        if cfg!(feature = "terminal") {
+            expected.push("terminal");
+        }
+        // `hello` comes last: `register_all` = `prod_register` + demo tool.
+        expected.push("hello");
+        assert_eq!(names, expected);
+    }
+
     /// Security regression: `terminal` runs arbitrary commands on a PTY —
     /// strictly more powerful than `bash` (persistent, stdin-writable). It
     /// must be `High` like `bash`, or AutoEdit-mode hosts auto-approve a

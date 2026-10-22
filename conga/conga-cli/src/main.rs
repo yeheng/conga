@@ -302,4 +302,157 @@ mod tests {
     fn approval_banner_empty_for_empty_args() {
         assert_eq!(approval_banner("bash", &serde_json::json!({})), "");
     }
+
+    // ── Extension loading ───────────────────────────────────────
+
+    #[test]
+    fn load_inprocess_ext_wires_the_tools_and_the_hook_chain() {
+        let (tools, hooks) = load_inprocess_ext();
+        #[cfg(feature = "ext")]
+        {
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(names.contains(&"web_search"), "{names:?}");
+            assert!(names.contains(&"hello"), "{names:?}");
+            assert!(hooks.is_some(), "the extension hook chain must be wired");
+        }
+        #[cfg(not(feature = "ext"))]
+        {
+            assert!(tools.is_empty(), "no in-process tools without the feature");
+            assert!(hooks.is_none(), "no hook chain without the feature");
+        }
+    }
+
+    #[test]
+    fn load_js_ext_for_without_scripts_returns_nothing() {
+        let (tools, hooks) = load_js_ext_for(&[]);
+        assert!(tools.is_empty());
+        assert!(
+            hooks.is_empty(),
+            "an empty script list must not spawn a hook chain"
+        );
+    }
+
+    #[test]
+    fn load_js_ext_reads_the_scripts_from_the_process_args() {
+        // The test binary runs without `--ext-js=`, so nothing is loaded.
+        let (tools, hooks) = load_js_ext();
+        assert!(tools.is_empty());
+        assert!(hooks.is_empty());
+    }
+
+    // ── Approval prompt ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stdin_approver_denies_an_empty_answer() {
+        // The test harness hands the process an empty stdin: no answer is
+        // a deny (the headless default).
+        let approved = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stdin_approver("bash", &serde_json::json!({})),
+        )
+        .await
+        .expect("the approver must answer without blocking forever");
+        assert!(!approved, "an empty answer denies the call");
+    }
+
+    // ── Slash commands ──────────────────────────────────────────
+
+    /// A throwaway directory for the session store. `conga-cli` has no
+    /// dev-dependencies, so the temp dir is created by hand.
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("conga-cli-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("the temp root is created");
+        p
+    }
+
+    /// A host wired to a throwaway session store; the provider is never
+    /// called (no turn is run in these tests).
+    fn test_host(root: &std::path::Path) -> Host {
+        let cfg = conga_host::HostConfig {
+            provider: conga::ProviderConfig::from_parts(
+                conga::ProviderApi::OpenAiCompat,
+                "http://127.0.0.1:9/v1".into(),
+                "test-key".into(),
+                "test-model".into(),
+            )
+            .expect("a valid provider config"),
+            tunables: conga::AgentTunables::from_env_with(&|_| Err(std::env::VarError::NotPresent)),
+        };
+        let session = conga_host::session::SessionManager::with_root(root.to_path_buf());
+        let deny: conga_host::permission::Approver =
+            Arc::new(|_name: &str, _args: &serde_json::Value| Box::pin(async move { false }));
+        let policy = Arc::new(conga_host::PermissionPolicy::new(Mode::AutoEdit, deny));
+        Host::new(cfg, session, policy, "test prompt".into(), Vec::new())
+    }
+
+    #[tokio::test]
+    async fn slash_mode_switches_the_permission_mode() {
+        let root = temp_root("mode");
+        let mut host = test_host(&root);
+        assert_eq!(host.policy().mode(), Mode::AutoEdit);
+
+        handle_slash("mode plan", &mut host, &[]).await;
+
+        assert_eq!(host.policy().mode(), Mode::Plan);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn slash_mode_without_an_argument_keeps_the_mode() {
+        let root = temp_root("mode-arg");
+        let mut host = test_host(&root);
+
+        handle_slash("mode", &mut host, &[]).await;
+
+        assert_eq!(
+            host.policy().mode(),
+            Mode::AutoEdit,
+            "an unparsable mode must not change the policy"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn slash_clear_appends_a_cleared_fact_to_the_session_log() {
+        let root = temp_root("clear");
+        let mut host = test_host(&root);
+        let sid = host.session().current_id();
+
+        handle_slash("clear", &mut host, &[]).await;
+
+        let events = host
+            .session()
+            .open_or_migrate(&sid)
+            .await
+            .expect("the session log is readable");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, conga::SessionEvent::Cleared)),
+            "the clear must be recorded in the append-only log: {events:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn slash_unknown_command_leaves_the_host_untouched() {
+        let root = temp_root("unknown");
+        let mut host = test_host(&root);
+        let sid = host.session().current_id();
+
+        handle_slash("definitely-not-a-command", &mut host, &[]).await;
+
+        assert_eq!(host.policy().mode(), Mode::AutoEdit);
+        let events = host
+            .session()
+            .open_or_migrate(&sid)
+            .await
+            .expect("the session log is readable");
+        assert!(
+            events.is_empty(),
+            "an unknown command must not touch the session: {events:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

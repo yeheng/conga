@@ -213,6 +213,37 @@ mod tests {
     /// Serialize env-dependent tests (std::env is process-global).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    fn request(uri: &str, authorization: Option<&str>) -> Request {
+        let mut b = Request::builder().uri(uri);
+        if let Some(a) = authorization {
+            b = b.header(axum::http::header::AUTHORIZATION, a);
+        }
+        b.body(axum::body::Body::empty()).unwrap()
+    }
+
+    fn test_state(token: &str) -> Arc<AppState> {
+        Arc::new(AppState {
+            sessions: dashmap::DashMap::new(),
+            store_root: std::path::PathBuf::from("/tmp"),
+            index_db: std::path::PathBuf::from("/tmp/index.db"),
+            auth_token: Arc::new(token.to_string()),
+        })
+    }
+
+    /// A router behind the token middleware.
+    fn guarded_router(token: &str) -> axum::Router {
+        let state = test_state(token);
+        axum::Router::new()
+            .route("/api/thing", axum::routing::get(|| async { "ok" }))
+            .route("/ws", axum::routing::get(|| async { "ok" }))
+            .route("/public", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_token,
+            ))
+            .with_state(state)
+    }
+
     #[test]
     fn token_matches_equality_and_rejection() {
         assert!(token_matches("abc123", "abc123"));
@@ -221,6 +252,145 @@ mod tests {
         assert!(!token_matches("abc123", ""));
         assert!(!token_matches("", "x"));
         assert!(token_matches("", ""));
+    }
+
+    #[test]
+    fn token_source_display_names_the_env_or_the_file() {
+        assert_eq!(TokenSource::Env.to_string(), "CONGA_GATEWAY_TOKEN env");
+        let p = std::path::PathBuf::from("/tmp/gateway_token");
+        assert_eq!(
+            TokenSource::File(p.clone()).to_string(),
+            "/tmp/gateway_token"
+        );
+        assert_eq!(TokenSource::Generated(p).to_string(), "/tmp/gateway_token");
+    }
+
+    #[test]
+    fn presented_token_reads_the_bearer_header() {
+        assert_eq!(
+            presented_token(&request("/api/x", Some("Bearer abc"))).as_deref(),
+            Some("abc")
+        );
+        // The scheme is matched case-insensitively.
+        assert_eq!(
+            presented_token(&request("/api/x", Some("bearer abc"))).as_deref(),
+            Some("abc")
+        );
+        // Surrounding whitespace is trimmed.
+        assert_eq!(
+            presented_token(&request("/api/x", Some("Bearer  abc  "))).as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn presented_token_falls_back_to_the_query_parameter() {
+        assert_eq!(
+            presented_token(&request("/ws?token=abc", None)).as_deref(),
+            Some("abc")
+        );
+        // Percent- and plus-decoding.
+        assert_eq!(
+            presented_token(&request("/ws?token=a%20b", None)).as_deref(),
+            Some("a b")
+        );
+        assert_eq!(
+            presented_token(&request("/ws?token=a+b", None)).as_deref(),
+            Some("a b")
+        );
+        // The first `token` parameter wins.
+        assert_eq!(
+            presented_token(&request("/ws?token=a&token=b", None)).as_deref(),
+            Some("a")
+        );
+        // A header takes precedence over the query.
+        assert_eq!(
+            presented_token(&request("/ws?token=q", Some("Bearer h"))).as_deref(),
+            Some("h")
+        );
+    }
+
+    #[test]
+    fn presented_token_is_none_without_a_usable_credential() {
+        assert_eq!(presented_token(&request("/api/x", None)), None);
+        // A foreign scheme is not a token.
+        assert_eq!(presented_token(&request("/api/x", Some("Basic abc"))), None);
+        // No space after the scheme: not the Bearer form.
+        assert_eq!(presented_token(&request("/api/x", Some("Bearer"))), None);
+        // An empty query value is rejected.
+        assert_eq!(presented_token(&request("/ws?token=", None)), None);
+        assert_eq!(presented_token(&request("/ws?other=1", None)), None);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_is_a_401_with_a_challenge() {
+        let resp = unauthorized();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .unwrap(),
+            "Bearer realm=\"conga-gateway\""
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "unauthorized: missing or invalid gateway token");
+    }
+
+    #[tokio::test]
+    async fn require_token_gates_api_and_ws_paths_only() {
+        use tower::util::ServiceExt;
+
+        // No credential -> 401 on /api/*.
+        let app = guarded_router("secret");
+        let res = app
+            .clone()
+            .oneshot(request("/api/thing", None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // A wrong token -> 401.
+        let res = app
+            .clone()
+            .oneshot(request("/api/thing", Some("Bearer wrong")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // An empty bearer value -> 401 (never an empty-token match).
+        let res = app
+            .clone()
+            .oneshot(request("/api/thing", Some("Bearer ")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // The right token -> through.
+        let res = app
+            .clone()
+            .oneshot(request("/api/thing", Some("Bearer secret")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // The query parameter works too (browser WebSocket).
+        let res = app
+            .clone()
+            .oneshot(request("/api/thing?token=secret", None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // /ws is gated as well.
+        let res = app.clone().oneshot(request("/ws", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // A non-API path is not gated.
+        let res = app.oneshot(request("/public", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[test]

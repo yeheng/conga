@@ -339,4 +339,282 @@ mod tests {
         ]));
         assert!(matches!(r, Err(ConfigError::BadProxy { .. })));
     }
+
+    // ── ProviderConfig::from_env ──────────────────────────────────
+
+    #[test]
+    fn from_env_agrees_with_the_injected_process_lookup() {
+        // `from_env` must be exactly `from_env_with(&std::env::var)` — no
+        // hidden extra knobs, no divergence between the two entry points.
+        let direct = ProviderConfig::from_env();
+        let injected = ProviderConfig::from_env_with(&|k: &str| std::env::var(k));
+        match (direct, injected) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(a.api, b.api);
+                assert_eq!(a.base_url, b.base_url);
+                assert_eq!(a.api_key, b.api_key);
+                assert_eq!(a.model, b.model);
+            }
+            (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+            _ => panic!("from_env and from_env_with must agree"),
+        }
+    }
+
+    #[test]
+    fn from_env_error_names_the_missing_variable() {
+        // Whatever the machine's env holds, the failure mode must name the
+        // variable that is missing — never a bare "invalid config".
+        if let Err(e) = ProviderConfig::from_env() {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("CONGA_LLM_BASE_URL")
+                    || msg.contains("CONGA_LLM_KEY")
+                    || msg.contains("CONGA_LLM_MODEL"),
+                "error must name the missing variable, got: {msg}"
+            );
+        }
+    }
+
+    // ── ProviderConfig::from_parts ────────────────────────────────
+
+    #[test]
+    fn from_parts_keeps_the_explicit_values() {
+        let cfg = ProviderConfig::from_parts(
+            ProviderApi::Anthropic,
+            "https://api.anthropic.com/v1".to_string(),
+            "sk-test".to_string(),
+            "claude-sonnet".to_string(),
+        )
+        .expect("explicit parts must build");
+        assert_eq!(cfg.api, ProviderApi::Anthropic);
+        assert_eq!(cfg.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(cfg.api_key, "sk-test");
+        assert_eq!(cfg.model, "claude-sonnet");
+    }
+
+    #[test]
+    fn from_parts_keeps_the_openai_api_selector() {
+        let cfg = ProviderConfig::from_parts(
+            ProviderApi::OpenAiCompat,
+            "http://127.0.0.1:8080/v1".to_string(),
+            "k".to_string(),
+            "m".to_string(),
+        )
+        .expect("explicit parts must build");
+        assert_eq!(cfg.api, ProviderApi::OpenAiCompat);
+        assert_eq!(cfg.base_url, "http://127.0.0.1:8080/v1");
+    }
+
+    #[test]
+    fn from_parts_accepts_an_empty_base_url() {
+        // No validation happens at this layer: the host owns the value and
+        // the failure (if any) surfaces on the first request.
+        let cfg = ProviderConfig::from_parts(
+            ProviderApi::OpenAiCompat,
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+        .expect("empty values must not panic");
+        assert_eq!(cfg.base_url, "");
+        assert_eq!(cfg.api_key, "");
+        assert_eq!(cfg.model, "");
+    }
+
+    // ── build_client ──────────────────────────────────────────────
+
+    #[test]
+    fn build_client_without_any_proxy() {
+        let client = build_client(&None, &None, &None).expect("no proxy must build");
+        let _ = client;
+    }
+
+    #[test]
+    fn build_client_with_a_generic_proxy() {
+        let generic = Some("http://127.0.0.1:7890".to_string());
+        let client = build_client(&None, &None, &generic).expect("generic proxy must build");
+        let _ = client;
+    }
+
+    #[test]
+    fn build_client_with_scheme_specific_proxies() {
+        let http = Some("http://127.0.0.1:7890".to_string());
+        let https = Some("http://127.0.0.1:7891".to_string());
+        let client = build_client(&http, &https, &None).expect("scheme proxies must build");
+        let _ = client;
+    }
+
+    #[test]
+    fn build_client_with_only_an_http_proxy() {
+        let http = Some("http://127.0.0.1:7890".to_string());
+        let client = build_client(&http, &None, &None).expect("http-only proxy must build");
+        let _ = client;
+    }
+
+    /// A port no ambient proxy uses, so the assertions below cannot be
+    /// satisfied by the machine's own `HTTP_PROXY`/`HTTPS_PROXY`.
+    const PROXY_MARKER_PORT: u16 = 18899;
+
+    #[test]
+    fn from_parts_with_proxy_installs_the_given_proxy() {
+        let cfg = ProviderConfig::from_parts_with_proxy(
+            ProviderApi::OpenAiCompat,
+            "https://api.x.com/v1".into(),
+            "sk-test".into(),
+            "main-model".into(),
+            Some(&format!("http://127.0.0.1:{PROXY_MARKER_PORT}")),
+        )
+        .expect("a valid proxy must build");
+        assert_eq!(cfg.base_url, "https://api.x.com/v1");
+        assert_eq!(cfg.api_key, "sk-test");
+        assert_eq!(cfg.model, "main-model");
+        let dbg = format!("{:?}", cfg.client);
+        assert!(
+            dbg.contains("18899"),
+            "the proxy must reach the client: {dbg}"
+        );
+    }
+
+    #[test]
+    fn from_parts_with_proxy_without_a_proxy_leaves_it_unproxied() {
+        let cfg = ProviderConfig::from_parts_with_proxy(
+            ProviderApi::Anthropic,
+            "https://api.x.com".into(),
+            "sk-test".into(),
+            "m".into(),
+            None,
+        )
+        .expect("no proxy must build");
+        assert_eq!(cfg.api, ProviderApi::Anthropic);
+        let dbg = format!("{:?}", cfg.client);
+        assert!(
+            !dbg.contains("18899"),
+            "no proxy must be installed: {dbg}"
+        );
+    }
+
+    #[test]
+    fn from_parts_with_proxy_treats_a_blank_proxy_as_absent() {
+        let cfg = ProviderConfig::from_parts_with_proxy(
+            ProviderApi::OpenAiCompat,
+            "https://api.x.com/v1".into(),
+            "sk-test".into(),
+            "m".into(),
+            Some("   "),
+        )
+        .expect("a blank proxy must build");
+        let dbg = format!("{:?}", cfg.client);
+        assert!(
+            !dbg.contains("18899"),
+            "a blank proxy must not be installed: {dbg}"
+        );
+    }
+
+    #[test]
+    fn from_parts_with_proxy_rejects_an_unparsable_proxy() {
+        let err = ProviderConfig::from_parts_with_proxy(
+            ProviderApi::OpenAiCompat,
+            "https://api.x.com/v1".into(),
+            "sk-test".into(),
+            "m".into(),
+            Some("not a url"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::BadProxy { .. }),
+            "an unparsable proxy must fail loudly, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_client_with_only_an_https_proxy() {
+        let https = Some("http://127.0.0.1:7891".to_string());
+        let client = build_client(&None, &https, &None).expect("https-only proxy must build");
+        let _ = client;
+    }
+
+    #[test]
+    fn build_client_rejects_a_malformed_http_proxy() {
+        let http = Some("not a url %".to_string());
+        let err = build_client(&http, &None, &None).expect_err("malformed proxy must fail");
+        match err {
+            ConfigError::BadProxy { var, url, .. } => {
+                assert!(var.contains("HTTP_PROXY"), "var must name the knob: {var}");
+                assert_eq!(url, "not a url %");
+            }
+            other => panic!("expected BadProxy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_client_rejects_a_malformed_https_proxy() {
+        let https = Some("not a url %".to_string());
+        let err = build_client(&None, &https, &None).expect_err("malformed proxy must fail");
+        match err {
+            ConfigError::BadProxy { var, url, .. } => {
+                assert!(var.contains("HTTPS_PROXY"), "var must name the knob: {var}");
+                assert_eq!(url, "not a url %");
+            }
+            other => panic!("expected BadProxy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_client_error_message_names_the_offending_url() {
+        let generic = Some("not a url %".to_string());
+        let err = build_client(&None, &None, &generic).expect_err("malformed proxy must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("not a url %"), "{msg}");
+        assert!(msg.contains("CONGA_LLM_PROXY"), "{msg}");
+    }
+
+    // ── collect_text ──────────────────────────────────────────────
+
+    #[test]
+    fn collect_text_on_an_empty_block_list() {
+        assert_eq!(collect_text(&[]), "");
+    }
+
+    #[test]
+    fn collect_text_joins_the_text_blocks_without_a_separator() {
+        let blocks = vec![
+            ContentBlock::text("a"),
+            ContentBlock::text("b"),
+            ContentBlock::text("c"),
+        ];
+        assert_eq!(collect_text(&blocks), "abc");
+    }
+
+    #[test]
+    fn collect_text_skips_thinking_and_tool_call_blocks() {
+        use crate::types::message::{FunctionCall, ToolCall};
+        let blocks = vec![
+            ContentBlock::text("visible"),
+            ContentBlock::Thinking {
+                thinking: "hidden".to_string(),
+            },
+            ContentBlock::ToolCall {
+                tool_call: ToolCall {
+                    id: "t1".to_string(),
+                    function: FunctionCall {
+                        name: "bash".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+            },
+            ContentBlock::text(" tail"),
+        ];
+        assert_eq!(collect_text(&blocks), "visible tail");
+    }
+
+    #[test]
+    fn collect_text_keeps_whitespace_and_newlines_verbatim() {
+        let blocks = vec![ContentBlock::text("  spaced  "), ContentBlock::text("\n")];
+        assert_eq!(collect_text(&blocks), "  spaced  \n");
+    }
+
+    #[test]
+    fn collect_text_with_an_empty_text_block() {
+        assert_eq!(collect_text(&[ContentBlock::text("")]), "");
+    }
 }

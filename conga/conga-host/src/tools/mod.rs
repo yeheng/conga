@@ -235,6 +235,34 @@ mod tests {
         assert_eq!(truncate_output("small"), "small");
     }
 
+    /// Boundary: exactly at the cap nothing is truncated, and nothing is
+    /// spilled to disk.
+    #[test]
+    fn output_at_exactly_the_limit_is_left_alone() {
+        let exact = "x".repeat(MAX_OUTPUT_BYTES);
+        let out = truncate_output(&exact);
+        assert_eq!(out.len(), MAX_OUTPUT_BYTES);
+        assert!(!out.ends_with("...(truncated)"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = spill_ctx(tmp.path());
+        let out = spill_or_truncate(&ctx, &exact);
+        assert_eq!(out.len(), MAX_OUTPUT_BYTES);
+        assert!(
+            !tmp.path().join("spill").exists(),
+            "nothing may be spilled at the limit"
+        );
+    }
+
+    /// Boundary: one byte over the cap is truncated with the indicator.
+    #[test]
+    fn output_one_byte_over_the_limit_is_truncated() {
+        let over = "x".repeat(MAX_OUTPUT_BYTES + 1);
+        let out = truncate_output(&over);
+        assert!(out.ends_with("\n...(truncated)"), "{}", &out[out.len() - 20..]);
+        assert_eq!(out.len(), MAX_OUTPUT_BYTES + "\n...(truncated)".len());
+    }
+
     fn spill_ctx(state_dir: &Path) -> conga::types::tool::ToolCallCtx {
         conga::types::tool::ToolCallCtx {
             tool_call_id: "t".into(),
@@ -325,6 +353,133 @@ mod tests {
         std::fs::write(cwd.path().join("f.txt"), "x").unwrap();
         let resolved = resolve_read_path_in(cwd.path(), root.path(), "f.txt").unwrap();
         assert_eq!(resolved, cwd.path().canonicalize().unwrap().join("f.txt"));
+    }
+
+    /// The built-in set is the host's default tool list: every entry must be
+    /// fully wired (schema + executable handler), and the list must not
+    /// silently grow or shrink.
+    #[test]
+    fn built_in_tools_returns_the_expected_tool_set() {
+        let names: Vec<String> = built_in_tools().into_iter().map(|t| t.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "read",
+                "write",
+                "edit",
+                "bash",
+                "list",
+                "grep",
+                "fetch",
+                "todo",
+                "spawn_subagents",
+                "evolve",
+            ]
+        );
+    }
+
+    #[test]
+    fn built_in_tools_are_all_fully_specified() {
+        let tools = built_in_tools();
+        assert_eq!(tools.len(), 10);
+        for t in &tools {
+            assert!(!t.name.is_empty(), "tool without a name");
+            assert!(!t.label.is_empty(), "{} has no label", t.name);
+            assert!(!t.description.is_empty(), "{} has no description", t.name);
+            assert!(
+                t.parameters.is_object(),
+                "{} has a non-object parameter schema",
+                t.name
+            );
+        }
+    }
+
+    /// An existing path is its own nearest existing ancestor: the returned
+    /// tail must be empty (no phantom components).
+    #[test]
+    fn nearest_existing_ancestor_returns_existing_path_with_empty_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        let (ancestor, tail) = nearest_existing_ancestor(&file);
+        assert_eq!(ancestor, file);
+        assert!(
+            tail.as_os_str().is_empty(),
+            "tail must be empty for an existing path: {tail:?}"
+        );
+    }
+
+    /// A path that does not exist yet resolves to its closest existing
+    /// ancestor plus the still-missing remainder (root-to-leaf order).
+    #[test]
+    fn nearest_existing_ancestor_walks_up_and_keeps_missing_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a/b/c/new.txt");
+        let (ancestor, tail) = nearest_existing_ancestor(&deep);
+        assert_eq!(ancestor, tmp.path());
+        assert_eq!(
+            tail,
+            PathBuf::from("a").join("b").join("c").join("new.txt")
+        );
+    }
+
+    /// Walking up must stop at the filesystem root instead of looping
+    /// forever when nothing on the path exists.
+    #[cfg(unix)]
+    #[test]
+    fn nearest_existing_ancestor_stops_at_the_filesystem_root() {
+        let missing = PathBuf::from("/conga-nonexistent-root-xyz/child.txt");
+        let (ancestor, tail) = nearest_existing_ancestor(&missing);
+        assert_eq!(ancestor, PathBuf::from("/"));
+        assert_eq!(
+            tail,
+            PathBuf::from("conga-nonexistent-root-xyz").join("child.txt")
+        );
+    }
+
+    /// The production read-path policy (not just its testable core):
+    /// relative paths resolve inside cwd.
+    #[test]
+    fn resolve_read_path_resolves_relative_path_inside_cwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("f.txt"), "x").unwrap();
+        let resolved = resolve_read_path(cwd.path(), "f.txt").unwrap();
+        assert_eq!(resolved, cwd.path().canonicalize().unwrap().join("f.txt"));
+    }
+
+    #[test]
+    fn resolve_read_path_rejects_relative_escape() {
+        let cwd = tempfile::tempdir().unwrap();
+        let err = resolve_read_path(cwd.path(), "../outside.txt").unwrap_err();
+        assert!(err.contains("escapes working directory"), "{err}");
+    }
+
+    /// Absolute paths are only allowed under conga's own config dir; every
+    /// other absolute path is refused.
+    #[test]
+    fn resolve_read_path_rejects_absolute_path_outside_config_dir() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("secret.txt");
+        std::fs::write(&file, "s3cr3t").unwrap();
+        let err = resolve_read_path(cwd.path(), file.to_str().unwrap()).unwrap_err();
+        let root = conga::storage::config_dir();
+        if root.exists() {
+            assert!(err.contains("outside the conga config directory"), "{err}");
+        } else {
+            // No config dir on this machine: the allowed root cannot be
+            // canonicalized, and the guard still refuses (fail closed).
+            assert!(err.contains("allowed root not accessible"), "{err}");
+        }
+    }
+
+    /// Boundary: an empty request is not a path — it must resolve to the
+    /// cwd itself rather than erroring or escaping.
+    #[test]
+    fn resolve_read_path_empty_request_resolves_to_cwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        let resolved = resolve_read_path(cwd.path(), "").unwrap();
+        assert_eq!(resolved, cwd.path().canonicalize().unwrap());
     }
 
     #[cfg(unix)]

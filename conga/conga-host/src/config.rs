@@ -212,6 +212,102 @@ mod tests {
     }
 
     #[test]
+    fn load_reads_the_process_env_and_fails_loud_without_a_provider() {
+        // `load()` reads the real process env (no .env file in the repo),
+        // so the LLM knobs are absent -> a ConfigError, never a silent
+        // default provider.
+        match ConfigLoader::load() {
+            Ok(cfg) => {
+                // A developer machine with CONGA_LLM_* exported still works.
+                assert!(!cfg.provider.model.is_empty());
+                assert!(!cfg.provider.base_url.is_empty());
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("CONGA_LLM"),
+                    "the missing knob must be named: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_turn_resets_the_signal_and_wires_the_context() {
+        let cfg = test_cfg(&[]);
+        let signal = CancelSignal::new();
+        signal.cancel();
+        assert!(signal.is_cancelled(), "precondition: the signal is cancelled");
+
+        let history = vec![AgentMessage::User(conga::UserMessage {
+            content: vec![conga::ContentBlock::text("hi".to_string())],
+            timestamp: 1,
+        })];
+        let tools = vec![crate::tools::built_in_tools()
+            .into_iter()
+            .next()
+            .unwrap()];
+        let (context, config) = cfg.prepare_turn(
+            TurnInputs {
+                system_prompt: "sys",
+                history: &history,
+                tools: &tools,
+                cwd: Path::new("/tmp"),
+                session_id: "s1",
+            },
+            &signal,
+            Arc::new(crate::HookStack::new(Vec::new())),
+            cfg.provider_stream_fn(),
+            5,
+            None,
+        );
+
+        // A Ctrl-C from the previous turn must not leak into this one.
+        assert!(!signal.is_cancelled(), "prepare_turn must reset the signal");
+        assert_eq!(context.system_prompt, "sys");
+        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.tools.len(), 1);
+        assert_eq!(context.cwd, PathBuf::from("/tmp"));
+        assert_eq!(context.session_id, "s1");
+        assert!(!context.env.is_empty(), "the env snapshot is captured");
+        // The loop config carries the caller's knobs.
+        assert_eq!(config.max_turns, 5);
+        assert!(config.signal.is_some());
+        assert!(config.hooks.is_some());
+        assert!(config.persist.is_none());
+    }
+
+    #[test]
+    fn prepare_turn_installs_the_persist_callback() {
+        let cfg = test_cfg(&[]);
+        let signal = CancelSignal::new();
+        let persisted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&persisted);
+        let persist: PersistFn = Arc::new(move |_ev: &SessionEvent| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let (_, config) = cfg.prepare_turn(
+            TurnInputs {
+                system_prompt: "sys",
+                history: &[],
+                tools: &[],
+                cwd: Path::new("/tmp"),
+                session_id: "s1",
+            },
+            &signal,
+            Arc::new(crate::HookStack::new(Vec::new())),
+            cfg.provider_stream_fn(),
+            1,
+            Some(persist),
+        );
+        assert!(config.persist.is_some());
+        let persist = config.persist.unwrap();
+        persist(&SessionEvent::TurnStart).unwrap();
+        assert_eq!(persisted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn build_context_maps_fields() {
         let cfg = test_cfg(&[]);
         let history = vec![AgentMessage::User(conga::UserMessage {

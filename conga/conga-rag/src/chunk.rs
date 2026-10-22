@@ -234,4 +234,122 @@ mod tests {
             assert!(c.content.chars().count() > 0);
         }
     }
+
+    // --- flush (a nested helper of `chunk`, exercised through it) ---
+
+    #[test]
+    fn flush_emits_no_chunk_for_a_whitespace_only_buffer() {
+        let out = chunk("   \t  ", 100, 10);
+        assert!(
+            out.is_empty(),
+            "a buffer that trims to empty must not produce a chunk: {out:?}"
+        );
+    }
+
+    #[test]
+    fn flush_trims_the_trailing_whitespace_of_the_emitted_chunk() {
+        let out = chunk("a  \n\nb  ", 100, 0);
+        assert_eq!(contents(&out), vec!["a  \n\nb"]);
+    }
+
+    #[test]
+    fn flush_carries_the_overlap_tail_of_the_trimmed_content() {
+        let text = "alpha bravo charlie delta echo foxtrot golf";
+        let out = chunk(text, 20, 5);
+        assert!(out.len() > 1, "must produce multiple chunks");
+        let first: Vec<char> = out[0].content.chars().collect();
+        let tail: String = first[first.len() - 5..].iter().collect();
+        assert!(
+            out[1].content.starts_with(&tail),
+            "the next chunk must start with the tail of the previous one"
+        );
+    }
+
+    // --- soft_split ---
+
+    #[test]
+    fn soft_split_keeps_a_short_paragraph_whole() {
+        assert_eq!(soft_split("hello", 10), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn soft_split_keeps_a_paragraph_of_exactly_target_whole() {
+        let para = "a".repeat(10);
+        assert_eq!(soft_split(&para, 10), vec![para]);
+    }
+
+    #[test]
+    fn soft_split_prefers_a_sentence_boundary() {
+        let para = "第一句。第二句。第三句。";
+        let out = soft_split(para, 5);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], "第一句。");
+        assert_eq!(out[1], "第二句。");
+        assert_eq!(out[2], "第三句。");
+    }
+
+    #[test]
+    fn soft_split_falls_back_to_a_word_boundary() {
+        let para = "alpha bravo charlie delta echo foxtrot";
+        let out = soft_split(para, 12);
+        assert_eq!(out.concat(), para, "no content may be lost");
+        for piece in &out[..out.len() - 1] {
+            assert!(
+                piece.ends_with(' '),
+                "a word must not be cut in half: {piece:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_split_hard_cuts_when_no_boundary_exists() {
+        let para = "x".repeat(25);
+        let out = soft_split(&para, 10);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].chars().count(), 10);
+        assert_eq!(out[2].chars().count(), 5);
+        assert_eq!(out.concat(), para);
+    }
+
+    #[test]
+    fn soft_split_handles_unicode_without_panicking() {
+        let para = "你好世界。".repeat(10);
+        let out = soft_split(&para, 7);
+        assert_eq!(out.concat(), para);
+        for piece in &out {
+            assert!(piece.chars().count() <= 7, "piece too big: {piece:?}");
+        }
+    }
+
+    #[test]
+    fn soft_split_of_an_empty_paragraph_yields_one_empty_piece() {
+        assert_eq!(soft_split("", 10), vec![String::new()]);
+    }
+
+    // --- tail_chars ---
+
+    #[test]
+    fn tail_chars_returns_empty_for_a_zero_length_tail() {
+        assert_eq!(tail_chars("hello", 0), "");
+    }
+
+    #[test]
+    fn tail_chars_returns_empty_for_an_empty_input() {
+        assert_eq!(tail_chars("", 5), "");
+    }
+
+    #[test]
+    fn tail_chars_returns_the_last_n_chars() {
+        assert_eq!(tail_chars("hello", 3), "llo");
+    }
+
+    #[test]
+    fn tail_chars_returns_the_whole_string_when_n_exceeds_the_length() {
+        assert_eq!(tail_chars("hello", 99), "hello");
+    }
+
+    #[test]
+    fn tail_chars_is_char_boundary_safe() {
+        assert_eq!(tail_chars("你好世界", 2), "世界");
+    }
 }

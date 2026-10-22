@@ -227,6 +227,61 @@ mod tests {
     }
 
     #[test]
+    fn resolve_for_preview_keeps_absolute_paths() {
+        let cwd = Path::new("/tmp/project");
+        assert_eq!(
+            resolve_for_preview(cwd, "/etc/hosts"),
+            std::path::PathBuf::from("/etc/hosts")
+        );
+    }
+
+    #[test]
+    fn resolve_for_preview_joins_relative_paths_to_the_cwd() {
+        let cwd = Path::new("/tmp/project");
+        assert_eq!(
+            resolve_for_preview(cwd, "src/lib.rs"),
+            std::path::PathBuf::from("/tmp/project/src/lib.rs")
+        );
+        assert_eq!(
+            resolve_for_preview(cwd, "./src/lib.rs"),
+            std::path::PathBuf::from("/tmp/project/./src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn write_preview_reads_an_absolute_target_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("abs.txt");
+        std::fs::write(&file, "old\n").unwrap();
+        let args = serde_json::json!({"path": file.display().to_string(), "content": "new\n"});
+        let p = write_preview(&args, Path::new("/nowhere")).unwrap();
+        assert!(p.contains("- old"), "{p}");
+        assert!(p.contains("+ new"), "{p}");
+    }
+
+    #[test]
+    fn hunk_diff_reports_no_change_for_identical_text() {
+        assert_eq!(hunk_diff("same\n", "same\n"), "(no textual change)\n");
+        assert_eq!(hunk_diff("", ""), "(no textual change)\n");
+    }
+
+    #[test]
+    fn hunk_diff_renders_removed_and_added_lines() {
+        let out = hunk_diff("keep\nold\n", "keep\nnew\n");
+        assert!(out.contains("  keep"), "{out}");
+        assert!(out.contains("- old"), "{out}");
+        assert!(out.contains("+ new"), "{out}");
+        assert!(out.ends_with('\n'), "{out}");
+    }
+
+    #[test]
+    fn hunk_diff_with_an_empty_old_text_is_a_pure_addition() {
+        // The hunk adds the diff's own trailing newline.
+        let out = hunk_diff("", "added\n");
+        assert_eq!(out, "+ added\n\n");
+    }
+
+    #[test]
     fn line_diff_lockstep_semantics() {
         // Locks the diff semantics the flat LCS must preserve exactly:
         // deletions first on ties, context lines kept, tail drained.

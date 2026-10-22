@@ -172,3 +172,79 @@ async fn main() {
         .expect("failed to bind");
     axum::serve(listener, app).await.expect("server error");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::util::ServiceExt;
+
+    fn app_with_cors() -> Router {
+        Router::new()
+            .route("/api/thing", get(|| async { "ok" }))
+            .layer(cors_layer())
+    }
+
+    fn origin_request(origin: &str) -> Request<Body> {
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/api/thing")
+            .header("origin", origin)
+            .header("access-control-request-method", "GET")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cors_layer_allows_the_default_dev_origins() {
+        for origin in ["http://localhost:1420", "http://127.0.0.1:1420"] {
+            let res = app_with_cors()
+                .oneshot(origin_request(origin))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "origin: {origin}");
+            assert_eq!(
+                res.headers().get("access-control-allow-origin").unwrap(),
+                origin,
+                "the default dev origin must be allowed"
+            );
+            let methods = res
+                .headers()
+                .get("access-control-allow-methods")
+                .expect("the allowed methods are advertised")
+                .to_str()
+                .unwrap();
+            assert!(methods.contains("GET"), "{methods}");
+            assert!(methods.contains("DELETE"), "{methods}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_layer_refuses_an_unknown_origin() {
+        let res = app_with_cors()
+            .oneshot(origin_request("http://evil.example"))
+            .await
+            .unwrap();
+        assert!(
+            res.headers().get("access-control-allow-origin").is_none(),
+            "an unknown origin must not be reflected back"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_layer_marks_a_simple_allowed_request() {
+        let req = Request::builder()
+            .uri("/api/thing")
+            .header("origin", "http://localhost:1420")
+            .body(Body::empty())
+            .unwrap();
+        let res = app_with_cors().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("access-control-allow-origin").unwrap(),
+            "http://localhost:1420"
+        );
+    }
+}

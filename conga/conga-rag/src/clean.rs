@@ -59,4 +59,39 @@ mod tests {
     fn empty_input_stays_empty() {
         assert_eq!(clean(""), "");
     }
+
+    #[test]
+    fn whitespace_only_input_becomes_empty() {
+        assert_eq!(clean("   \t  "), "");
+        assert_eq!(clean("\n\n \n"), "");
+    }
+
+    #[test]
+    fn keeps_html_and_entities_verbatim() {
+        // Markdown (and any embedded HTML) is preserved as-is: the cleaner
+        // only normalizes whitespace, it never rewrites markup.
+        let html = "<script>alert(1)</script> <style>p{}</style> &amp; &#65;";
+        assert_eq!(clean(html), html);
+    }
+
+    #[test]
+    fn collapses_a_long_run_of_blank_lines() {
+        let input = format!("a{}b", "\n".repeat(50));
+        assert_eq!(clean(&input), "a\n\nb");
+    }
+
+    #[test]
+    fn strips_only_the_first_bom() {
+        assert_eq!(clean("\u{feff}\u{feff}a"), "\u{feff}a");
+    }
+
+    #[test]
+    fn keeps_leading_indentation_but_trims_trailing_whitespace() {
+        assert_eq!(clean("  indented  \n\talso indented\t"), "  indented\n\talso indented");
+    }
+
+    #[test]
+    fn normalizes_mixed_line_endings() {
+        assert_eq!(clean("a\r\nb\nc\rd"), "a\nb\nc\nd");
+    }
 }

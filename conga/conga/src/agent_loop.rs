@@ -1196,6 +1196,995 @@ mod tests {
         }
     }
 
+    // ---- direct tests for the loop's internal helpers -------------------
+
+    /// An assistant message carrying the given tool calls
+    /// `(id, name, raw arguments)`.
+    fn assistant_with_calls(calls: &[(&str, &str, &str)]) -> AssistantMessage {
+        let mut msg = AssistantMessage::new(&"test".to_string());
+        for (id, name, args) in calls {
+            msg.append_tool_call(
+                None,
+                id.to_string(),
+                Some(name.to_string()),
+                args.to_string(),
+            );
+        }
+        msg
+    }
+
+    /// A context carrying the given tools.
+    fn ctx_with_tools(tools: Vec<ToolDefinition>) -> AgentContext {
+        AgentContext {
+            system_prompt: "sys".into(),
+            messages: vec![],
+            tools,
+            cwd: ".".into(),
+            env: Default::default(),
+            session_id: "s".into(),
+        }
+    }
+
+    /// The text of a tool result's first content block.
+    fn result_text(result: &ToolResultMessage) -> String {
+        match result.content.first() {
+            Some(ContentBlock::Text { text }) => text.clone(),
+            other => panic!("expected a text block, got {other:?}"),
+        }
+    }
+
+    /// The text of an assistant message's first content block.
+    fn result_text_assistant(msg: &AssistantMessage) -> String {
+        match msg.content.first() {
+            Some(ContentBlock::Text { text }) => text.clone(),
+            other => panic!("expected a text block, got {other:?}"),
+        }
+    }
+
+    /// A stream fn that only counts how often it was polled.
+    struct CountingStream {
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl StreamFn for CountingStream {
+        fn stream(
+            &self,
+            _model: &ModelSpec,
+            _messages: &[AgentMessage],
+            _system: &str,
+            _tools: &[ToolDefinition],
+            _signal: Option<crate::CancelSignal>,
+        ) -> Pin<Box<dyn futures_util::Stream<Item = StreamChunk> + Send>> {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(futures_util::stream::iter(vec![]))
+        }
+    }
+
+    // ---- is_aborted ------------------------------------------------------
+
+    /// No signal at all means "not aborted".
+    #[test]
+    fn is_aborted_is_false_without_a_signal() {
+        let config = test_config(vec![]);
+        assert!(!is_aborted(&config));
+    }
+
+    /// The abort state follows the cancel signal: clear -> not aborted,
+    /// cancelled -> aborted, reset -> not aborted again.
+    #[test]
+    fn is_aborted_follows_the_cancel_signal() {
+        let mut config = test_config(vec![]);
+        let sig = crate::CancelSignal::new();
+        config.signal = Some(sig.clone());
+        assert!(!is_aborted(&config));
+        sig.cancel();
+        assert!(is_aborted(&config));
+        sig.reset();
+        assert!(!is_aborted(&config));
+    }
+
+    // ---- persist_event ---------------------------------------------------
+
+    /// Without a persist callback the event is dropped silently (no-op).
+    #[test]
+    fn persist_event_without_callback_is_a_noop() {
+        let config = test_config(vec![]);
+        assert!(persist_event(&config, &SessionEvent::TurnStart).is_ok());
+    }
+
+    /// The callback receives the event that was handed in.
+    #[test]
+    fn persist_event_forwards_the_event_to_the_callback() {
+        let mut config = test_config(vec![]);
+        let seen: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        config.persist = Some(Arc::new(move |ev: &SessionEvent| {
+            sink.lock().unwrap().push(ev.clone());
+            Ok(())
+        }));
+
+        persist_event(&config, &SessionEvent::TurnStart).unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(matches!(seen[0], SessionEvent::TurnStart));
+    }
+
+    /// A failing persist callback aborts the run (fail loud) - the error is
+    /// propagated to the caller.
+    #[test]
+    fn persist_event_propagates_the_callback_error() {
+        let mut config = test_config(vec![]);
+        config.persist = Some(Arc::new(|_ev: &SessionEvent| {
+            Err(AgentError::Io(std::io::Error::other("disk full")))
+        }));
+
+        let err = persist_event(&config, &SessionEvent::TurnStart).unwrap_err();
+        assert!(matches!(err, AgentError::Io(_)), "{err:?}");
+    }
+
+    // ---- record_tool_result ----------------------------------------------
+
+    /// A finished tool result is emitted, persisted and collected - in that
+    /// order.
+    #[test]
+    fn record_tool_result_emits_persists_and_collects() {
+        let mut config = test_config(vec![]);
+        let persisted: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = persisted.clone();
+        config.persist = Some(Arc::new(move |ev: &SessionEvent| {
+            sink.lock().unwrap().push(ev.clone());
+            Ok(())
+        }));
+
+        let result = ToolResultMessage {
+            tool_call_id: "t1".into(),
+            tool_name: "echo".into(),
+            content: vec![ContentBlock::text("done")],
+            is_error: false,
+            timestamp: 7,
+        };
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let mut results: Vec<ToolResultMessage> = Vec::new();
+        {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            record_tool_result(&config, &mut emit, &mut results, result.clone(), false).unwrap();
+        }
+
+        // Collected exactly once, unchanged.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], result);
+
+        // Emitted as ToolExecutionEnd with the error flag.
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                result: emitted,
+                is_error,
+            } => {
+                assert_eq!(tool_call_id, "t1");
+                assert_eq!(emitted, &result);
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolExecutionEnd, got {other:?}"),
+        }
+
+        // Persisted as a ToolResult session event.
+        let persisted = persisted.lock().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert!(
+            matches!(&persisted[0], SessionEvent::ToolResult(AgentMessage::ToolResult(tr))
+                if tr.tool_call_id == "t1" && tr.tool_name == "echo"),
+            "unexpected persisted event: {:?}",
+            persisted[0]
+        );
+    }
+
+    /// The `is_error` flag is passed through to the event, and a failing
+    /// persist callback keeps the result OUT of the collected list (the run
+    /// aborts before the fact is recorded).
+    #[test]
+    fn record_tool_result_flags_errors_and_drops_unpersisted_results() {
+        let mut config = test_config(vec![]);
+        config.persist = Some(Arc::new(|_ev: &SessionEvent| {
+            Err(AgentError::Io(std::io::Error::other("disk full")))
+        }));
+        let result = ToolResultMessage {
+            tool_call_id: "t1".into(),
+            tool_name: "boom".into(),
+            content: vec![ContentBlock::text("failed")],
+            is_error: true,
+            timestamp: 7,
+        };
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let mut results: Vec<ToolResultMessage> = Vec::new();
+        let err = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            record_tool_result(&config, &mut emit, &mut results, result.clone(), true)
+        }
+        .unwrap_err();
+
+        assert!(matches!(err, AgentError::Io(_)), "{err:?}");
+        assert!(results.is_empty(), "an unpersisted result is not collected");
+        // The event was still emitted before the persist failure.
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ToolExecutionEnd { is_error: true, .. }
+        ));
+    }
+
+    // ---- fail_all_tool_calls ---------------------------------------------
+
+    /// Every tool call of a truncated assistant message gets an error
+    /// result - none may be missed.
+    #[test]
+    fn fail_all_tool_calls_marks_every_call_as_failed() {
+        let mut assistant = assistant_with_calls(&[("t1", "alpha", "{}"), ("t2", "beta", "{}")]);
+        assistant.append_text("some prose");
+
+        let results = fail_all_tool_calls(&assistant);
+
+        assert_eq!(results.len(), 2, "every tool call must get a result");
+        assert_eq!(results[0].tool_call_id, "t1");
+        assert_eq!(results[0].tool_name, "alpha");
+        assert_eq!(results[1].tool_call_id, "t2");
+        assert_eq!(results[1].tool_name, "beta");
+        for r in &results {
+            assert!(r.is_error, "a discarded call must be flagged as an error");
+            let text = result_text(r);
+            assert!(text.contains("truncated"), "{text}");
+        }
+    }
+
+    /// An assistant message without tool calls has nothing to discard.
+    #[test]
+    fn fail_all_tool_calls_without_tool_calls_is_empty() {
+        let mut assistant = AssistantMessage::new(&"test".to_string());
+        assistant.append_text("just prose");
+        assert!(fail_all_tool_calls(&assistant).is_empty());
+    }
+
+    // ---- error_tool_result -----------------------------------------------
+
+    /// The error result carries the call identity, the message and the error
+    /// flag.
+    #[test]
+    fn error_tool_result_keeps_the_identity_and_flags_the_error() {
+        let r = error_tool_result("call-1", "bash", "boom");
+        assert!(r.is_error);
+        assert_eq!(r.tool_call_id, "call-1");
+        assert_eq!(r.tool_name, "bash");
+        assert_eq!(r.content.len(), 1);
+        assert_eq!(result_text(&r), "boom");
+        assert!(r.timestamp > 0, "the result must be timestamped");
+    }
+
+    /// An empty message is still a valid error result (no panic, no default
+    /// text invented).
+    #[test]
+    fn error_tool_result_accepts_an_empty_message() {
+        let r = error_tool_result("", "", "");
+        assert!(r.is_error);
+        assert_eq!(r.tool_call_id, "");
+        assert_eq!(r.tool_name, "");
+        assert_eq!(result_text(&r), "");
+    }
+
+    // ---- execute_tool_calls ----------------------------------------------
+
+    /// A batch without tool calls does nothing: no results, no events.
+    #[tokio::test]
+    async fn execute_tool_calls_without_tool_calls_returns_nothing() {
+        let mut assistant = AssistantMessage::new(&"test".to_string());
+        assistant.append_text("no tools here");
+        let config = test_config(vec![]);
+        let ctx = ctx_with_tools(vec![]);
+        let mut guard = crate::guard::RepeatGuard::new();
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let results = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            execute_tool_calls(&ctx, &assistant, &config, &mut guard, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert!(results.is_empty());
+        assert!(events.is_empty(), "an empty batch must emit no events");
+    }
+
+    /// A single tool call is executed and its result recorded.
+    #[tokio::test]
+    async fn execute_tool_calls_runs_a_single_tool_and_records_its_result() {
+        let assistant = assistant_with_calls(&[("t1", "echo", "{\"x\":1}")]);
+        let config = test_config(vec![]);
+        let ctx = ctx_with_tools(vec![echo_tool()]);
+        let mut guard = crate::guard::RepeatGuard::new();
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let results = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            execute_tool_calls(&ctx, &assistant, &config, &mut guard, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_call_id, "t1");
+        assert_eq!(results[0].tool_name, "echo");
+        assert!(!results[0].is_error);
+        assert_eq!(result_text(&results[0]), "{\"x\":1}");
+
+        // Start and End events for the executed call.
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }))
+            .count();
+        let ends = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+            .count();
+        assert_eq!(starts, 1);
+        assert_eq!(ends, 1);
+    }
+
+    /// Parallel calls are dispatched together and their results are recorded
+    /// in DECLARATION order, no matter which one finishes first.
+    #[tokio::test]
+    async fn execute_tool_calls_runs_parallel_tools_in_declaration_order() {
+        // The first tool yields a few times before answering, so the second
+        // one is very likely to finish first.
+        let slow = crate::types::tool::ToolDefinition {
+            name: "slow".into(),
+            label: "Slow".into(),
+            description: "yields".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
+            execute: std::sync::Arc::new(|_c: ToolCallCtx| {
+                Box::pin(async move {
+                    for _ in 0..5 {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(crate::types::tool::ToolResult::text("slow"))
+                })
+            }),
+        };
+        let fast = crate::types::tool::ToolDefinition {
+            name: "fast".into(),
+            label: "Fast".into(),
+            description: "answers at once".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
+            execute: std::sync::Arc::new(|_c: ToolCallCtx| {
+                Box::pin(async move { Ok(crate::types::tool::ToolResult::text("fast")) })
+            }),
+        };
+        let assistant = assistant_with_calls(&[("t1", "slow", "{}"), ("t2", "fast", "{}")]);
+        let config = test_config(vec![]);
+        let ctx = ctx_with_tools(vec![slow, fast]);
+        let mut guard = crate::guard::RepeatGuard::new();
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let results = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            execute_tool_calls(&ctx, &assistant, &config, &mut guard, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tool_name, "slow");
+        assert_eq!(results[1].tool_name, "fast");
+
+        // The Start events follow the declaration order too.
+        let started: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolExecutionStart { tool_name, .. } => Some(tool_name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec!["slow".to_string(), "fast".to_string()]);
+    }
+
+    /// A tool that returns `Err` becomes an error result - the batch does
+    /// not abort.
+    #[tokio::test]
+    async fn execute_tool_calls_reports_a_tool_error_as_an_error_result() {
+        let boom = crate::types::tool::ToolDefinition {
+            name: "boom".into(),
+            label: "Boom".into(),
+            description: "always fails".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
+            execute: std::sync::Arc::new(|_c: ToolCallCtx| {
+                Box::pin(async move { Err(crate::error::ToolError::Message("boom".into())) })
+            }),
+        };
+        let assistant = assistant_with_calls(&[("t1", "boom", "{}")]);
+        let config = test_config(vec![]);
+        let ctx = ctx_with_tools(vec![boom]);
+        let mut guard = crate::guard::RepeatGuard::new();
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let results = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            execute_tool_calls(&ctx, &assistant, &config, &mut guard, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        assert!(result_text(&results[0]).contains("boom"));
+        assert!(matches!(
+            &events.last().unwrap(),
+            AgentEvent::ToolExecutionEnd { is_error: true, .. }
+        ));
+    }
+
+    /// An unknown tool is reported as an error result instead of crashing.
+    #[tokio::test]
+    async fn execute_tool_calls_reports_an_unknown_tool() {
+        let assistant = assistant_with_calls(&[("t1", "ghost", "{}")]);
+        let config = test_config(vec![]);
+        let ctx = ctx_with_tools(vec![]);
+        let mut guard = crate::guard::RepeatGuard::new();
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let results = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            execute_tool_calls(&ctx, &assistant, &config, &mut guard, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        assert!(result_text(&results[0]).contains("tool not found: ghost"));
+        // A rejected call is never dispatched.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolExecutionStart { .. })),
+            "an unknown tool must not be dispatched"
+        );
+    }
+
+    /// Malformed arguments are fed back to the model as an error result.
+    #[tokio::test]
+    async fn execute_tool_calls_reports_malformed_arguments() {
+        let assistant = assistant_with_calls(&[("t1", "echo", "{\"x\":")]);
+        let config = test_config(vec![]);
+        let ctx = ctx_with_tools(vec![echo_tool()]);
+        let mut guard = crate::guard::RepeatGuard::new();
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let results = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            execute_tool_calls(&ctx, &assistant, &config, &mut guard, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        assert!(result_text(&results[0]).contains("failed to parse tool arguments"));
+    }
+
+    /// Empty arguments are treated as `{}` - a tool without parameters.
+    #[tokio::test]
+    async fn execute_tool_calls_treats_empty_arguments_as_an_empty_object() {
+        let assistant = assistant_with_calls(&[("t1", "echo", "")]);
+        let config = test_config(vec![]);
+        let ctx = ctx_with_tools(vec![echo_tool()]);
+        let mut guard = crate::guard::RepeatGuard::new();
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let results = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            execute_tool_calls(&ctx, &assistant, &config, &mut guard, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].is_error);
+        assert_eq!(result_text(&results[0]), "{}");
+    }
+
+    /// Calls beyond the per-turn limit are reported, never dropped silently.
+    #[tokio::test]
+    async fn execute_tool_calls_reports_calls_over_the_limit() {
+        let assistant = assistant_with_calls(&[("t1", "echo", "{}"), ("t2", "echo", "{}")]);
+        let mut config = test_config(vec![]);
+        config.max_tool_calls_per_turn = 1;
+        let ctx = ctx_with_tools(vec![echo_tool()]);
+        let mut guard = crate::guard::RepeatGuard::new();
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let results = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            execute_tool_calls(&ctx, &assistant, &config, &mut guard, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(results.len(), 2, "the dropped call still gets a result");
+        assert!(!results[0].is_error);
+        assert!(results[1].is_error);
+        assert!(result_text(&results[1]).contains("tool call limit"));
+        assert_eq!(results[1].tool_call_id, "t2");
+    }
+
+    /// An already-cancelled signal stops the batch before any tool runs.
+    #[tokio::test]
+    async fn execute_tool_calls_skips_the_batch_when_already_aborted() {
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = ran.clone();
+        let counted = crate::types::tool::ToolDefinition {
+            name: "counted".into(),
+            label: "Counted".into(),
+            description: "counts executions".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: RiskLevel::Low,
+            execute: std::sync::Arc::new(move |_c: ToolCallCtx| {
+                let counter = counter.clone();
+                Box::pin(async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(crate::types::tool::ToolResult::text("ran"))
+                })
+            }),
+        };
+        let assistant = assistant_with_calls(&[("t1", "counted", "{}")]);
+        let mut config = test_config(vec![]);
+        let sig = crate::CancelSignal::new();
+        sig.cancel();
+        config.signal = Some(sig);
+        let ctx = ctx_with_tools(vec![counted]);
+        let mut guard = crate::guard::RepeatGuard::new();
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let results = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            execute_tool_calls(&ctx, &assistant, &config, &mut guard, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an aborted batch must not execute any tool"
+        );
+        assert!(results.is_empty());
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolExecutionStart { .. })),
+            "an aborted batch must not dispatch a tool"
+        );
+    }
+
+    // ---- stream_assistant_response ---------------------------------------
+
+    /// An empty provider stream ends the turn with an empty message.
+    #[tokio::test]
+    async fn stream_assistant_response_with_an_empty_stream_ends_the_turn() {
+        let config = test_config(vec![]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let msg = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            stream_assistant_response(&ctx, &config, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(msg.stop_reason, StopReason::EndTurn);
+        assert!(msg.content.is_empty());
+        assert_eq!(msg.model, "test");
+        assert!(msg.usage.is_none());
+
+        // The host is told the message ended and the response arrived.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::MessageEnd { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AfterProviderResponse { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::BeforeProviderRequest { .. })));
+    }
+
+    /// Text deltas are concatenated into ONE text block and streamed to the
+    /// host as they arrive.
+    #[tokio::test]
+    async fn stream_assistant_response_concatenates_text_deltas() {
+        let config = test_config(vec![
+            StreamChunk::TextDelta("Hello".into()),
+            StreamChunk::TextDelta(" world".into()),
+            StreamChunk::Done,
+        ]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let msg = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            stream_assistant_response(&ctx, &config, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(msg.content.len(), 1);
+        assert_eq!(result_text_assistant(&msg), "Hello world");
+        assert_eq!(msg.stop_reason, StopReason::EndTurn);
+
+        let deltas = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::MessageUpdate {
+                        delta: ContentDelta::TextDelta(_)
+                    }
+                )
+            })
+            .count();
+        assert_eq!(deltas, 2, "one update per streamed delta");
+    }
+
+    /// A provider error surfaces as `StopReason::Error` (no retry with the
+    /// default "retries off" policy).
+    #[tokio::test]
+    async fn stream_assistant_response_reports_a_provider_error() {
+        let config = test_config(vec![StreamChunk::Error("provider boom".into())]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let msg = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            stream_assistant_response(&ctx, &config, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        match &msg.stop_reason {
+            StopReason::Error(e) => assert!(e.contains("provider boom"), "{e}"),
+            other => panic!("expected StopReason::Error, got {other:?}"),
+        }
+        assert!(msg.content.is_empty());
+    }
+
+    /// A cancel that arrives before the provider request skips the request
+    /// entirely and reports an aborted message.
+    #[tokio::test]
+    async fn stream_assistant_response_skips_the_provider_when_aborted() {
+        let mut config = test_config(vec![]);
+        let sig = crate::CancelSignal::new();
+        sig.cancel();
+        config.signal = Some(sig);
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        config.stream_fn = Arc::new(CountingStream {
+            polls: polls.clone(),
+        });
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let msg = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            stream_assistant_response(&ctx, &config, &mut emit)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(msg.stop_reason, StopReason::Aborted);
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an aborted call must not reach the provider"
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::BeforeProviderRequest { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::MessageEnd { .. })));
+    }
+
+    // ---- attempt_stream_once ---------------------------------------------
+
+    /// An empty stream yields an ended message without usage.
+    #[tokio::test]
+    async fn attempt_stream_once_with_an_empty_stream_yields_end_turn() {
+        let config = test_config(vec![]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let outcome = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            attempt_stream_once(&[], &ctx, &config, &mut emit).await
+        };
+
+        match outcome {
+            StreamAttempt::Done(msg) => {
+                assert_eq!(msg.stop_reason, StopReason::EndTurn);
+                assert!(msg.content.is_empty());
+                assert!(msg.usage.is_none());
+            }
+            StreamAttempt::Errored { .. } => panic!("expected a completed stream"),
+        }
+    }
+
+    /// Text deltas are concatenated into a single block.
+    #[tokio::test]
+    async fn attempt_stream_once_accumulates_text_deltas() {
+        let config = test_config(vec![
+            StreamChunk::TextDelta("Hello".into()),
+            StreamChunk::TextDelta(" world".into()),
+            StreamChunk::Done,
+        ]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let outcome = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            attempt_stream_once(&[], &ctx, &config, &mut emit).await
+        };
+
+        match outcome {
+            StreamAttempt::Done(msg) => {
+                assert_eq!(msg.content.len(), 1);
+                assert_eq!(result_text_assistant(&msg), "Hello world");
+                assert_eq!(msg.stop_reason, StopReason::EndTurn);
+            }
+            StreamAttempt::Errored { .. } => panic!("expected a completed stream"),
+        }
+    }
+
+    /// A stream error before any content is retryable (nothing was emitted
+    /// to the host yet).
+    #[tokio::test]
+    async fn attempt_stream_once_reports_an_error_without_emitted_content() {
+        let config = test_config(vec![StreamChunk::Error("boom".into())]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let outcome = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            attempt_stream_once(&[], &ctx, &config, &mut emit).await
+        };
+
+        match outcome {
+            StreamAttempt::Errored {
+                error,
+                emitted_content,
+            } => {
+                assert_eq!(error, "boom");
+                assert!(!emitted_content, "nothing was streamed yet");
+            }
+            StreamAttempt::Done(_) => panic!("expected a failed stream"),
+        }
+    }
+
+    /// A stream error AFTER content was emitted is NOT retryable - the
+    /// caller must not duplicate the partial output.
+    #[tokio::test]
+    async fn attempt_stream_once_reports_an_error_after_content() {
+        let config = test_config(vec![
+            StreamChunk::TextDelta("partial".into()),
+            StreamChunk::Error("mid-stream boom".into()),
+        ]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let outcome = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            attempt_stream_once(&[], &ctx, &config, &mut emit).await
+        };
+
+        match outcome {
+            StreamAttempt::Errored {
+                error,
+                emitted_content,
+            } => {
+                assert_eq!(error, "mid-stream boom");
+                assert!(emitted_content, "content was streamed before the error");
+            }
+            StreamAttempt::Done(_) => panic!("expected a failed stream"),
+        }
+    }
+
+    /// The provider's stop signal wins over the content-based guess.
+    #[tokio::test]
+    async fn attempt_stream_once_provider_stop_overrides_the_content_guess() {
+        let config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                index: None,
+                id: "t1".into(),
+                name: Some("echo".into()),
+                args_delta: "{\"x\":".into(),
+            },
+            StreamChunk::Stop(StopReason::MaxTokens),
+            StreamChunk::Done,
+        ]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let outcome = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            attempt_stream_once(&[], &ctx, &config, &mut emit).await
+        };
+
+        match outcome {
+            StreamAttempt::Done(msg) => {
+                assert_eq!(
+                    msg.stop_reason,
+                    StopReason::MaxTokens,
+                    "the provider stop must win over the ToolUse guess"
+                );
+            }
+            StreamAttempt::Errored { .. } => panic!("expected a completed stream"),
+        }
+    }
+
+    /// Without a provider stop, a tool call classifies the turn as ToolUse.
+    #[tokio::test]
+    async fn attempt_stream_once_guesses_tool_use_from_a_tool_call() {
+        let config = test_config(vec![
+            StreamChunk::ToolCallDelta {
+                index: None,
+                id: "t1".into(),
+                name: Some("echo".into()),
+                args_delta: "{}".into(),
+            },
+            StreamChunk::Done,
+        ]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let outcome = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            attempt_stream_once(&[], &ctx, &config, &mut emit).await
+        };
+
+        match outcome {
+            StreamAttempt::Done(msg) => assert_eq!(msg.stop_reason, StopReason::ToolUse),
+            StreamAttempt::Errored { .. } => panic!("expected a completed stream"),
+        }
+    }
+
+    /// Usage chunks are merged, cache counters included.
+    #[tokio::test]
+    async fn attempt_stream_once_merges_usage_chunks() {
+        let config = test_config(vec![
+            StreamChunk::Usage {
+                input: 42,
+                output: 0,
+                cache_read: 100,
+                cache_write: 50,
+            },
+            StreamChunk::Usage {
+                input: 0,
+                output: 7,
+                cache_read: 0,
+                cache_write: 0,
+            },
+            StreamChunk::Done,
+        ]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let outcome = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            attempt_stream_once(&[], &ctx, &config, &mut emit).await
+        };
+
+        match outcome {
+            StreamAttempt::Done(msg) => {
+                let usage = msg.usage.expect("usage must be reported");
+                assert_eq!(usage.input_tokens, 42);
+                assert_eq!(usage.output_tokens, 7);
+                assert_eq!(usage.cache_read_tokens, Some(100));
+                assert_eq!(usage.cache_write_tokens, Some(50));
+            }
+            StreamAttempt::Errored { .. } => panic!("expected a completed stream"),
+        }
+    }
+
+    /// Unreported cache tokens stay `None` (absent = unknown).
+    #[tokio::test]
+    async fn attempt_stream_once_leaves_unreported_cache_tokens_none() {
+        let config = test_config(vec![
+            StreamChunk::Usage {
+                input: 42,
+                output: 7,
+                cache_read: 0,
+                cache_write: 0,
+            },
+            StreamChunk::Done,
+        ]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let outcome = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            attempt_stream_once(&[], &ctx, &config, &mut emit).await
+        };
+
+        match outcome {
+            StreamAttempt::Done(msg) => {
+                let usage = msg.usage.expect("usage must be reported");
+                assert!(usage.cache_read_tokens.is_none());
+                assert!(usage.cache_write_tokens.is_none());
+            }
+            StreamAttempt::Errored { .. } => panic!("expected a completed stream"),
+        }
+    }
+
+    /// Thinking deltas are accumulated in their own block.
+    #[tokio::test]
+    async fn attempt_stream_once_accumulates_thinking_deltas() {
+        let config = test_config(vec![
+            StreamChunk::ThinkingDelta("let me think".into()),
+            StreamChunk::ThinkingDelta(" harder".into()),
+            StreamChunk::Done,
+        ]);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let outcome = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            attempt_stream_once(&[], &ctx, &config, &mut emit).await
+        };
+
+        match outcome {
+            StreamAttempt::Done(msg) => {
+                assert_eq!(msg.content.len(), 1);
+                match &msg.content[0] {
+                    ContentBlock::Thinking { thinking } => {
+                        assert_eq!(thinking, "let me think harder")
+                    }
+                    other => panic!("expected a thinking block, got {other:?}"),
+                }
+            }
+            StreamAttempt::Errored { .. } => panic!("expected a completed stream"),
+        }
+    }
+
+    /// A cancelled signal during the stream keeps the aborted marker, even
+    /// though the partial content was still accumulated.
+    #[tokio::test]
+    async fn attempt_stream_once_marks_the_message_aborted_when_cancelled() {
+        let mut config = test_config(vec![
+            StreamChunk::TextDelta("partial".into()),
+            StreamChunk::Done,
+        ]);
+        let sig = crate::CancelSignal::new();
+        sig.cancel();
+        config.signal = Some(sig);
+        let ctx = ctx_with_tools(vec![]);
+
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let outcome = {
+            let mut emit = |ev: AgentEvent| events.push(ev);
+            attempt_stream_once(&[], &ctx, &config, &mut emit).await
+        };
+
+        match outcome {
+            StreamAttempt::Done(msg) => {
+                assert_eq!(msg.stop_reason, StopReason::Aborted);
+                assert_eq!(result_text_assistant(&msg), "partial");
+            }
+            StreamAttempt::Errored { .. } => panic!("expected a completed stream"),
+        }
+    }
+
     #[tokio::test]
     async fn transform_context_applies_before_each_llm_call() {
         // The seam must run before EVERY provider call, not just the first:
@@ -2373,6 +3362,71 @@ mod tests {
                 if tr.tool_name == "echo"),
             "ToolResult must be persisted after the Assistant"
         );
+    }
+
+    /// The persisted events reach the session log as JSON lines, in the
+    /// crash-safe order: the assistant turn first, the tool result after it.
+    #[tokio::test]
+    async fn persisted_events_are_written_to_the_session_log_as_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("events.jsonl");
+
+        let mut config = test_config(vec![
+            StreamChunk::TextDelta("checking".into()),
+            StreamChunk::ToolCallDelta {
+                index: None,
+                id: "t1".into(),
+                name: Some("echo".into()),
+                args_delta: "{\"x\":1}".into(),
+            },
+            StreamChunk::Usage {
+                input: 5,
+                output: 3,
+                cache_read: 0,
+                cache_write: 0,
+            },
+            StreamChunk::Done,
+        ]);
+        config.max_turns = 1;
+        {
+            let log = log.clone();
+            config.persist = Some(Arc::new(move |ev: &SessionEvent| {
+                let line = serde_json::to_string(ev).map_err(AgentError::Serde)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+                    .map_err(AgentError::Io)?;
+                use std::io::Write;
+                writeln!(file, "{line}").map_err(AgentError::Io)?;
+                Ok(())
+            }));
+        }
+
+        let ctx = ctx_with_tools(vec![echo_tool()]);
+        run_agent_loop(vec![], ctx, config, |_| {}).await.unwrap();
+
+        let raw = std::fs::read_to_string(&log).expect("the session log must exist");
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every log line is valid JSON"))
+            .collect();
+        assert_eq!(lines.len(), 2, "assistant + tool result: {lines:?}");
+
+        // Line 1: the assembled assistant turn (with its usage).
+        assert_eq!(lines[0]["type"], "assistant");
+        assert_eq!(lines[0]["message"]["role"], "assistant");
+        assert_eq!(lines[0]["usage"]["input_tokens"], 5);
+        assert_eq!(lines[0]["usage"]["output_tokens"], 3);
+
+        // Line 2: the tool result answering the call.
+        assert_eq!(lines[1]["type"], "tool_result");
+        assert_eq!(lines[1]["role"], "tool_result");
+        assert_eq!(lines[1]["tool_call_id"], "t1");
+        assert_eq!(lines[1]["tool_name"], "echo");
+        assert_eq!(lines[1]["is_error"], false);
+        assert_eq!(lines[1]["content"][0]["type"], "text");
+        assert_eq!(lines[1]["content"][0]["text"], "{\"x\":1}");
     }
 
     #[tokio::test]

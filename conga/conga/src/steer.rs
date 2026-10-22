@@ -63,4 +63,21 @@ mod tests {
         handle.push("via clone");
         assert_eq!(q.drain(), vec!["via clone"]);
     }
+
+    /// The Debug output reports how many messages are still pending.
+    #[test]
+    fn debug_fmt_reports_pending_count() {
+        let q = SteerQueue::new();
+        let empty = format!("{q:?}");
+        assert!(empty.contains("SteerQueue"), "{empty}");
+        assert!(empty.contains("pending: 0"), "{empty}");
+
+        q.push("first");
+        q.push("second");
+        let pending = format!("{q:?}");
+        assert!(pending.contains("pending: 2"), "{pending}");
+
+        q.drain();
+        assert!(format!("{q:?}").contains("pending: 0"));
+    }
 }

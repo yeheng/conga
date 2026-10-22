@@ -107,4 +107,59 @@ mod tests {
         .unwrap();
         assert_eq!(out, "答案[1]");
     }
+
+    #[test]
+    fn context_of_an_empty_hit_list_is_only_the_header() {
+        assert_eq!(build_context(&[]), "资料:\n");
+    }
+
+    #[test]
+    fn context_uses_one_based_hit_and_block_numbers() {
+        let mut h = hit("/a.md", "alpha");
+        h.ordinal = 2;
+        let ctx = build_context(&[h]);
+        assert!(ctx.contains("[1]"), "{ctx}");
+        assert!(ctx.contains("第3块"), "the ordinal is one-based: {ctx}");
+    }
+
+    /// Fake StreamFn that fails mid-stream.
+    struct Failing;
+    impl StreamFn for Failing {
+        fn stream(
+            &self,
+            _model: &ModelSpec,
+            _messages: &[AgentMessage],
+            _system: &str,
+            _tools: &[ToolDefinition],
+            _signal: Option<conga::CancelSignal>,
+        ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
+            Box::pin(futures_util::stream::iter(vec![
+                StreamChunk::TextDelta("部分答案".into()),
+                StreamChunk::Error("provider exploded".into()),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_fails_when_the_provider_stream_errors() {
+        let hits = vec![hit("/a.md", "alpha")];
+        let mut out = String::new();
+        let err = run_ask(
+            Arc::new(Failing),
+            ModelSpec {
+                id: "m".into(),
+                api: ProviderApi::OpenAiCompat,
+                max_tokens: 64,
+            },
+            "q?",
+            &hits,
+            &mut |d| out.push_str(d),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("生成失败"), "msg: {msg}");
+        assert!(msg.contains("provider exploded"), "msg: {msg}");
+        assert_eq!(out, "部分答案", "the text before the error was delivered");
+    }
 }

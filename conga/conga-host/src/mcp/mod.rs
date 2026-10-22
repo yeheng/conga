@@ -121,4 +121,217 @@ pub(crate) mod test_util {
             },
         }
     }
+
+    /// Serializes the tests that mutate the process-global MCP env vars
+    /// (`CONGA_MCP_CONFIG`, `CONGA_MCP_CALL_TIMEOUT_S`): they are read by
+    /// `load_config` / `mcp_call_timeout`, which have no injectable lookup.
+    pub(crate) static ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// Write a tiny local MCP server (python3) that answers the
+    /// `initialize` / `tools/list` / `tools/call` handshake with one tool
+    /// named `echo`, and return the script path. The temp dir is kept so
+    /// the script outlives this call.
+    pub(crate) fn fixture_echo_server_script() -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_echo.py");
+        std::fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import sys, json
+
+def send(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method", "")
+
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "echo-server", "version": "1.0.0"}
+        }})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [{
+            "name": "echo",
+            "description": "echo back the arguments",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"]
+            }
+        }]}})
+    elif method == "tools/call":
+        args = msg.get("params", {}).get("arguments", {})
+        text = args.get("text", "")
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text", "text": text}],
+            "isError": False
+        }})
+"#,
+        )
+        .unwrap();
+        let kept = dir.keep();
+        kept.join("mcp_echo.py").to_string_lossy().into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_util::{fixture_echo_server_script, ENV_LOCK};
+    use super::*;
+
+    /// Scoped, process-global MCP env (`CONGA_MCP_CONFIG` /
+    /// `CONGA_MCP_CALL_TIMEOUT_S`); restored on drop.
+    struct McpEnv {
+        saved_config: Option<String>,
+        saved_timeout: Option<String>,
+        _guard: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl McpEnv {
+        fn apply(config: Option<&std::path::Path>, timeout: Option<&str>) {
+            match config {
+                Some(p) => std::env::set_var("CONGA_MCP_CONFIG", p),
+                None => std::env::remove_var("CONGA_MCP_CONFIG"),
+            }
+            match timeout {
+                Some(v) => std::env::set_var("CONGA_MCP_CALL_TIMEOUT_S", v),
+                None => std::env::remove_var("CONGA_MCP_CALL_TIMEOUT_S"),
+            }
+        }
+
+        /// Sync variant — for plain `#[test]`s.
+        fn set(config: Option<&std::path::Path>, timeout: Option<&str>) -> Self {
+            let guard = ENV_LOCK.blocking_lock();
+            let saved_config = std::env::var("CONGA_MCP_CONFIG").ok();
+            let saved_timeout = std::env::var("CONGA_MCP_CALL_TIMEOUT_S").ok();
+            Self::apply(config, timeout);
+            Self {
+                saved_config,
+                saved_timeout,
+                _guard: guard,
+            }
+        }
+
+        /// Async variant — for `#[tokio::test]`s (`blocking_lock` panics
+        /// inside a runtime).
+        async fn set_async(config: Option<&std::path::Path>, timeout: Option<&str>) -> Self {
+            let guard = ENV_LOCK.lock().await;
+            let saved_config = std::env::var("CONGA_MCP_CONFIG").ok();
+            let saved_timeout = std::env::var("CONGA_MCP_CALL_TIMEOUT_S").ok();
+            Self::apply(config, timeout);
+            Self {
+                saved_config,
+                saved_timeout,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for McpEnv {
+        fn drop(&mut self) {
+            match self.saved_config.take() {
+                Some(v) => std::env::set_var("CONGA_MCP_CONFIG", v),
+                None => std::env::remove_var("CONGA_MCP_CONFIG"),
+            }
+            match self.saved_timeout.take() {
+                Some(v) => std::env::set_var("CONGA_MCP_CALL_TIMEOUT_S", v),
+                None => std::env::remove_var("CONGA_MCP_CALL_TIMEOUT_S"),
+            }
+        }
+    }
+
+    /// Write an `mcp.json` with the given body and return its path.
+    fn write_config(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("mcp.json");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn load_all_mcp_returns_empty_when_config_file_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope.json");
+        let _env = McpEnv::set_async(Some(&missing), Some("5")).await;
+        let tools = load_all_mcp().await;
+        assert!(tools.is_empty(), "a missing config file yields no tools");
+    }
+
+    #[tokio::test]
+    async fn load_all_mcp_returns_empty_on_invalid_config_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "{ this is not json");
+        let _env = McpEnv::set_async(Some(&path), Some("5")).await;
+        let tools = load_all_mcp().await;
+        assert!(tools.is_empty(), "a broken config file yields no tools");
+    }
+
+    #[tokio::test]
+    async fn load_all_mcp_skips_server_that_cannot_be_spawned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"{"mcpServers":{"broken":{"command":"/nonexistent/mcp-server","args":[]}}}"#,
+        );
+        let _env = McpEnv::set_async(Some(&path), Some("5")).await;
+        let tools = load_all_mcp().await;
+        assert!(
+            tools.is_empty(),
+            "a server that fails to start must be skipped, not fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_all_mcp_collects_tools_from_a_stdio_server() {
+        let script = fixture_echo_server_script();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            &format!(r#"{{"mcpServers":{{"echo":{{"command":"python3","args":["{script}"]}}}}}}"#),
+        );
+        let _env = McpEnv::set_async(Some(&path), Some("20")).await;
+        let tools = load_all_mcp().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "mcp__echo__echo");
+    }
+
+    #[test]
+    fn mcp_call_timeout_defaults_to_60_seconds() {
+        let _env = McpEnv::set(None, None);
+        assert_eq!(mcp_call_timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn mcp_call_timeout_reads_the_env_override() {
+        let _env = McpEnv::set(None, Some("5"));
+        assert_eq!(mcp_call_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn mcp_call_timeout_invalid_env_value_falls_back_to_the_default() {
+        let _env = McpEnv::set(None, Some("not-a-number"));
+        assert_eq!(mcp_call_timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn mcp_call_timeout_empty_env_value_falls_back_to_the_default() {
+        let _env = McpEnv::set(None, Some(""));
+        assert_eq!(mcp_call_timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn mcp_call_timeout_zero_env_value_is_a_zero_duration() {
+        let _env = McpEnv::set(None, Some("0"));
+        assert_eq!(mcp_call_timeout(), Duration::from_secs(0));
+    }
 }

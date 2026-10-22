@@ -820,6 +820,161 @@ mod tests {
         crate::memory::load_entries(root)
     }
 
+    // ── char-bound-safe truncation ──
+
+    #[test]
+    fn bound_truncates_at_a_char_boundary_with_an_ellipsis() {
+        assert_eq!(bound("hello", 10), "hello", "shorter than the cap is kept");
+        assert_eq!(bound("hello", 5), "hello", "exactly at the cap is kept");
+        assert_eq!(bound("hello", 3), "hel…");
+        assert_eq!(bound("hello", 0), "…");
+        // Multi-byte characters are never split mid-character.
+        assert_eq!(bound("你好世界", 2), "你好…");
+        assert_eq!(bound("你好世界", 4), "你好世界");
+        assert_eq!(bound("", 3), "");
+    }
+
+    // ── library snapshot ──
+
+    /// A skill file the catalog scanner accepts (frontmatter + body).
+    fn write_skill(dir: &Path, file: &str, name: &str, description: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(file),
+            format!("---\nname: {name}\ndescription: {description}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn catalog_snapshot_lists_memory_entries_and_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(
+            mem.join("rust-dep.md"),
+            crate::memory::entry_markdown(
+                "rust-dep",
+                &["rust".to_string(), "cargo".to_string()],
+                "1",
+                "s1",
+                "body",
+            ),
+        )
+        .unwrap();
+
+        let cwd = tmp.path().join("project");
+        write_skill(
+            &cwd.join(".conga").join("skills"),
+            "demo.md",
+            "demo",
+            "A demo skill",
+        );
+        let global = tmp.path().join("global");
+        write_skill(&global.join("skills"), "glob.md", "glob", "A global skill");
+
+        let snap = catalog_snapshot(&mem, &cwd, &global);
+        assert!(
+            snap.contains("memory: rust-dep [rust, cargo]"),
+            "memory entry missing: {snap}"
+        );
+        assert!(
+            snap.contains("skill: demo — A demo skill"),
+            "project skill missing: {snap}"
+        );
+        assert!(
+            snap.contains("skill: glob — A global skill"),
+            "global skill missing: {snap}"
+        );
+    }
+
+    #[test]
+    fn catalog_snapshot_is_empty_for_missing_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = catalog_snapshot(
+            &tmp.path().join("no-memory"),
+            &tmp.path().join("no-project"),
+            &tmp.path().join("no-global"),
+        );
+        assert!(snap.is_empty(), "expected an empty snapshot, got: {snap}");
+    }
+
+    // ── outcome summary ──
+
+    #[test]
+    fn summarize_counts_every_bucket() {
+        let o = EvolveOutcome {
+            added_insights: vec!["i1".into()],
+            added_skills: vec!["s1".into()],
+            updated_skills: vec!["s2".into()],
+            retired: vec!["r1".into()],
+            rejected: vec!["x1".into()],
+            skipped: vec!["k1".into()],
+        };
+        let s = o.summarize();
+        assert!(s.contains("+1 insights"), "{s}");
+        assert!(s.contains("+1 skills"), "{s}");
+        assert!(s.contains("~1 skills updated"), "{s}");
+        assert!(s.contains("-1 retired"), "{s}");
+        assert!(s.contains("1 rejected"), "{s}");
+        assert!(s.contains("1 skipped"), "{s}");
+    }
+
+    #[test]
+    fn summarize_of_an_empty_outcome_is_all_zeroes() {
+        let s = EvolveOutcome::default().summarize();
+        assert!(s.contains("+0 insights"), "{s}");
+        assert!(s.contains("+0 skills"), "{s}");
+        assert!(s.contains("~0 skills updated"), "{s}");
+        assert!(s.contains("-0 retired"), "{s}");
+        assert!(s.contains("0 rejected"), "{s}");
+        assert!(s.contains("0 skipped"), "{s}");
+    }
+
+    // ── slugging ──
+
+    #[test]
+    fn slug_normalizes_to_kebab_case() {
+        assert_eq!(slug("Demo Skill"), "demo-skill");
+        assert_eq!(slug("demo_skill"), "demo-skill");
+        assert_eq!(slug("  Mixed   Case  "), "mixed-case");
+        assert_eq!(slug("a--b"), "a-b", "runs of dashes collapse");
+        assert_eq!(slug("Rust 101"), "rust-101");
+        assert_eq!(slug("ALREADY-lower"), "already-lower");
+    }
+
+    #[test]
+    fn slug_of_a_name_without_usable_characters_is_empty() {
+        assert_eq!(slug(""), "");
+        assert_eq!(slug("---"), "");
+        assert_eq!(slug("   "), "");
+        // A CJK-only name has no ASCII slug at all.
+        assert_eq!(slug("循环依赖"), "");
+    }
+
+    #[test]
+    fn title_slug_matches_the_title_slugging_rules() {
+        assert_eq!(title_slug("Rust Cyclic Dep"), "rust-cyclic-dep");
+        assert_eq!(title_slug("Rust Cyclic Dep"), slug("Rust Cyclic Dep"));
+        assert_eq!(title_slug(""), "");
+    }
+
+    // ── fail-soft memory reindex (rag feature only) ──
+
+    /// The reindex hook must never turn a successful evolve into a failure:
+    /// with no RAG store configured it silently does nothing.
+    #[cfg(feature = "rag")]
+    #[tokio::test]
+    async fn index_memory_fail_soft_is_a_noop_without_a_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory_root = tmp.path().join("memory");
+        index_memory_fail_soft(&memory_root).await;
+        assert!(
+            !memory_root.exists(),
+            "the fail-soft hook must not create anything"
+        );
+    }
+
     // --- feature rag: memory source reindex ---
 
     /// CONGA_RAG_CONFIG / CONGA_RAG_BUILTIN_BASE are process-global; the

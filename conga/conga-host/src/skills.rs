@@ -388,4 +388,384 @@ mod tests {
             "no run longer than the cap may appear"
         );
     }
+
+    // ---- append_skills (production entry) ----
+
+    #[test]
+    fn append_skills_production_entry_reads_the_config_dir() {
+        // The production entry points at the machine's real config dir
+        // (~/.conga), which cannot be redirected without mutating the
+        // process environment. Assert the structural contract instead: the
+        // base prompt survives and any appended catalog is well-formed.
+        let out = append_skills("BASE", Path::new("/no-such-cwd-for-test"));
+        assert!(out.starts_with("BASE"), "{out}");
+        if out.len() > "BASE".len() {
+            assert!(out.contains("## Skills"), "{out}");
+            assert!(out.contains("- name: "), "{out}");
+            assert!(out.contains("(source: "), "{out}");
+            assert!(out.contains("`read`"), "{out}");
+        }
+    }
+
+    // ---- scan_catalog ----
+
+    #[test]
+    fn scan_catalog_merges_global_and_project_skills() {
+        let g = tempfile::tempdir().unwrap();
+        let p = tempfile::tempdir().unwrap();
+        skill_file(
+            g.path(),
+            "g.md",
+            "---\nname: gskill\ndescription: from global\n---\n",
+        );
+        skill_file(
+            &p.path().join(".conga"),
+            "p.md",
+            "---\nname: pskill\ndescription: from project\n---\n",
+        );
+        let catalog = scan_catalog(p.path(), g.path());
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog.get("gskill").unwrap().description, "from global");
+        assert_eq!(catalog.get("pskill").unwrap().description, "from project");
+    }
+
+    #[test]
+    fn scan_catalog_project_skill_overrides_the_global_one_of_the_same_name() {
+        let g = tempfile::tempdir().unwrap();
+        let p = tempfile::tempdir().unwrap();
+        skill_file(
+            g.path(),
+            "dup.md",
+            "---\nname: dup\ndescription: global one\n---\n",
+        );
+        skill_file(
+            &p.path().join(".conga"),
+            "dup.md",
+            "---\nname: dup\ndescription: project one\n---\n",
+        );
+        let catalog = scan_catalog(p.path(), g.path());
+        assert_eq!(catalog.len(), 1, "same name → one entry");
+        assert_eq!(catalog.get("dup").unwrap().description, "project one");
+        assert_eq!(
+            catalog.get("dup").unwrap().source,
+            PathBuf::from(".conga/skills/dup.md"),
+            "the project entry wins, with a cwd-relative source"
+        );
+    }
+
+    #[test]
+    fn scan_catalog_of_missing_directories_is_empty() {
+        let catalog = scan_catalog(Path::new("/no/such/cwd"), Path::new("/no/such/global"));
+        assert!(
+            catalog.is_empty(),
+            "a missing dir means no skills, not an error"
+        );
+    }
+
+    #[test]
+    fn scan_catalog_ignores_non_markdown_files() {
+        let g = tempfile::tempdir().unwrap();
+        skill_file(
+            g.path(),
+            "notes.txt",
+            "---\nname: txt\ndescription: nope\n---\n",
+        );
+        skill_file(g.path(), "ok.md", "---\nname: ok\ndescription: yes\n---\n");
+        let catalog = scan_catalog(Path::new("/no/such/cwd"), g.path());
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog.contains_key("ok"));
+    }
+
+    // ---- catalog_entries ----
+
+    #[test]
+    fn catalog_entries_returns_name_description_pairs_sorted_by_name() {
+        let g = tempfile::tempdir().unwrap();
+        skill_file(
+            g.path(),
+            "b.md",
+            "---\nname: beta\ndescription: second\n---\n",
+        );
+        skill_file(
+            g.path(),
+            "a.md",
+            "---\nname: alpha\ndescription: first\n---\n",
+        );
+        let entries = catalog_entries(Path::new("/no/such/cwd"), g.path());
+        assert_eq!(
+            entries,
+            vec![
+                ("alpha".to_string(), "first".to_string()),
+                ("beta".to_string(), "second".to_string()),
+            ],
+            "the catalog is sorted by name (byte-stable prompt)"
+        );
+    }
+
+    #[test]
+    fn catalog_entries_of_an_empty_root_is_empty() {
+        let g = tempfile::tempdir().unwrap();
+        assert!(catalog_entries(Path::new("/no/such/cwd"), g.path()).is_empty());
+    }
+
+    // ---- scan_dir ----
+
+    #[test]
+    fn scan_dir_skips_files_without_usable_frontmatter() {
+        let dir = tempfile::tempdir().unwrap().path().join("skills");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("bad.md"), "no frontmatter at all").unwrap();
+        fs::write(dir.join("half.md"), "---\nname: half\n---\nbody\n").unwrap();
+        fs::write(dir.join("skip.txt"), "not markdown").unwrap();
+        fs::write(
+            dir.join("ok.md"),
+            "---\nname: ok\ndescription: fine\n---\nbody\n",
+        )
+        .unwrap();
+
+        let mut catalog: BTreeMap<String, SkillMeta> = BTreeMap::new();
+        scan_dir(&dir, None, &mut catalog);
+        assert_eq!(catalog.len(), 1, "only the complete skill is cataloged");
+        assert_eq!(catalog.get("ok").unwrap().description, "fine");
+    }
+
+    #[test]
+    fn scan_dir_keeps_absolute_paths_when_no_base_is_given() {
+        let dir = tempfile::tempdir().unwrap().path().join("skills");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("ok.md"), "---\nname: ok\ndescription: fine\n---\n").unwrap();
+        let mut catalog: BTreeMap<String, SkillMeta> = BTreeMap::new();
+        scan_dir(&dir, None, &mut catalog);
+        assert_eq!(catalog.get("ok").unwrap().source, dir.join("ok.md"));
+    }
+
+    #[test]
+    fn scan_dir_strips_the_base_path_for_project_entries() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join(".conga").join("skills");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("ok.md"), "---\nname: ok\ndescription: fine\n---\n").unwrap();
+        let mut catalog: BTreeMap<String, SkillMeta> = BTreeMap::new();
+        scan_dir(&dir, Some(base.path()), &mut catalog);
+        assert_eq!(
+            catalog.get("ok").unwrap().source,
+            PathBuf::from(".conga/skills/ok.md"),
+            "a project source must be cwd-relative so `read` can resolve it"
+        );
+    }
+
+    #[test]
+    fn scan_dir_of_a_missing_directory_is_a_no_op() {
+        let mut catalog: BTreeMap<String, SkillMeta> = BTreeMap::new();
+        scan_dir(Path::new("/no/such/skills"), None, &mut catalog);
+        assert!(catalog.is_empty());
+    }
+
+    // ---- catalog_description ----
+
+    #[test]
+    fn catalog_description_keeps_a_short_description_as_is() {
+        assert_eq!(catalog_description("short"), "short");
+        assert_eq!(catalog_description(""), "");
+    }
+
+    #[test]
+    fn catalog_description_flattens_newlines_into_spaces() {
+        assert_eq!(catalog_description("a\nb"), "a b");
+        assert_eq!(catalog_description("a\r\nb"), "a  b");
+    }
+
+    #[test]
+    fn catalog_description_at_the_cap_is_not_truncated() {
+        let exact = "x".repeat(MAX_DESCRIPTION_CHARS);
+        assert_eq!(catalog_description(&exact), exact);
+        assert!(!catalog_description(&exact).ends_with('…'));
+    }
+
+    #[test]
+    fn catalog_description_over_the_cap_is_truncated_with_an_ellipsis() {
+        let long = "x".repeat(MAX_DESCRIPTION_CHARS + 50);
+        let out = catalog_description(&long);
+        assert_eq!(
+            out.chars().count(),
+            MAX_DESCRIPTION_CHARS + 1,
+            "the cap plus the ellipsis"
+        );
+        assert!(out.ends_with('…'));
+        assert_eq!(
+            out.chars().take(MAX_DESCRIPTION_CHARS).collect::<String>(),
+            "x".repeat(MAX_DESCRIPTION_CHARS)
+        );
+    }
+
+    #[test]
+    fn catalog_description_counts_chars_not_bytes() {
+        // 200 multi-byte chars are 600 bytes but still within the char cap.
+        let s = "中".repeat(MAX_DESCRIPTION_CHARS);
+        assert_eq!(catalog_description(&s), s);
+        let over = "中".repeat(MAX_DESCRIPTION_CHARS + 1);
+        assert_eq!(
+            catalog_description(&over).chars().count(),
+            MAX_DESCRIPTION_CHARS + 1
+        );
+    }
+
+    // ---- parse_frontmatter ----
+
+    #[test]
+    fn parse_frontmatter_reads_name_and_description() {
+        assert_eq!(
+            parse_frontmatter("---\nname: a\ndescription: b\n---\nbody\n"),
+            Some(("a".to_string(), "b".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_requires_both_keys() {
+        assert_eq!(
+            parse_frontmatter("---\nname: a\n---\nbody\n"),
+            None,
+            "a missing description skips the skill"
+        );
+        assert_eq!(
+            parse_frontmatter("---\ndescription: b\n---\nbody\n"),
+            None,
+            "a missing name skips the skill"
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_rejects_a_missing_or_unterminated_block() {
+        assert_eq!(parse_frontmatter("name: a\ndescription: b\n"), None);
+        assert_eq!(parse_frontmatter("---\nname: a\ndescription: b\n"), None);
+        assert_eq!(
+            parse_frontmatter("---\r\nname: a\ndescription: b\n---\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_must_start_the_file() {
+        assert_eq!(
+            parse_frontmatter("\n---\nname: a\ndescription: b\n---\n"),
+            None,
+            "frontmatter must be the very first thing in the file"
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_ignores_unknown_keys() {
+        assert_eq!(
+            parse_frontmatter("---\nfoo: bar\nname: a\ndescription: b\n---\n"),
+            Some(("a".to_string(), "b".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_reads_a_block_scalar_description() {
+        assert_eq!(
+            parse_frontmatter("---\nname: blk\ndescription: |\n  one\n  two\n---\nbody\n"),
+            Some(("blk".to_string(), "one two".to_string()))
+        );
+    }
+
+    // ---- parse_value ----
+
+    #[test]
+    fn parse_value_reads_a_plain_scalar() {
+        let mut lines = "".lines().peekable();
+        assert_eq!(
+            parse_value("  plain  ", &mut lines),
+            Some("plain".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_value_returns_none_for_an_empty_scalar() {
+        let mut lines = "".lines().peekable();
+        assert_eq!(parse_value("   ", &mut lines), None);
+        assert_eq!(parse_value("", &mut lines), None);
+    }
+
+    #[test]
+    fn parse_value_strips_one_quote_pair() {
+        let mut lines = "".lines().peekable();
+        assert_eq!(
+            parse_value("\"quoted\"", &mut lines),
+            Some("quoted".to_string())
+        );
+        assert_eq!(
+            parse_value("'quoted'", &mut lines),
+            Some("quoted".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_value_collects_a_literal_block_scalar() {
+        let mut lines = "  one\n  two\nname: next\n".lines().peekable();
+        assert_eq!(parse_value("|", &mut lines), Some("one two".to_string()));
+        assert_eq!(
+            lines.next(),
+            Some("name: next"),
+            "the block ends at the dedent; the next entry is untouched"
+        );
+    }
+
+    #[test]
+    fn parse_value_collects_a_folded_block_scalar_with_a_chomp_indicator() {
+        let mut lines = "  folded\n".lines().peekable();
+        assert_eq!(parse_value(">-", &mut lines), Some("folded".to_string()));
+        let mut lines = "  kept\n".lines().peekable();
+        assert_eq!(parse_value("|+", &mut lines), Some("kept".to_string()));
+    }
+
+    #[test]
+    fn parse_value_treats_an_indicator_with_a_digit_as_a_plain_scalar() {
+        let mut lines = "".lines().peekable();
+        assert_eq!(parse_value("|2", &mut lines), Some("|2".to_string()));
+    }
+
+    #[test]
+    fn parse_value_block_scalar_without_content_is_none() {
+        let mut lines = "name: next\n".lines().peekable();
+        assert_eq!(parse_value("|", &mut lines), None);
+    }
+
+    #[test]
+    fn parse_value_block_scalar_skips_blank_lines_inside_the_block() {
+        let mut lines = "  one\n\n  two\n".lines().peekable();
+        assert_eq!(parse_value("|", &mut lines), Some("one two".to_string()));
+    }
+
+    // ---- unquote ----
+
+    #[test]
+    fn unquote_removes_one_balanced_quote_pair() {
+        assert_eq!(unquote("\"abc\""), "abc");
+        assert_eq!(unquote("'abc'"), "abc");
+    }
+
+    #[test]
+    fn unquote_keeps_unbalanced_or_mismatched_quotes() {
+        assert_eq!(unquote("\"abc"), "\"abc");
+        assert_eq!(unquote("abc\""), "abc\"");
+        assert_eq!(unquote("\"abc'"), "\"abc'");
+        assert_eq!(unquote("'abc\""), "'abc\"");
+    }
+
+    #[test]
+    fn unquote_of_a_single_quote_character_is_unchanged() {
+        assert_eq!(unquote("\""), "\"");
+        assert_eq!(unquote("'"), "'");
+    }
+
+    #[test]
+    fn unquote_of_an_empty_string_is_empty() {
+        assert_eq!(unquote(""), "");
+    }
+
+    #[test]
+    fn unquote_strips_only_the_outermost_pair() {
+        assert_eq!(unquote("\"\"abc\"\""), "\"abc\"");
+    }
 }

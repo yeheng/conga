@@ -451,4 +451,244 @@ mod tests {
             started.elapsed()
         );
     }
+
+    // ── SseFrameSplitter::default ─────────────────────────────────
+
+    #[test]
+    fn default_splitter_behaves_like_a_fresh_one() {
+        let mut s = SseFrameSplitter::default();
+        assert_eq!(s.push(b"data: a\n\n"), vec!["data: a".to_string()]);
+        assert!(s.finish().is_empty());
+    }
+
+    #[test]
+    fn default_splitter_starts_empty() {
+        let mut s = SseFrameSplitter::default();
+        assert!(s.push(b"data: partial").is_empty());
+        assert_eq!(s.finish(), vec!["data: partial".to_string()]);
+    }
+
+    // ── SseFrameSplitter::compact ─────────────────────────────────
+
+    #[test]
+    fn compact_clears_a_fully_consumed_buffer() {
+        // Steady state: everything read is consumed, so the buffer must be
+        // released instead of growing with the stream.
+        let mut s = SseFrameSplitter::new();
+        s.push(b"data: a\n\ndata: b\n\n");
+        assert_eq!(s.buf.len(), 0);
+        assert_eq!(s.read_pos, 0);
+    }
+
+    #[test]
+    fn compact_keeps_the_unconsumed_tail_when_nothing_was_consumed() {
+        let mut s = SseFrameSplitter::new();
+        assert!(s.push(b"data: partial").is_empty());
+        assert_eq!(s.buf, b"data: partial".to_vec());
+        assert_eq!(s.read_pos, 0);
+    }
+
+    #[test]
+    fn compact_slides_the_tail_to_the_front_once_the_prefix_grows_past_the_threshold() {
+        // Feed enough complete frames to push the consumed prefix past
+        // COMPACT_THRESHOLD, then leave a partial frame behind: the buffer
+        // must shrink back to the tail alone and the tail must survive.
+        let mut s = SseFrameSplitter::new();
+        let frame = format!("data: {}\n\n", "x".repeat(100));
+        let mut expected = Vec::new();
+        for i in 0..400 {
+            let f = format!("data: {i}\n\n");
+            let frames = s.push(f.as_bytes());
+            assert_eq!(frames, vec![f.trim_end().to_string()]);
+            expected.push(f.trim_end().to_string());
+        }
+        // Now a big run of frames plus a trailing partial.
+        let frames = s.push(frame.as_bytes());
+        assert_eq!(frames.len(), 1);
+        assert!(s.push(b"data: tail").is_empty());
+        // The consumed prefix is gone: only the unterminated tail is left.
+        assert_eq!(s.buf, b"data: tail".to_vec());
+        assert_eq!(s.read_pos, 0);
+        assert_eq!(s.finish(), vec!["data: tail".to_string()]);
+    }
+
+    #[test]
+    fn compact_preserves_the_tail_across_many_compaction_cycles() {
+        let mut s = SseFrameSplitter::new();
+        for i in 0..2000 {
+            let f = format!("data: {i}\n\n");
+            assert_eq!(s.push(f.as_bytes()), vec![f.trim_end().to_string()]);
+        }
+        assert!(s.push(b"data: tail").is_empty());
+        assert_eq!(s.finish(), vec!["data: tail".to_string()]);
+    }
+
+    // ── find_separator ────────────────────────────────────────────
+
+    #[test]
+    fn find_separator_locates_an_lf_lf_separator() {
+        assert_eq!(find_separator(b"data: a\n\n"), Some((7, 9)));
+    }
+
+    #[test]
+    fn find_separator_locates_a_crlf_crlf_separator() {
+        assert_eq!(find_separator(b"data: a\r\n\r\n"), Some((7, 11)));
+    }
+
+    #[test]
+    fn find_separator_returns_none_without_a_separator() {
+        assert_eq!(find_separator(b"data: a\n"), None);
+        assert_eq!(find_separator(b"data: a\r\n"), None);
+    }
+
+    #[test]
+    fn find_separator_on_an_empty_buffer() {
+        assert_eq!(find_separator(b""), None);
+    }
+
+    #[test]
+    fn find_separator_on_a_buffer_of_one_byte() {
+        assert_eq!(find_separator(b"\n"), None);
+        assert_eq!(find_separator(b"\r"), None);
+    }
+
+    #[test]
+    fn find_separator_picks_the_earliest_of_both_spellings() {
+        // "\n\n" comes first -> it wins.
+        assert_eq!(find_separator(b"\n\n\r\n\r\n"), Some((0, 2)));
+        // "\r\n\r\n" comes first -> it wins.
+        assert_eq!(find_separator(b"x\r\n\r\n\n\n"), Some((1, 5)));
+    }
+
+    #[test]
+    fn find_separator_reports_the_frame_start_and_end() {
+        // The frame is buf[..start]; the separator is buf[start..end].
+        let buf = b"data: x\n\ndata: y\n\n";
+        let (start, end) = find_separator(buf).expect("separator");
+        assert_eq!(&buf[..start], b"data: x");
+        assert_eq!(&buf[start..end], b"\n\n");
+        assert_eq!(&buf[end..], b"data: y\n\n");
+    }
+
+    #[test]
+    fn find_separator_finds_a_separator_at_the_very_end() {
+        assert_eq!(find_separator(b"a\n\n"), Some((1, 3)));
+        assert_eq!(find_separator(b"a\r\n\r\n"), Some((1, 5)));
+    }
+
+    // ── parse_sse_frame boundaries ────────────────────────────────
+
+    #[test]
+    fn parses_a_multiline_data_payload() {
+        // Two `data:` lines in one frame are joined with a newline.
+        let payloads = parse_sse_frame("data: line1\ndata: line2\n\n");
+        assert_eq!(payloads, vec![Some("line1\nline2".to_string())]);
+    }
+
+    #[test]
+    fn parses_a_crlf_frame() {
+        let payloads = parse_sse_frame("data: {\"x\":1}\r\n\r\n");
+        assert_eq!(payloads, vec![Some("{\"x\":1}".to_string())]);
+    }
+
+    #[test]
+    fn parses_a_data_field_without_the_optional_space() {
+        let payloads = parse_sse_frame("data:{\"x\":1}\n\n");
+        assert_eq!(payloads, vec![Some("{\"x\":1}".to_string())]);
+    }
+
+    #[test]
+    fn ignores_comment_and_event_lines() {
+        let frame = ": keep-alive\nevent: message\nid: 7\nretry: 100\ndata: {\"x\":1}\n\n";
+        assert_eq!(parse_sse_frame(frame), vec![Some("{\"x\":1}".to_string())]);
+    }
+
+    #[test]
+    fn parses_an_empty_frame_as_no_payload() {
+        assert!(parse_sse_frame("\n\n").is_empty());
+        assert!(parse_sse_frame("").is_empty());
+    }
+
+    #[test]
+    fn done_sentinel_with_surrounding_whitespace() {
+        assert_eq!(parse_sse_frame("data: [DONE]  \n\n"), vec![None]);
+    }
+
+    // ── download_sse error paths ──────────────────────────────────
+
+    #[tokio::test]
+    async fn download_sse_yields_one_error_chunk_on_a_non_2xx_response() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            // Drain the request head.
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 10\r\nConnection: close\r\n\r\nboom, oops",
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let mut stream = download_sse(
+            "test",
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{addr}/v1/chat"),
+            |req| req,
+            serde_json::json!({}),
+            None,
+            |_frame| Vec::new(),
+        );
+        let mut chunks = Vec::new();
+        while let Some(c) = stream.next().await {
+            chunks.push(c);
+        }
+        server.await.unwrap();
+
+        // Exactly one error chunk, naming the status and the body.
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        match &chunks[0] {
+            StreamChunk::Error(msg) => {
+                assert!(msg.contains("500"), "{msg}");
+                assert!(msg.contains("boom, oops"), "{msg}");
+            }
+            other => panic!("expected an error chunk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_sse_yields_one_error_chunk_when_the_connection_fails() {
+        use futures_util::StreamExt;
+
+        // Bind then drop: the port is free, so the connect is refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut stream = download_sse(
+            "test",
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{addr}/v1/chat"),
+            |req| req,
+            serde_json::json!({}),
+            None,
+            |_frame| Vec::new(),
+        );
+        let mut chunks = Vec::new();
+        while let Some(c) = stream.next().await {
+            chunks.push(c);
+        }
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        assert!(
+            matches!(&chunks[0], StreamChunk::Error(_)),
+            "expected an error chunk, got {:?}",
+            chunks[0]
+        );
+    }
 }

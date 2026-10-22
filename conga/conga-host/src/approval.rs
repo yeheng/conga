@@ -271,4 +271,77 @@ mod tests {
             "10ms 超时不应提前返回"
         );
     }
+
+    // ---- Default ----
+
+    #[test]
+    fn default_registry_behaves_like_a_new_one() {
+        let mut r = ApprovalRegistry::default();
+        let RegisterOutcome::Pending { request_id, rx } = r.register("bash") else {
+            panic!("first approval must be pending");
+        };
+        assert_eq!(request_id, "ap1", "the id sequence starts at ap1");
+        r.respond(&request_id, true, true);
+        assert_eq!(rx.blocking_recv(), Ok(true));
+        assert!(
+            matches!(r.register("bash"), RegisterOutcome::Remembered(true)),
+            "a default registry remembers like a new one"
+        );
+    }
+
+    #[test]
+    fn default_registry_has_an_empty_remember_cache() {
+        let mut r = ApprovalRegistry::default();
+        // Nothing remembered yet → the first approval is pending, not reused.
+        assert!(matches!(
+            r.register("bash"),
+            RegisterOutcome::Pending { .. }
+        ));
+    }
+
+    // ---- remember semantics ----
+
+    #[test]
+    fn a_decision_without_remember_is_not_reused() {
+        let mut r = ApprovalRegistry::new();
+        let RegisterOutcome::Pending { request_id, rx } = r.register("bash") else {
+            panic!();
+        };
+        r.respond(&request_id, true, false); // remember=false
+        assert_eq!(rx.blocking_recv(), Ok(true));
+        assert!(
+            matches!(r.register("bash"), RegisterOutcome::Pending { .. }),
+            "without remember the same tool must ask again"
+        );
+    }
+
+    #[test]
+    fn a_remembered_rejection_is_reused() {
+        let mut r = ApprovalRegistry::new();
+        let RegisterOutcome::Pending { request_id, rx } = r.register("bash") else {
+            panic!();
+        };
+        r.respond(&request_id, false, true);
+        assert_eq!(rx.blocking_recv(), Ok(false));
+        match r.register("bash") {
+            RegisterOutcome::Remembered(false) => {}
+            other => panic!("expected remembered(false), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_response_after_clear_pending_is_ignored() {
+        // A late response must neither panic nor resurrect the decision.
+        let mut r = ApprovalRegistry::new();
+        let RegisterOutcome::Pending { request_id, rx } = r.register("bash") else {
+            panic!();
+        };
+        r.clear_pending();
+        r.respond(&request_id, true, true);
+        assert!(rx.blocking_recv().is_err(), "the waiter stays closed");
+        assert!(
+            matches!(r.register("bash"), RegisterOutcome::Pending { .. }),
+            "a late response must not remember anything"
+        );
+    }
 }

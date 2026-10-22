@@ -363,4 +363,150 @@ mod tests {
             "plan mode must not consult the approver"
         );
     }
+
+    // ---- mode ----
+
+    #[test]
+    fn mode_reflects_the_configured_mode() {
+        let p = PermissionPolicy::new(Mode::Suggest, Arc::new(|_, _| Box::pin(async { false })));
+        assert_eq!(p.mode(), Mode::Suggest);
+        p.set_mode(Mode::AutoEdit);
+        assert_eq!(p.mode(), Mode::AutoEdit);
+        p.set_mode(Mode::FullAuto);
+        assert_eq!(p.mode(), Mode::FullAuto);
+        p.set_mode(Mode::Plan);
+        assert_eq!(p.mode(), Mode::Plan);
+    }
+
+    #[test]
+    fn parse_accepts_the_documented_aliases() {
+        assert_eq!(Mode::parse("suggest"), Some(Mode::Suggest));
+        assert_eq!(Mode::parse("auto-edit"), Some(Mode::AutoEdit));
+        assert_eq!(Mode::parse("autoedit"), Some(Mode::AutoEdit));
+        assert_eq!(Mode::parse("auto"), Some(Mode::AutoEdit));
+        assert_eq!(Mode::parse("full-auto"), Some(Mode::FullAuto));
+        assert_eq!(Mode::parse("fullauto"), Some(Mode::FullAuto));
+        assert_eq!(Mode::parse("full"), Some(Mode::FullAuto));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_modes() {
+        assert_eq!(Mode::parse(""), None);
+        assert_eq!(Mode::parse("nonsense"), None);
+        assert_eq!(Mode::parse("full_auto"), None);
+        assert_eq!(Mode::parse(" suggest"), None);
+    }
+
+    // ---- await_approver ----
+
+    #[tokio::test]
+    async fn await_approver_allows_when_the_approver_approves() {
+        let p = PermissionPolicy::new(Mode::AutoEdit, Arc::new(|_, _| Box::pin(async { true })));
+        assert!(matches!(
+            p.await_approver("bash", &serde_json::json!({})).await,
+            ToolCallVerdict::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn await_approver_blocks_with_a_reason_when_the_approver_rejects() {
+        let p = PermissionPolicy::new(Mode::AutoEdit, Arc::new(|_, _| Box::pin(async { false })));
+        match p.await_approver("bash", &serde_json::json!({})).await {
+            ToolCallVerdict::Block(msg) => {
+                assert_eq!(msg, "bash denied by user")
+            }
+            v => panic!("expected Block, got {v:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn await_approver_passes_the_tool_name_and_args_to_the_approver() {
+        let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let c = seen.clone();
+        let p = PermissionPolicy::new(
+            Mode::AutoEdit,
+            Arc::new(move |name, args| {
+                c.lock().unwrap().push((name.to_string(), args.to_string()));
+                Box::pin(async { true })
+            }),
+        );
+        p.await_approver("bash", &serde_json::json!({"cmd": "ls"}))
+            .await;
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "bash");
+        assert!(
+            seen[0].1.contains("ls"),
+            "the args must reach the approver, got: {}",
+            seen[0].1
+        );
+    }
+
+    #[tokio::test]
+    async fn await_approver_reports_cancellation_as_an_abort() {
+        let policy = PermissionPolicy::new(
+            Mode::AutoEdit,
+            Arc::new(|_n, _a| Box::pin(std::future::pending::<bool>())),
+        );
+        let signal = CancelSignal::new();
+        policy.set_signal(signal.clone());
+        let waiting =
+            tokio::spawn(
+                async move { policy.await_approver("bash", &serde_json::json!({})).await },
+            );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let started = std::time::Instant::now();
+        signal.cancel();
+        match waiting.await.unwrap() {
+            ToolCallVerdict::Block(msg) => {
+                assert!(msg.contains("aborted"), "{msg}");
+                assert!(msg.contains("bash"), "{msg}");
+            }
+            v => panic!("expected Block, got {v:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "cancel must unwind the approval wait immediately"
+        );
+    }
+
+    // ---- after_tool_call ----
+
+    #[test]
+    fn after_tool_call_passes_the_result_through_unchanged() {
+        let p = PermissionPolicy::new(Mode::FullAuto, Arc::new(|_, _| Box::pin(async { true })));
+        let result = ToolResultMessage {
+            tool_call_id: "t1".into(),
+            tool_name: "bash".into(),
+            content: vec![conga::ContentBlock::text("ok")],
+            is_error: false,
+            timestamp: 7,
+        };
+        let out = p.after_tool_call("call-1", &result);
+        assert_eq!(out, result);
+        assert_eq!(out.tool_call_id, "t1");
+        assert_eq!(out.timestamp, 7);
+    }
+
+    #[test]
+    fn after_tool_call_returns_an_independent_clone() {
+        let p = PermissionPolicy::new(Mode::FullAuto, Arc::new(|_, _| Box::pin(async { true })));
+        let mut result = ToolResultMessage {
+            tool_call_id: "t1".into(),
+            tool_name: "bash".into(),
+            content: vec![conga::ContentBlock::text("ok")],
+            is_error: false,
+            timestamp: 0,
+        };
+        let out = p.after_tool_call("call-1", &result);
+        result
+            .content
+            .push(conga::ContentBlock::text("late mutation"));
+        assert_eq!(
+            out.content.len(),
+            1,
+            "the returned message must be a clone, not a shared handle"
+        );
+    }
 }

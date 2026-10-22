@@ -487,4 +487,172 @@ mod tests {
         assert!(next.contains("alive"), "shell must stay usable: {next}");
         assert!(next.contains("[exit 0]"), "{next}");
     }
+
+    // ---- new_sentinel ----
+
+    /// The completion marker carries a per-run nonce: two runs must never
+    /// share one, or user output could forge an exit code.
+    #[test]
+    fn new_sentinel_is_unique_per_call() {
+        let a = new_sentinel();
+        let b = new_sentinel();
+        assert_ne!(a, b, "every run needs its own marker");
+        assert!(a.starts_with("__CONGA_DONE_"), "{a}");
+        assert!(a.ends_with("__"), "{a}");
+        assert!(!a.contains(' '), "the marker must be a single token: {a}");
+    }
+
+    // ---- ShellSession::spawn ----
+
+    /// A spawned session is wired up: stdin accepts a command and stdout
+    /// carries its output.
+    #[tokio::test]
+    async fn spawn_creates_a_usable_shell_session() {
+        let mut session = ShellSession::spawn(std::path::Path::new("/tmp"), &HashMap::new())
+            .expect("sh must be spawnable");
+        session
+            .stdin
+            .write_all(b"echo spawned-ok\n")
+            .await
+            .expect("stdin must accept the command");
+        let mut buf = Vec::new();
+        session
+            .stdout
+            .read_until(b'\n', &mut buf)
+            .await
+            .expect("stdout must yield a line");
+        assert_eq!(String::from_utf8_lossy(&buf).trim(), "spawned-ok");
+    }
+
+    /// Error path: a working directory that does not exist cannot host a
+    /// shell.
+    #[test]
+    fn spawn_fails_for_a_missing_working_directory() {
+        // `ShellSession` has no `Debug` impl, so `expect_err` is not
+        // available — match on the result instead.
+        match ShellSession::spawn(
+            std::path::Path::new("/conga-no-such-dir-xyz"),
+            &HashMap::new(),
+        ) {
+            Ok(_) => panic!("spawning into a missing dir must fail"),
+            Err(e) => assert!(!e.to_string().is_empty()),
+        }
+    }
+
+    // ---- ShellOutcome::incomplete / finish ----
+
+    /// An incomplete run (timeout, shell death) has no exit code.
+    #[test]
+    fn incomplete_has_no_exit_code() {
+        let outcome = ShellOutcome::incomplete("partial output".into());
+        assert_eq!(outcome.output, "partial output");
+        assert_eq!(outcome.exit_code, None);
+    }
+
+    /// A background run names its log file so the model knows where to poll.
+    #[test]
+    fn finish_appends_the_background_log_path() {
+        let outcome = finish(
+            ShellOutcome::incomplete("done".into()),
+            Some(std::path::PathBuf::from("/tmp/bg-1.log")),
+        );
+        assert!(
+            outcome.output.contains("[background output -> /tmp/bg-1.log]"),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.starts_with("done"),
+            "the collected output must be kept: {}",
+            outcome.output
+        );
+    }
+
+    /// A foreground run is left exactly as collected.
+    #[test]
+    fn finish_without_a_log_path_leaves_the_output_untouched() {
+        let outcome = finish(
+            ShellOutcome {
+                output: "[exit 0]".into(),
+                exit_code: Some(0),
+            },
+            None,
+        );
+        assert_eq!(outcome.output, "[exit 0]");
+        assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    // ---- get_or_spawn / evict ----
+
+    /// The registry hands out ONE session per id: a second call reuses the
+    /// live shell instead of spawning another one.
+    #[tokio::test]
+    async fn get_or_spawn_reuses_the_existing_session() {
+        let id = format!("t10-reuse-{}", uuid::Uuid::new_v4());
+        let first = get_or_spawn(&id, std::path::Path::new("/tmp"), &HashMap::new())
+            .await
+            .expect("first spawn");
+        let second = get_or_spawn(&id, std::path::Path::new("/tmp"), &HashMap::new())
+            .await
+            .expect("second spawn");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "the same session id must reuse the same shell"
+        );
+        assert!(registry().lock().await.contains_key(&id));
+        evict(&id).await;
+    }
+
+    /// Different ids get different shells.
+    #[tokio::test]
+    async fn get_or_spawn_creates_one_session_per_id() {
+        let a_id = format!("t11-a-{}", uuid::Uuid::new_v4());
+        let b_id = format!("t11-b-{}", uuid::Uuid::new_v4());
+        let a = get_or_spawn(&a_id, std::path::Path::new("/tmp"), &HashMap::new())
+            .await
+            .expect("spawn a");
+        let b = get_or_spawn(&b_id, std::path::Path::new("/tmp"), &HashMap::new())
+            .await
+            .expect("spawn b");
+        assert!(
+            !std::sync::Arc::ptr_eq(&a, &b),
+            "different ids must not share a shell"
+        );
+        evict(&a_id).await;
+        evict(&b_id).await;
+    }
+
+    /// `evict` drops the registry entry; a later call respawns from scratch.
+    #[tokio::test]
+    async fn evict_removes_the_registry_entry() {
+        let id = format!("t12-evict-{}", uuid::Uuid::new_v4());
+        get_or_spawn(&id, std::path::Path::new("/tmp"), &HashMap::new())
+            .await
+            .expect("spawn");
+        assert!(registry().lock().await.contains_key(&id));
+        evict(&id).await;
+        assert!(
+            !registry().lock().await.contains_key(&id),
+            "evict must drop the registry entry"
+        );
+    }
+
+    /// Evicting an unknown id is a no-op (no panic).
+    #[tokio::test]
+    async fn evict_of_an_unknown_session_is_a_no_op() {
+        evict("t13-never-existed").await;
+        assert!(!registry().lock().await.contains_key("t13-never-existed"));
+    }
+
+    // ---- millis ----
+
+    /// The background log file name is derived from a millisecond
+    /// timestamp: it must be a real timestamp and must not go backwards.
+    #[test]
+    fn millis_returns_a_non_decreasing_timestamp() {
+        let first = millis();
+        let second = millis();
+        assert!(first > 0, "the clock must be past the epoch");
+        assert!(second >= first, "time must not go backwards");
+    }
 }

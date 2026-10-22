@@ -184,4 +184,35 @@ mod tests {
         assert!(b.is_cancelled());
         task.await.unwrap();
     }
+
+    /// `Default` hands out the same fresh, not-cancelled signal as `new()`.
+    #[test]
+    fn default_signal_starts_uncancelled() {
+        let sig = CancelSignal::default();
+        assert!(!sig.is_cancelled());
+        // The shared raw flag starts clear too - tools must not see an abort.
+        assert!(!sig.flag().load(Ordering::Relaxed));
+    }
+
+    /// A defaulted signal is fully usable: it can be cancelled and reset.
+    #[test]
+    fn default_signal_supports_cancel_and_reset() {
+        let sig = CancelSignal::default();
+        sig.cancel();
+        assert!(sig.is_cancelled());
+        sig.reset();
+        assert!(!sig.is_cancelled());
+    }
+
+    /// The Debug output names the type and the current cancel state.
+    #[test]
+    fn debug_fmt_reports_cancel_state() {
+        let sig = CancelSignal::new();
+        let before = format!("{sig:?}");
+        assert!(before.contains("CancelSignal"), "{before}");
+        assert!(before.contains("cancelled: false"), "{before}");
+        sig.cancel();
+        let after = format!("{sig:?}");
+        assert!(after.contains("cancelled: true"), "{after}");
+    }
 }

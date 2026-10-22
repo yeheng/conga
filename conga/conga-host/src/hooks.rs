@@ -131,6 +131,59 @@ mod tests {
         }
     }
 
+    struct ModifyArgs;
+    impl HookChain for ModifyArgs {
+        fn before_tool_call<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a serde_json::Value,
+            _: RiskLevel,
+        ) -> Pin<Box<dyn Future<Output = ToolCallVerdict> + Send + 'a>> {
+            Box::pin(async { ToolCallVerdict::Modify(serde_json::json!({"rewritten": true})) })
+        }
+        fn after_tool_call(&self, _: &str, r: &ToolResultMessage) -> ToolResultMessage {
+            r.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn push_appends_the_chain_to_the_stack() {
+        let mut stack = HookStack::new(Vec::new());
+        // An empty stack allows everything.
+        let v = stack
+            .before_tool_call("1", "bash", &serde_json::json!({}), RiskLevel::High)
+            .await;
+        assert!(matches!(v, ToolCallVerdict::Allow));
+
+        // A pushed chain is consulted from then on.
+        stack.push(Arc::new(BlockBash));
+        let v = stack
+            .before_tool_call("1", "bash", &serde_json::json!({}), RiskLevel::High)
+            .await;
+        assert!(matches!(v, ToolCallVerdict::Block(_)), "the pushed chain must run");
+
+        // Pushing more chains keeps the earlier verdict (first Block wins).
+        stack.push(Arc::new(AllowAll));
+        let v = stack
+            .before_tool_call("1", "bash", &serde_json::json!({}), RiskLevel::High)
+            .await;
+        assert!(matches!(v, ToolCallVerdict::Block(_)));
+    }
+
+    #[tokio::test]
+    async fn pushed_modify_chain_rewrites_the_arguments() {
+        let mut stack = HookStack::new(vec![Arc::new(AllowAll)]);
+        stack.push(Arc::new(ModifyArgs));
+        let v = stack
+            .before_tool_call("1", "bash", &serde_json::json!({"cmd": "ls"}), RiskLevel::Low)
+            .await;
+        match v {
+            ToolCallVerdict::Modify(args) => assert_eq!(args["rewritten"], true),
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn first_block_wins() {
         let stack = HookStack::new(vec![Arc::new(AllowAll), Arc::new(BlockBash)]);

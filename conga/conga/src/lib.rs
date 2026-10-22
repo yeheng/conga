@@ -53,3 +53,22 @@ pub fn now() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::now;
+
+    /// `now` is an epoch-millisecond clock: far past 2020 and never running
+    /// backwards between two reads.
+    #[test]
+    fn now_is_epoch_millis_and_non_decreasing() {
+        let first = now();
+        let second = now();
+        // 2020-09-13T12:26:40Z - a sane floor for "milliseconds since epoch".
+        assert!(
+            first > 1_600_000_000_000,
+            "now() must be epoch milliseconds, got {first}"
+        );
+        assert!(second >= first, "clock went backwards: {first} -> {second}");
+    }
+}

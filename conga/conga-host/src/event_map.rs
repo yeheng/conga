@@ -228,6 +228,88 @@ mod tests {
     }
 
     #[test]
+    fn thinking_delta_maps_to_thinking_event() {
+        let mut tool_names = HashMap::new();
+        let event = AgentEvent::MessageUpdate {
+            delta: ContentDelta::ThinkingDelta("pondering".into()),
+        };
+        let v = ws_json(&event, &mut tool_names);
+        assert_eq!(v["type"], "thinking");
+        assert_eq!(v["content"], "pondering");
+    }
+
+    #[test]
+    fn error_event_maps_to_the_error_event() {
+        let mut tool_names = HashMap::new();
+        let v = ws_json(&AgentEvent::Error { message: "boom".into() }, &mut tool_names);
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["content"], "boom");
+        assert_eq!(v["message"], "boom");
+    }
+
+    #[test]
+    fn tool_end_without_any_text_block_reports_an_empty_output() {
+        let mut tool_names = HashMap::new();
+        let event = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tc1".into(),
+            result: ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                tool_name: "bash".into(),
+                content: vec![ContentBlock::Thinking {
+                    thinking: "hmm".into(),
+                }],
+                is_error: false,
+                timestamp: 0,
+            },
+            is_error: false,
+        };
+        let v = ws_json(&event, &mut tool_names);
+        assert_eq!(v["type"], "tool_end");
+        assert_eq!(v["output"], "");
+    }
+
+    #[test]
+    fn subagent_events_map_to_their_wire_types() {
+        let v = subagent_event_to_ws(&SubagentEvent::AllStarted { count: 3 }).unwrap();
+        assert_eq!(v["type"], "subagent_all_started");
+        assert_eq!(v["count"], 3);
+
+        let v = subagent_event_to_ws(&SubagentEvent::Synthesizing).unwrap();
+        assert_eq!(v["type"], "subagent_synthesizing");
+
+        let v = subagent_event_to_ws(&SubagentEvent::Started {
+            id: "s1".into(),
+            task: "do it".into(),
+            index: 0,
+        })
+        .unwrap();
+        assert_eq!(v["type"], "subagent_started");
+        assert_eq!(v["id"], "s1");
+        assert_eq!(v["task"], "do it");
+        assert_eq!(v["index"], 0);
+
+        let v = subagent_event_to_ws(&SubagentEvent::Completed {
+            id: "s1".into(),
+            index: 1,
+            summary: "done".into(),
+            tool_count: 2,
+        })
+        .unwrap();
+        assert_eq!(v["type"], "subagent_completed");
+        assert_eq!(v["summary"], "done");
+        assert_eq!(v["tool_count"], 2);
+
+        let v = subagent_event_to_ws(&SubagentEvent::Error {
+            id: "s1".into(),
+            index: 0,
+            error: "bad".into(),
+        })
+        .unwrap();
+        assert_eq!(v["type"], "subagent_error");
+        assert_eq!(v["error"], "bad");
+    }
+
+    #[test]
     fn unhandled_events_map_to_none() {
         let mut tool_names = HashMap::new();
         let events = [

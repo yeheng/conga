@@ -289,4 +289,167 @@ mod tests {
         assert!(result_text(&r1).contains("from-one"));
         assert!(result_text(&r2).contains("from-two"));
     }
+
+    /// Returns fixed results so the summary rendering can be asserted.
+    struct ScriptedSpawner {
+        results: Vec<SubagentResult>,
+    }
+
+    impl SubagentSpawner for ScriptedSpawner {
+        fn spawn(
+            &self,
+            _tasks: Vec<SubagentSpawn>,
+        ) -> Pin<Box<dyn Future<Output = Vec<SubagentResult>> + Send>> {
+            let results = self.results.clone();
+            Box::pin(async move { results })
+        }
+    }
+
+    fn scripted_result(index: usize, task: &str) -> SubagentResult {
+        SubagentResult {
+            id: format!("r-{index}"),
+            task: task.to_string(),
+            index,
+            summary: "headline".into(),
+            output: String::new(),
+            tool_count: 0,
+            error: None,
+            log_path: None,
+        }
+    }
+
+    fn ctx_with_args(args: serde_json::Value) -> ToolCallCtx {
+        ToolCallCtx {
+            tool_call_id: "t1".into(),
+            args,
+            signal: Arc::new(AtomicBool::new(false)),
+            ctx: ToolContext {
+                cwd: std::env::current_dir().unwrap(),
+                env: HashMap::new(),
+                session_id: "s1".into(),
+                state_dir: std::env::temp_dir(),
+            },
+        }
+    }
+
+    #[test]
+    fn tool_definition_exposes_a_bounded_task_array() {
+        let t = tool(None);
+        assert_eq!(t.name, "spawn_subagents");
+        assert_eq!(t.label, "Spawn Subagents");
+        assert_eq!(t.risk, conga::types::tool::RiskLevel::Medium);
+        let tasks = &t.parameters["properties"]["tasks"];
+        assert_eq!(tasks["type"], "array");
+        assert_eq!(tasks["minItems"], 1);
+        assert_eq!(tasks["maxItems"], 5);
+        assert_eq!(t.parameters["required"], serde_json::json!(["tasks"]));
+    }
+
+    /// Error path: the task array is mandatory.
+    #[tokio::test]
+    async fn requires_a_tasks_array() {
+        let err = execute(Arc::new(crate::subagent_types::NoopSubagentSpawner), ctx_with_args(serde_json::json!({})))
+            .await
+            .expect_err("a missing tasks array must fail");
+        assert!(
+            err.to_string().contains("tasks array is required"),
+            "{err}"
+        );
+    }
+
+    /// Error path: an empty task list has nothing to spawn.
+    #[tokio::test]
+    async fn rejects_an_empty_task_list() {
+        let r = execute(
+            Arc::new(crate::subagent_types::NoopSubagentSpawner),
+            ctx_with(serde_json::json!([])),
+        )
+        .await
+        .unwrap();
+        assert!(r.is_error);
+        assert!(result_text(&r).contains("no valid tasks"), "{}", result_text(&r));
+    }
+
+    /// Error path: entries without a `task` string are all invalid.
+    #[tokio::test]
+    async fn rejects_tasks_without_a_task_string() {
+        let r = execute(
+            Arc::new(crate::subagent_types::NoopSubagentSpawner),
+            ctx_with(serde_json::json!([{ "nope": 1 }, { "also": "nope" }])),
+        )
+        .await
+        .unwrap();
+        assert!(r.is_error);
+        assert!(result_text(&r).contains("no valid tasks"), "{}", result_text(&r));
+    }
+
+    /// Error path: an aborted call must not spawn anything.
+    #[tokio::test]
+    async fn aborts_on_signal() {
+        let mut ctx = ctx_with(serde_json::json!([{ "task": "a" }]));
+        ctx.signal = Arc::new(AtomicBool::new(true));
+        let r = execute(
+            Arc::new(crate::subagent_types::NoopSubagentSpawner),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert!(r.is_error);
+        assert!(result_text(&r).contains("aborted"), "{}", result_text(&r));
+    }
+
+    /// The parent reasons over the FULL output, and the log path is named
+    /// so the transcript can be re-read on demand.
+    #[tokio::test]
+    async fn includes_the_full_output_and_the_log_path() {
+        let mut result = scripted_result(1, "do the thing");
+        result.output = "the full transcript".into();
+        result.log_path = Some("/tmp/subagent-1.jsonl".into());
+        let spawner = Arc::new(ScriptedSpawner {
+            results: vec![result],
+        });
+        let r = execute(spawner, ctx_with(serde_json::json!([{ "task": "do the thing" }])))
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+        let text = result_text(&r);
+        assert!(text.contains("the full transcript"), "{text}");
+        assert!(text.contains("(full log: /tmp/subagent-1.jsonl)"), "{text}");
+        assert_eq!(r.details["subagent_count"], 1);
+        assert_eq!(r.details["completed"], 1);
+        assert_eq!(r.details["errors"], 0);
+        assert_eq!(r.details["log_paths"][0], "/tmp/subagent-1.jsonl");
+    }
+
+    /// A sub-agent that failed is reported as an error, never as a silent
+    /// empty result.
+    #[tokio::test]
+    async fn reports_subagent_errors() {
+        let mut result = scripted_result(1, "do the thing");
+        result.error = Some("boom".into());
+        let spawner = Arc::new(ScriptedSpawner {
+            results: vec![result],
+        });
+        let r = execute(spawner, ctx_with(serde_json::json!([{ "task": "do the thing" }])))
+            .await
+            .unwrap();
+        let text = result_text(&r);
+        assert!(text.contains("ERROR - boom"), "{text}");
+        assert_eq!(r.details["errors"], 1);
+        assert_eq!(r.details["completed"], 0);
+    }
+
+    /// With no output the short summary stands in for it.
+    #[tokio::test]
+    async fn falls_back_to_the_summary_when_the_output_is_empty() {
+        let spawner = Arc::new(ScriptedSpawner {
+            results: vec![scripted_result(1, "do the thing")],
+        });
+        let r = execute(spawner, ctx_with(serde_json::json!([{ "task": "do the thing" }])))
+            .await
+            .unwrap();
+        let text = result_text(&r);
+        assert!(text.contains("Subagent 1 (do the thing)"), "{text}");
+        assert!(text.contains("headline"), "{text}");
+    }
 }

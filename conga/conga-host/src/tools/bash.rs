@@ -178,6 +178,28 @@ mod tests {
         .unwrap()
     }
 
+    /// Same as [`run`], but keeps the `Err` so the error path can be
+    /// asserted on.
+    async fn run_raw(
+        args: serde_json::Value,
+        cwd: &std::path::Path,
+    ) -> Result<ToolResult, conga::error::ToolError> {
+        let session = format!("bash-test-{}", uuid::Uuid::new_v4());
+        let t = tool();
+        (t.execute)(ToolCallCtx {
+            tool_call_id: "x".into(),
+            args,
+            signal: Arc::new(AtomicBool::new(false)),
+            ctx: ToolContext {
+                cwd: cwd.to_path_buf(),
+                env: std::env::vars().collect(),
+                session_id: session,
+                state_dir: cwd.to_path_buf(),
+            },
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn runs_echo() {
         let tmp = tempfile::tempdir().unwrap();
@@ -458,5 +480,132 @@ mod tests {
         .await;
         assert!(!r.is_error, "sandbox off -> old behavior");
         assert!(target.exists());
+    }
+
+    // ---- tool definition / argument handling ----
+
+    #[test]
+    fn tool_definition_exposes_command_timeout_and_background() {
+        let t = tool();
+        assert_eq!(t.name, "bash");
+        assert_eq!(t.label, "Bash");
+        // A tool that executes arbitrary commands is always High risk.
+        assert_eq!(t.risk, conga::types::tool::RiskLevel::High);
+        assert!(t.parameters["properties"]["command"]["type"] == "string");
+        assert!(t.parameters["properties"]["timeout"]["type"] == "integer");
+        assert!(t.parameters["properties"]["run_in_background"]["type"] == "boolean");
+        assert_eq!(t.parameters["required"], serde_json::json!(["command"]));
+    }
+
+    /// Error path: the command argument is mandatory.
+    #[tokio::test]
+    async fn requires_a_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = run_raw(serde_json::json!({}), tmp.path())
+            .await
+            .expect_err("a missing command must fail");
+        assert!(err.to_string().contains("command is required"), "{err}");
+    }
+
+    /// Error path: an aborted call must not run anything.
+    #[tokio::test]
+    async fn aborts_on_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tool();
+        let r = (t.execute)(ToolCallCtx {
+            tool_call_id: "x".into(),
+            args: serde_json::json!({"command": "echo should-not-run"}),
+            signal: Arc::new(AtomicBool::new(true)),
+            ctx: ToolContext {
+                cwd: tmp.path().to_path_buf(),
+                env: Default::default(),
+                session_id: format!("bash-abort-{}", uuid::Uuid::new_v4()),
+                state_dir: tmp.path().to_path_buf(),
+            },
+        })
+        .await
+        .unwrap();
+        assert!(r.is_error);
+        let text = match &r.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(text.contains("aborted"), "{text}");
+    }
+
+    /// The exit status is reported both in the output and in `details`.
+    #[tokio::test]
+    async fn reports_the_exit_code_in_details() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = if cfg!(target_os = "windows") {
+            "cmd /C exit 3"
+        } else {
+            "sh -c 'exit 3'"
+        };
+        let r = run(serde_json::json!({"command": cmd}), tmp.path()).await;
+        assert!(r.is_error, "a non-zero exit is an error result");
+        assert_eq!(r.details["exit_code"], 3);
+        assert_eq!(r.details["persistent"], true);
+    }
+
+    /// A command with no output still reports its exit status.
+    #[tokio::test]
+    async fn reports_the_exit_status_for_a_silent_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = if cfg!(target_os = "windows") {
+            "cmd /C exit 0"
+        } else {
+            "true"
+        };
+        let r = run(serde_json::json!({"command": cmd}), tmp.path()).await;
+        assert!(!r.is_error, "{:?}", r.details);
+        assert_eq!(r.details["exit_code"], 0);
+        let text = match &r.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(text.contains("[exit 0]"), "{text}");
+    }
+
+    /// Quotes and newlines in the command must survive the shell wrapper.
+    #[tokio::test]
+    async fn handles_quotes_and_newlines_in_the_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = run(
+            serde_json::json!({"command": "printf '%s\\n' \"a b\"; printf 'x\\ny\\n'"}),
+            tmp.path(),
+        )
+        .await;
+        assert!(!r.is_error, "{:?}", r.details);
+        let text = match &r.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(text.contains("a b"), "quoted argument lost: {text}");
+        assert!(text.contains('x'), "{text}");
+        assert!(text.contains('y'), "{text}");
+    }
+
+    /// Background mode returns immediately and names the log file the
+    /// output is written to.
+    #[tokio::test]
+    async fn runs_in_background_and_names_the_log_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = run(
+            serde_json::json!({"command": "echo backgrounded", "run_in_background": true}),
+            tmp.path(),
+        )
+        .await;
+        assert!(!r.is_error, "{:?}", r.details);
+        assert_eq!(r.details["background"], true);
+        let text = match &r.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("background output ->"),
+            "the log file must be named: {text}"
+        );
+        assert!(text.contains("bg-"), "the log file must be named: {text}");
     }
 }

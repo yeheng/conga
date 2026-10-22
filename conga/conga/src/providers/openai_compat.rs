@@ -593,5 +593,230 @@ mod tests {
                 vec![StreamChunk::Stop(StopReason::ToolUse)]
             );
         }
+
+        // ── Construction & Debug ───────────────────────────────────
+
+        #[test]
+        fn with_client_keeps_the_base_url() {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let p = OpenAiCompat::with_client("http://127.0.0.1:1234/v1", "k", client);
+            let out = format!("{p:?}");
+            assert!(out.contains("OpenAiCompat"), "{out}");
+            assert!(out.contains("http://127.0.0.1:1234/v1"), "{out}");
+        }
+
+        #[test]
+        fn debug_format_never_leaks_the_api_key() {
+            let p = OpenAiCompat::new("http://127.0.0.1:1234/v1", "sk-super-secret");
+            let out = format!("{p:?}");
+            assert!(
+                !out.contains("sk-super-secret"),
+                "the api key must not reach the logs: {out}"
+            );
+        }
+
+        #[test]
+        fn from_config_uses_the_configured_base_url() {
+            use crate::test_util::fake_env;
+            let cfg = crate::providers::ProviderConfig::from_env_with(&fake_env(&[
+                ("CONGA_LLM_BASE_URL", "https://api.x.com/v1"),
+                ("CONGA_LLM_KEY", "sk-test"),
+                ("CONGA_LLM_MODEL", "gpt-4o-mini"),
+            ]))
+            .unwrap();
+            let p = OpenAiCompat::from_config(&cfg);
+            let out = format!("{p:?}");
+            assert!(out.contains("https://api.x.com/v1"), "{out}");
+            assert!(!out.contains("sk-test"), "{out}");
+        }
+
+        // ── build_request_body ─────────────────────────────────────
+
+        fn spec() -> ModelSpec {
+            ModelSpec {
+                id: "gpt-4o-mini".into(),
+                api: ProviderApi::OpenAiCompat,
+                max_tokens: 256,
+            }
+        }
+
+        #[test]
+        fn build_request_body_carries_the_model_and_stream_flags() {
+            let body = build_request_body(&spec(), &[], "", &[]);
+            assert_eq!(body["model"], "gpt-4o-mini");
+            assert_eq!(body["stream"], json!(true));
+            assert_eq!(body["max_tokens"], json!(256));
+            assert_eq!(body["stream_options"]["include_usage"], json!(true));
+            assert_eq!(body["messages"].as_array().unwrap().len(), 0);
+        }
+
+        #[test]
+        fn build_request_body_prefixes_the_system_prompt() {
+            let body =
+                build_request_body(&spec(), &[AgentMessage::user("hi")], "you are helpful", &[]);
+            let msgs = body["messages"].as_array().unwrap();
+            assert_eq!(msgs.len(), 2);
+            assert_eq!(msgs[0]["role"], "system");
+            assert_eq!(msgs[0]["content"], "you are helpful");
+            assert_eq!(msgs[1]["role"], "user");
+        }
+
+        #[test]
+        fn build_request_body_without_a_system_prompt_has_no_system_message() {
+            let body = build_request_body(&spec(), &[AgentMessage::user("hi")], "", &[]);
+            let msgs = body["messages"].as_array().unwrap();
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0]["role"], "user");
+        }
+
+        #[test]
+        fn build_request_body_without_tools_has_no_tools_key() {
+            let body = build_request_body(&spec(), &[], "", &[]);
+            assert!(body.get("tools").is_none(), "{body}");
+        }
+
+        #[test]
+        fn build_request_body_maps_the_tools() {
+            let tool = ToolDefinition {
+                name: "read".into(),
+                label: "Read".into(),
+                description: "read a file".into(),
+                parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                risk: crate::types::tool::RiskLevel::Low,
+                execute: std::sync::Arc::new(|_c: crate::types::tool::ToolCallCtx| {
+                    Box::pin(async { Ok(crate::types::tool::ToolResult::text("")) })
+                }),
+            };
+            let body = build_request_body(&spec(), &[], "", &[tool]);
+            let tools = body["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0]["type"], "function");
+            assert_eq!(tools[0]["function"]["name"], "read");
+            assert_eq!(tools[0]["function"]["description"], "read a file");
+            assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+        }
+
+        #[test]
+        fn build_request_body_drops_custom_messages() {
+            let custom = AgentMessage::Custom(crate::types::message::CustomMessage {
+                custom_type: "x".into(),
+                content: json!({}),
+                timestamp: 0,
+            });
+            let body = build_request_body(&spec(), &[custom, AgentMessage::user("hi")], "", &[]);
+            let msgs = body["messages"].as_array().unwrap();
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0]["role"], "user");
+        }
+
+        // ── convert_message ────────────────────────────────────────
+
+        #[test]
+        fn convert_message_user_joins_the_text_blocks() {
+            let msg = AgentMessage::User(crate::types::message::UserMessage {
+                content: vec![ContentBlock::text("a"), ContentBlock::text("b")],
+                timestamp: 0,
+            });
+            let entry = convert_message(&msg).expect("user maps to an entry");
+            assert_eq!(entry["role"], "user");
+            assert_eq!(entry["content"], "ab");
+        }
+
+        #[test]
+        fn convert_message_assistant_with_tool_calls() {
+            let mut a = crate::types::message::AssistantMessage::new(&"m".into());
+            a.append_tool_call(
+                None,
+                "t1".into(),
+                Some("bash".into()),
+                "{\"cmd\":\"ls\"}".into(),
+            );
+            let entry = convert_message(&AgentMessage::Assistant(a)).expect("assistant maps");
+            assert_eq!(entry["role"], "assistant");
+            let calls = entry["tool_calls"].as_array().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["id"], "t1");
+            assert_eq!(calls[0]["type"], "function");
+            assert_eq!(calls[0]["function"]["name"], "bash");
+            assert_eq!(calls[0]["function"]["arguments"], "{\"cmd\":\"ls\"}");
+            // No text -> no `content` key (a `null` content is rejected by
+            // some OpenAI-compat servers).
+            assert!(entry.get("content").is_none(), "{entry}");
+        }
+
+        #[test]
+        fn convert_message_assistant_with_text_and_tool_calls() {
+            let mut a = crate::types::message::AssistantMessage::new(&"m".into());
+            a.append_text("working");
+            a.append_tool_call(None, "t1".into(), Some("bash".into()), "{}".into());
+            let entry = convert_message(&AgentMessage::Assistant(a)).expect("assistant maps");
+            assert_eq!(entry["content"], "working");
+            assert_eq!(entry["tool_calls"].as_array().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn convert_message_assistant_with_multiple_tool_calls() {
+            let mut a = crate::types::message::AssistantMessage::new(&"m".into());
+            a.append_tool_call(Some(0), "t0".into(), Some("a".into()), "{}".into());
+            a.append_tool_call(Some(1), "t1".into(), Some("b".into()), "{}".into());
+            let entry = convert_message(&AgentMessage::Assistant(a)).expect("assistant maps");
+            let calls = entry["tool_calls"].as_array().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0]["id"], "t0");
+            assert_eq!(calls[1]["id"], "t1");
+        }
+
+        #[test]
+        fn convert_message_tool_result_uses_the_tool_role() {
+            let tr = AgentMessage::ToolResult(crate::types::message::ToolResultMessage {
+                tool_call_id: "t1".into(),
+                tool_name: "bash".into(),
+                content: vec![ContentBlock::text("out"), ContentBlock::text("put")],
+                is_error: false,
+                timestamp: 0,
+            });
+            let entry = convert_message(&tr).expect("tool result maps");
+            assert_eq!(entry["role"], "tool");
+            assert_eq!(entry["tool_call_id"], "t1");
+            assert_eq!(entry["content"], "output");
+        }
+
+        #[test]
+        fn convert_message_tool_result_with_an_empty_output() {
+            let tr = AgentMessage::ToolResult(crate::types::message::ToolResultMessage {
+                tool_call_id: "t1".into(),
+                tool_name: "bash".into(),
+                content: vec![],
+                is_error: true,
+                timestamp: 0,
+            });
+            let entry = convert_message(&tr).expect("tool result maps");
+            assert_eq!(entry["role"], "tool");
+            assert_eq!(entry["content"], "");
+        }
+
+        // ── tool_to_openai ─────────────────────────────────────────
+
+        #[test]
+        fn tool_to_openai_maps_the_definition() {
+            let tool = ToolDefinition {
+                name: "read".into(),
+                label: "Read".into(),
+                description: "read a file".into(),
+                parameters: json!({"type": "object"}),
+                risk: crate::types::tool::RiskLevel::Low,
+                execute: std::sync::Arc::new(|_c: crate::types::tool::ToolCallCtx| {
+                    Box::pin(async { Ok(crate::types::tool::ToolResult::text("")) })
+                }),
+            };
+            let v = tool_to_openai(&tool);
+            assert_eq!(v["type"], "function");
+            assert_eq!(v["function"]["name"], "read");
+            assert_eq!(v["function"]["description"], "read a file");
+            assert_eq!(v["function"]["parameters"], json!({"type": "object"}));
+            // The provider wire format must not carry the internal fields.
+            assert!(v.get("label").is_none());
+            assert!(v.get("risk").is_none());
+        }
     }
 }

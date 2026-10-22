@@ -777,4 +777,229 @@ mod tests {
         );
         assert!(REGISTRY.read().contains_key(&format!("{b}/default")));
     }
+
+    // ── Direct tests of the session primitives ──────────────────
+
+    /// A tool context for the direct (non-tool-dispatch) calls.
+    fn ctx_for(session: &str, cwd: &std::path::Path, args: serde_json::Value) -> ToolCallCtx {
+        ToolCallCtx {
+            tool_call_id: "x".into(),
+            args,
+            signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ctx: ToolContext {
+                cwd: cwd.to_path_buf(),
+                env: std::env::vars().collect(),
+                session_id: session.into(),
+                state_dir: cwd.to_path_buf(),
+            },
+        }
+    }
+
+    #[test]
+    fn ring_is_empty_until_something_is_pushed() {
+        let mut r = OutputRing::default();
+        assert!(r.is_empty(), "a fresh ring holds nothing");
+        r.push_str("x");
+        assert!(!r.is_empty(), "a pushed chunk makes it non-empty");
+        assert_eq!(r.drain(), "x");
+        assert!(r.is_empty(), "draining empties the ring again");
+    }
+
+    #[tokio::test]
+    async fn run_spawns_a_pty_session_and_registers_it() {
+        let _registry = REGISTRY_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let session = format!("direct-run-{}", std::process::id());
+        let key = format!("{session}/default");
+        let ctx = ctx_for(
+            &session,
+            tmp.path(),
+            serde_json::json!({"command": "echo hi"}),
+        );
+
+        let res = run(&ctx, &key).expect("run spawns a session");
+
+        assert!(!res.is_error);
+        assert!(text(&res).contains(&key), "got: {}", text(&res));
+        assert_eq!(res.details["session"], key.as_str());
+        assert!(
+            REGISTRY.read().contains_key(&key),
+            "the spawned session is registered"
+        );
+        evict_session_terminals(&session);
+    }
+
+    #[tokio::test]
+    async fn run_without_a_command_is_rejected() {
+        let _registry = REGISTRY_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let session = format!("direct-run-err-{}", std::process::id());
+        let key = format!("{session}/default");
+        let ctx = ctx_for(&session, tmp.path(), serde_json::json!({}));
+
+        let err = match run(&ctx, &key) {
+            Ok(_) => panic!("run without a command must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("command is required for run"),
+            "{err}"
+        );
+        assert!(
+            !REGISTRY.read().contains_key(&key),
+            "a rejected run must not register a session"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_only_removes_the_matching_session() {
+        let _registry = REGISTRY_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let a = format!("direct-reap-a-{}", std::process::id());
+        let b = format!("direct-reap-b-{}", std::process::id());
+        // Both children wait for stdin: they stay alive for the whole test.
+        for session in [&a, &b] {
+            let ctx = ctx_for(
+                session,
+                tmp.path(),
+                serde_json::json!({"command": "read x; echo $x"}),
+            );
+            run(&ctx, &format!("{session}/default")).expect("run spawns");
+        }
+        let sess_a = REGISTRY
+            .read()
+            .get(&format!("{a}/default"))
+            .cloned()
+            .unwrap();
+        let sess_b = REGISTRY
+            .read()
+            .get(&format!("{b}/default"))
+            .cloned()
+            .unwrap();
+
+        // A stale session handle must not evict the current one.
+        remove_if_current(&format!("{a}/default"), &sess_b);
+        assert!(
+            REGISTRY.read().contains_key(&format!("{a}/default")),
+            "a mismatched session must not be removed"
+        );
+
+        remove_if_current(&format!("{a}/default"), &sess_a);
+        assert!(
+            !REGISTRY.read().contains_key(&format!("{a}/default")),
+            "the matching session must be removed"
+        );
+        assert!(REGISTRY.read().contains_key(&format!("{b}/default")));
+
+        evict_session_terminals(&a);
+        evict_session_terminals(&b);
+    }
+
+    #[tokio::test]
+    async fn reap_dead_sessions_culls_only_dead_and_fully_read_sessions() {
+        let _registry = REGISTRY_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // (1) dead child, no output at all -> cullable.
+        let dead = format!("direct-reap-dead-{}", std::process::id());
+        let ctx = ctx_for(&dead, tmp.path(), serde_json::json!({"command": "true"}));
+        run(&ctx, &format!("{dead}/default")).expect("run spawns");
+        for _ in 0..50 {
+            if session_is_dead(&format!("{dead}/default")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            session_is_dead(&format!("{dead}/default")),
+            "test precondition: the child must have exited"
+        );
+
+        // (2) dead child with unread output -> must survive (the bytes are
+        // still readable through `read`).
+        let unread = format!("direct-reap-unread-{}", std::process::id());
+        let ctx = ctx_for(
+            &unread,
+            tmp.path(),
+            serde_json::json!({"command": "echo buffered"}),
+        );
+        run(&ctx, &format!("{unread}/default")).expect("run spawns");
+        for _ in 0..50 {
+            if session_is_dead(&format!("{unread}/default")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(session_is_dead(&format!("{unread}/default")));
+
+        reap_dead_sessions();
+
+        assert!(
+            !REGISTRY.read().contains_key(&format!("{dead}/default")),
+            "a dead, fully-read session must be culled"
+        );
+        assert!(
+            REGISTRY.read().contains_key(&format!("{unread}/default")),
+            "a session with unread output must survive the sweep"
+        );
+
+        evict_session_terminals(&dead);
+        evict_session_terminals(&unread);
+    }
+
+    #[tokio::test]
+    async fn send_writes_to_the_stdin_of_a_running_session() {
+        let _registry = REGISTRY_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let session = format!("direct-send-{}", std::process::id());
+        let key = format!("{session}/default");
+        let ctx = ctx_for(
+            &session,
+            tmp.path(),
+            serde_json::json!({"command": "read line; echo got:$line"}),
+        );
+        run(&ctx, &key).expect("run spawns");
+
+        let send_ctx = ctx_for(&session, tmp.path(), serde_json::json!({"command": "ping"}));
+        let res = send(&send_ctx, &key).await.expect("send writes");
+        assert!(!res.is_error);
+        assert_eq!(text(&res), "sent");
+        assert_eq!(res.details["session"], key.as_str());
+
+        let mut got = String::new();
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            got = text(&read(&key).await.expect("read"));
+            if got.contains("got:ping") {
+                break;
+            }
+        }
+        assert!(got.contains("got:ping"), "got: {got}");
+
+        evict_session_terminals(&session);
+    }
+
+    #[tokio::test]
+    async fn send_without_a_command_or_session_fails() {
+        let _registry = REGISTRY_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let session = format!("direct-send-err-{}", std::process::id());
+        let key = format!("{session}/default");
+
+        let no_cmd = ctx_for(&session, tmp.path(), serde_json::json!({}));
+        let err = match send(&no_cmd, &key).await {
+            Ok(_) => panic!("send without a command must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("command is required for send"),
+            "{err}"
+        );
+
+        // No such session: an honest tool-level error, not a panic.
+        let ctx = ctx_for(&session, tmp.path(), serde_json::json!({"command": "x"}));
+        let res = send(&ctx, &key).await.expect("send returns a tool error");
+        assert!(res.is_error);
+        assert!(text(&res).contains("no session"), "got: {}", text(&res));
+    }
 }

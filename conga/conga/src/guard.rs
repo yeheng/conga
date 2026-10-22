@@ -64,6 +64,16 @@ mod tests {
         assert_eq!(g.observe("bash", r#"{"command":"ls"}"#), 1);
     }
 
+    /// `Default` starts a fresh streak, exactly like `new()`.
+    #[test]
+    fn default_guard_starts_a_fresh_streak() {
+        let mut g = RepeatGuard::default();
+        assert_eq!(g.observe("bash", r#"{"command":"ls"}"#), 1);
+        assert_eq!(g.observe("bash", r#"{"command":"ls"}"#), 2);
+        assert_eq!(g.observe("bash", r#"{"command":"ls"}"#), 3);
+        assert!(repeat_advisory(3).is_some());
+    }
+
     #[test]
     fn advisory_fires_only_at_three() {
         assert!(repeat_advisory(1).is_none());

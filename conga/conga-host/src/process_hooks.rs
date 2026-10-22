@@ -501,7 +501,284 @@ mod tests {
         assert_eq!(hooks[0].command, "yes");
     }
 
-    // ── runner + chain (Task 2) ─────────────────────────────
+    // ── matcher / file parsing ────────────────────────────────
+
+    #[test]
+    fn parse_matcher_blank_star_and_all_mean_every_tool() {
+        for raw in ["", "   ", "*", "all", "ALL", " All "] {
+            assert_eq!(
+                parse_matcher(raw),
+                ToolMatcher::All,
+                "matcher {raw:?} must apply to every tool"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_matcher_splits_lowercases_and_trims_names() {
+        assert_eq!(
+            parse_matcher("Bash, Write"),
+            ToolMatcher::Names(vec!["bash".into(), "write".into()])
+        );
+        assert_eq!(
+            parse_matcher("  read ,  "),
+            ToolMatcher::Names(vec!["read".into()])
+        );
+    }
+
+    #[test]
+    fn parse_matcher_with_only_separators_matches_nothing() {
+        // "," is neither empty nor "*": it parses to an empty name list, so
+        // the hook applies to NO tool (it must not silently widen to all).
+        let m = parse_matcher(", ,");
+        assert_eq!(m, ToolMatcher::Names(vec![]));
+        assert!(!m.matches("bash"));
+    }
+
+    #[test]
+    fn load_file_appends_the_parsed_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(
+            &path,
+            hook_json(r#"{"matcher": "bash", "hooks": [{"command": "true", "timeout": 2}]}"#),
+        )
+        .unwrap();
+        let mut out: Vec<ProcessHook> = Vec::new();
+        load_file(&path, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].command, "true");
+        assert_eq!(out[0].tools, ToolMatcher::Names(vec!["bash".into()]));
+        assert_eq!(out[0].timeout, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn load_file_on_a_missing_file_adds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut out: Vec<ProcessHook> = Vec::new();
+        load_file(&dir.path().join("nope.json"), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn load_file_skips_unsupported_types_and_empty_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(
+            &path,
+            hook_json(
+                r#"{"hooks": [{"type": "http", "command": "x"}, {"command": "   "}, {"command": "keep"}]}"#,
+            ),
+        )
+        .unwrap();
+        let mut out: Vec<ProcessHook> = Vec::new();
+        load_file(&path, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].command, "keep");
+    }
+
+    #[test]
+    fn load_file_defaults_a_zero_timeout_to_ten_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, hook_json(r#"{"hooks": [{"command": "true", "timeout": 0}]}"#)).unwrap();
+        let mut out: Vec<ProcessHook> = Vec::new();
+        load_file(&path, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].timeout, Duration::from_secs(10));
+    }
+
+    // ── the runner ─────────────────────────────────────────────
+
+    fn hook_with(command: &str, timeout: Duration) -> ProcessHook {
+        ProcessHook {
+            command: command.to_string(),
+            tools: ToolMatcher::All,
+            timeout,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_hook_blocks_on_exit_two_with_the_stderr_reason() {
+        let hook = hook_with("echo 'nope' >&2; exit 2", Duration::from_secs(5));
+        let d = run_hook(
+            None,
+            &hook,
+            "call-1",
+            "bash",
+            &serde_json::json!({}),
+            RiskLevel::Low,
+        )
+        .await;
+        match d {
+            HookDecision::Block(reason) => assert_eq!(reason, "nope"),
+            _other => panic!("expected Block, got something else"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_hook_blocks_without_a_reason_using_the_default_text() {
+        let hook = hook_with("exit 2", Duration::from_secs(5));
+        let d = run_hook(
+            None,
+            &hook,
+            "call-1",
+            "bash",
+            &serde_json::json!({}),
+            RiskLevel::Low,
+        )
+        .await;
+        match d {
+            HookDecision::Block(reason) => assert_eq!(reason, "blocked by process hook"),
+            _other => panic!("expected Block, got something else"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_hook_runs_the_command_in_the_given_working_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hook = hook_with("pwd", Duration::from_secs(5));
+        let d = run_hook(
+            Some(tmp.path()),
+            &hook,
+            "call-1",
+            "bash",
+            &serde_json::json!({}),
+            RiskLevel::Low,
+        )
+        .await;
+        assert!(matches!(d, HookDecision::NoOpinion), "pwd prints no decision");
+        // The command really ran inside the pinned cwd.
+        let marker = tmp.path().join("marker.txt");
+        let hook = hook_with(
+            &format!("touch {}", marker.display()),
+            Duration::from_secs(5),
+        );
+        let _ = run_hook(
+            Some(tmp.path()),
+            &hook,
+            "call-1",
+            "bash",
+            &serde_json::json!({}),
+            RiskLevel::Low,
+        )
+        .await;
+        assert!(marker.exists(), "the hook must run in the pinned cwd");
+    }
+
+    #[tokio::test]
+    async fn run_hook_times_out_into_no_opinion() {
+        let hook = hook_with("sleep 30", Duration::from_millis(150));
+        let d = run_hook(
+            None,
+            &hook,
+            "call-1",
+            "bash",
+            &serde_json::json!({}),
+            RiskLevel::Low,
+        )
+        .await;
+        assert!(matches!(d, HookDecision::NoOpinion));
+    }
+
+    #[tokio::test]
+    async fn run_hook_with_an_unspawnable_command_has_no_opinion() {
+        let hook = hook_with("definitely-not-a-real-binary-xyz", Duration::from_secs(5));
+        let d = run_hook(
+            None,
+            &hook,
+            "call-1",
+            "bash",
+            &serde_json::json!({}),
+            RiskLevel::Low,
+        )
+        .await;
+        assert!(matches!(d, HookDecision::NoOpinion));
+    }
+
+    // ── the stdout decision parser ─────────────────────────────
+
+    #[test]
+    fn parse_decision_deny_blocks_with_the_reason() {
+        let stdout = br#"{"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "no .env"}}"#;
+        match parse_decision(stdout, "") {
+            HookDecision::Block(reason) => assert_eq!(reason, "no .env"),
+            _other => panic!("expected Block, got something else"),
+        }
+    }
+
+    #[test]
+    fn parse_decision_deny_without_a_reason_falls_back_to_stderr() {
+        let stdout = br#"{"hookSpecificOutput": {"permissionDecision": "deny"}}"#;
+        match parse_decision(stdout, "stderr says no") {
+            HookDecision::Block(reason) => assert_eq!(reason, "stderr says no"),
+            _other => panic!("expected Block, got something else"),
+        }
+        // Neither a reason nor stderr -> the default block text.
+        match parse_decision(stdout, "") {
+            HookDecision::Block(reason) => assert_eq!(reason, "blocked by process hook"),
+            _other => panic!("expected Block, got something else"),
+        }
+        // A whitespace-only stderr is used verbatim (the runner trims the
+        // hook's stderr before it reaches the parser, so this never shows
+        // up as a blank reason in production).
+        match parse_decision(stdout, "  ") {
+            HookDecision::Block(reason) => assert_eq!(reason, "  "),
+            _other => panic!("expected Block, got something else"),
+        }
+    }
+
+    #[test]
+    fn parse_decision_allow_returns_allow() {
+        let stdout = br#"{"hookSpecificOutput": {"permissionDecision": "allow"}}"#;
+        assert!(matches!(
+            parse_decision(stdout, ""),
+            HookDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn parse_decision_updated_input_returns_modify() {
+        let stdout =
+            br#"{"hookSpecificOutput": {"updatedInput": {"command": "rtk git status"}}}"#;
+        match parse_decision(stdout, "") {
+            HookDecision::Modify(args) => assert_eq!(args["command"], "rtk git status"),
+            _other => panic!("expected Modify, got something else"),
+        }
+    }
+
+    #[test]
+    fn parse_decision_garbage_or_unknown_shapes_have_no_opinion() {
+        assert!(matches!(
+            parse_decision(b"not json at all", ""),
+            HookDecision::NoOpinion
+        ));
+        assert!(matches!(
+            parse_decision(b"{}", ""),
+            HookDecision::NoOpinion
+        ));
+        assert!(matches!(
+            parse_decision(br#"{"hookSpecificOutput": {}}"#, ""),
+            HookDecision::NoOpinion
+        ));
+        assert!(matches!(
+            parse_decision(
+                br#"{"hookSpecificOutput": {"permissionDecision": "maybe"}}"#,
+                ""
+            ),
+            HookDecision::NoOpinion
+        ));
+        // A non-object `updatedInput` is not a rewrite.
+        assert!(matches!(
+            parse_decision(
+                br#"{"hookSpecificOutput": {"updatedInput": "nope"}}"#,
+                ""
+            ),
+            HookDecision::NoOpinion
+        ));
+    }
+
+    // ── runner + chain (Task 2) ───────────────────────────────
 
     use conga::{HookChain, RiskLevel, ToolCallVerdict};
 

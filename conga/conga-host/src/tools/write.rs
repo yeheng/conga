@@ -80,6 +80,44 @@ mod tests {
     use conga::types::tool::ToolContext;
     use std::sync::atomic::AtomicBool;
 
+    async fn run(args: serde_json::Value, cwd: &std::path::Path) -> ToolResult {
+        let t = tool();
+        (t.execute)(ToolCallCtx {
+            tool_call_id: "x".into(),
+            args,
+            signal: Arc::new(AtomicBool::new(false)),
+            ctx: ToolContext {
+                cwd: cwd.to_path_buf(),
+                env: Default::default(),
+                session_id: "s".into(),
+                state_dir: cwd.to_path_buf(),
+            },
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Same as [`run`], but keeps the `Err` so the error path can be
+    /// asserted on.
+    async fn run_raw(
+        args: serde_json::Value,
+        cwd: &std::path::Path,
+    ) -> Result<ToolResult, conga::error::ToolError> {
+        let t = tool();
+        (t.execute)(ToolCallCtx {
+            tool_call_id: "x".into(),
+            args,
+            signal: Arc::new(AtomicBool::new(false)),
+            ctx: ToolContext {
+                cwd: cwd.to_path_buf(),
+                env: Default::default(),
+                session_id: "s".into(),
+                state_dir: cwd.to_path_buf(),
+            },
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn writes_file_and_creates_dirs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -198,5 +236,142 @@ mod tests {
             })
             .collect();
         assert!(leftovers.is_empty(), "tmp files leaked: {leftovers:?}");
+    }
+
+    // ---- tool definition / argument handling ----
+
+    #[test]
+    fn tool_definition_exposes_path_and_content() {
+        let t = tool();
+        assert_eq!(t.name, "write");
+        assert_eq!(t.label, "Write");
+        assert_eq!(t.risk, conga::types::tool::RiskLevel::Medium);
+        assert!(t.parameters["properties"]["path"]["type"] == "string");
+        assert!(t.parameters["properties"]["content"]["type"] == "string");
+        assert_eq!(
+            t.parameters["required"],
+            serde_json::json!(["path", "content"])
+        );
+    }
+
+    /// Error path: both arguments are mandatory.
+    #[tokio::test]
+    async fn requires_path_and_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = run_raw(serde_json::json!({"content": "x"}), tmp.path())
+            .await
+            .expect_err("a missing path must fail");
+        assert!(err.to_string().contains("path is required"), "{err}");
+
+        let err = run_raw(serde_json::json!({"path": "f.txt"}), tmp.path())
+            .await
+            .expect_err("a missing content must fail");
+        assert!(err.to_string().contains("content is required"), "{err}");
+    }
+
+    /// Error path: a path outside the cwd is refused — the sandbox holds.
+    #[tokio::test]
+    async fn rejects_a_path_outside_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = run(
+            serde_json::json!({"path": "../escape.txt", "content": "x"}),
+            tmp.path(),
+        )
+        .await;
+        assert!(r.is_error);
+        let text = match &r.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(text.contains("escapes working directory"), "{text}");
+    }
+
+    /// Error path: an aborted call must not write anything.
+    #[tokio::test]
+    async fn aborts_on_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tool();
+        let r = (t.execute)(ToolCallCtx {
+            tool_call_id: "x".into(),
+            args: serde_json::json!({"path": "f.txt", "content": "nope"}),
+            signal: Arc::new(AtomicBool::new(true)),
+            ctx: ToolContext {
+                cwd: tmp.path().to_path_buf(),
+                env: Default::default(),
+                session_id: "s".into(),
+                state_dir: tmp.path().to_path_buf(),
+            },
+        })
+        .await
+        .unwrap();
+        assert!(r.is_error);
+        assert!(!tmp.path().join("f.txt").exists(), "nothing may be written");
+    }
+
+    /// Boundary: empty content is a valid write — it produces an empty
+    /// file, not an error.
+    #[tokio::test]
+    async fn writes_an_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = run(
+            serde_json::json!({"path": "empty.txt", "content": ""}),
+            tmp.path(),
+        )
+        .await;
+        assert!(!r.is_error);
+        assert_eq!(r.details["bytes"], 0);
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("empty.txt"))
+                .await
+                .unwrap(),
+            ""
+        );
+    }
+
+    /// The reported byte count is bytes, not characters, and the content
+    /// round-trips byte for byte.
+    #[tokio::test]
+    async fn reports_the_byte_count_for_unicode_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = "héllo 你好";
+        let r = run(
+            serde_json::json!({"path": "u.txt", "content": content}),
+            tmp.path(),
+        )
+        .await;
+        assert!(!r.is_error);
+        assert_eq!(r.details["bytes"], content.len());
+        assert_ne!(
+            content.len(),
+            content.chars().count(),
+            "the fixture must actually be multibyte"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("u.txt"))
+                .await
+                .unwrap(),
+            content
+        );
+    }
+
+    /// Writing over an existing file replaces it wholesale.
+    #[tokio::test]
+    async fn overwrites_an_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "old content")
+            .await
+            .unwrap();
+        let r = run(
+            serde_json::json!({"path": "f.txt", "content": "new"}),
+            tmp.path(),
+        )
+        .await;
+        assert!(!r.is_error);
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("f.txt"))
+                .await
+                .unwrap(),
+            "new"
+        );
     }
 }

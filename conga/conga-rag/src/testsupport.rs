@@ -81,3 +81,67 @@ pub async fn spawn_mock_embeddings_error(
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (format!("http://{addr}/v1"), requests)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Proxy-free client: the machine-wide `HTTP_PROXY` would otherwise
+    /// hijack requests aimed at the local mock server.
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("proxy-free client")
+    }
+
+    async fn post(base: &str, input: serde_json::Value) -> reqwest::Response {
+        client()
+            .post(format!("{base}/embeddings"))
+            .json(&serde_json::json!({"model": "mock", "input": input}))
+            .send()
+            .await
+            .expect("mock request")
+    }
+
+    #[tokio::test]
+    async fn mock_embeddings_returns_deterministic_vectors() {
+        let (base, requests) = spawn_mock_embeddings(0).await;
+        let resp = post(&base, serde_json::json!(["match", "abc"])).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"][0]["index"], 0);
+        assert_eq!(
+            body["data"][0]["embedding"],
+            serde_json::json!([1.0, 0.0, 0.0, 0.0]),
+            "\"match\" must map to the retrieval vector"
+        );
+        assert_eq!(
+            body["data"][1]["embedding"],
+            serde_json::json!([0.0, 0.003, 0.0, 0.0]),
+            "other texts map to their length"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn mock_embeddings_fails_the_first_requests_with_429() {
+        let (base, requests) = spawn_mock_embeddings(1).await;
+        let first = post(&base, serde_json::json!(["x"])).await;
+        assert_eq!(first.status(), 429);
+        assert_eq!(first.text().await.unwrap(), "rate limited");
+        let second = post(&base, serde_json::json!(["x"])).await;
+        assert_eq!(second.status(), 200, "the failure budget is spent");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn mock_embeddings_error_answers_with_the_given_status_and_body() {
+        let (base, requests) = spawn_mock_embeddings_error(503, "upstream is down").await;
+        let resp = post(&base, serde_json::json!(["x"])).await;
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.text().await.unwrap(), "upstream is down");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+}

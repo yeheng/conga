@@ -103,6 +103,13 @@ mod tests {
         .unwrap()
     }
 
+    fn text_of(r: &ToolResult) -> String {
+        match &r.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        }
+    }
+
     #[tokio::test]
     async fn oversize_read_spills_to_disk() {
         // Freeze-at-birth: a read whose rendered output exceeds the
@@ -203,5 +210,150 @@ mod tests {
         // legitimate path still works.
         let r = run(serde_json::json!({"path": "f.txt"}), tmp.path()).await;
         assert!(!r.is_error, "normal path must still work");
+    }
+
+    #[test]
+    fn tool_definition_exposes_path_offset_and_limit() {
+        let t = tool();
+        assert_eq!(t.name, "read");
+        assert_eq!(t.label, "Read");
+        assert_eq!(t.risk, conga::types::tool::RiskLevel::Low);
+        assert!(t.parameters["properties"]["path"]["type"] == "string");
+        assert!(t.parameters["properties"]["offset"]["type"] == "integer");
+        assert!(t.parameters["properties"]["limit"]["type"] == "integer");
+        assert_eq!(t.parameters["required"], serde_json::json!(["path"]));
+    }
+
+    /// Boundary: an empty file has no lines -> the explicit empty marker.
+    #[tokio::test]
+    async fn empty_file_yields_the_empty_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "")
+            .await
+            .unwrap();
+        let r = run(serde_json::json!({"path": "f.txt"}), tmp.path()).await;
+        assert!(!r.is_error);
+        assert_eq!(text_of(&r), "(empty)");
+        assert_eq!(r.details["lines"], 0);
+    }
+
+    /// Boundary: an offset past the last line yields nothing (not an
+    /// error).
+    #[tokio::test]
+    async fn offset_beyond_the_end_yields_the_empty_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "a\nb\nc")
+            .await
+            .unwrap();
+        let r = run(
+            serde_json::json!({"path": "f.txt", "offset": 99}),
+            tmp.path(),
+        )
+        .await;
+        assert!(!r.is_error);
+        assert_eq!(text_of(&r), "(empty)");
+        assert_eq!(r.details["lines"], 0);
+    }
+
+    /// Boundary: `offset` is 1-based, so 0 clamps to the first line
+    /// instead of erroring or panicking.
+    #[tokio::test]
+    async fn offset_zero_is_clamped_to_the_first_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "a\nb\n")
+            .await
+            .unwrap();
+        let r = run(
+            serde_json::json!({"path": "f.txt", "offset": 0}),
+            tmp.path(),
+        )
+        .await;
+        assert!(!r.is_error);
+        assert!(text_of(&r).contains("1\ta"), "{}", text_of(&r));
+        assert_eq!(r.details["lines"], 2);
+    }
+
+    /// Boundary: a limit of zero lines yields the empty marker.
+    #[tokio::test]
+    async fn limit_zero_yields_the_empty_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "a\nb\n")
+            .await
+            .unwrap();
+        let r = run(
+            serde_json::json!({"path": "f.txt", "limit": 0}),
+            tmp.path(),
+        )
+        .await;
+        assert!(!r.is_error);
+        assert_eq!(text_of(&r), "(empty)");
+        assert_eq!(r.details["lines"], 0);
+    }
+
+    /// Boundary: a limit larger than the file returns every line.
+    #[tokio::test]
+    async fn limit_beyond_the_end_returns_every_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "a\nb\n")
+            .await
+            .unwrap();
+        let r = run(
+            serde_json::json!({"path": "f.txt", "limit": 100}),
+            tmp.path(),
+        )
+        .await;
+        assert!(!r.is_error);
+        assert!(text_of(&r).contains("1\ta"));
+        assert!(text_of(&r).contains("2\tb"));
+        assert_eq!(r.details["lines"], 2);
+    }
+
+    /// Error path: a file above the size cap is refused instead of being
+    /// read into the context.
+    #[tokio::test]
+    async fn rejects_a_file_above_the_size_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = vec![b'x'; MAX_BYTES + 1];
+        tokio::fs::write(tmp.path().join("big.bin"), &big).await.unwrap();
+        let r = run(serde_json::json!({"path": "big.bin"}), tmp.path()).await;
+        assert!(r.is_error);
+        assert!(text_of(&r).contains("file too large"), "{}", text_of(&r));
+    }
+
+    /// Boundary: a non-UTF-8 file is read lossily (replacement chars), not
+    /// rejected.
+    #[tokio::test]
+    async fn reads_non_utf8_content_lossily() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.bin"), [0xff, 0xfe, b'a'])
+            .await
+            .unwrap();
+        let r = run(serde_json::json!({"path": "f.bin"}), tmp.path()).await;
+        assert!(!r.is_error);
+        let text = text_of(&r);
+        assert!(text.contains('a'), "the valid byte must survive: {text}");
+        assert!(
+            text.contains('\u{fffd}'),
+            "invalid bytes must become replacement chars: {text}"
+        );
+    }
+
+    /// Error path: a missing file surfaces the read error.
+    #[tokio::test]
+    async fn reports_a_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let res = (tool().execute)(ToolCallCtx {
+            tool_call_id: "x".into(),
+            args: serde_json::json!({"path": "missing.txt"}),
+            signal: Arc::new(AtomicBool::new(false)),
+            ctx: ToolContext {
+                cwd: tmp.path().to_path_buf(),
+                env: Default::default(),
+                session_id: "s".into(),
+                state_dir: tmp.path().to_path_buf(),
+            },
+        })
+        .await;
+        assert!(res.is_err(), "a missing file must be an error");
     }
 }

@@ -197,4 +197,61 @@ mod tests {
         );
         assert_eq!(redact("socks5://127.0.0.1:1080"), "socks5://127.0.0.1:1080");
     }
+
+    // ── `tool_proxy` ──────────────────────────────────────────────
+
+    /// Restore an env var to the value it had before the test.
+    fn restore_env(key: &str, saved: Option<String>) {
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn tool_proxy_returns_the_override_when_it_is_set() {
+        let _g = test_util::LOCK.blocking_lock();
+        set_tool_proxy(Some("socks5://override:1080")).unwrap();
+        let resolved = tool_proxy();
+        set_tool_proxy(None).unwrap();
+        assert_eq!(resolved, Some("socks5://override:1080".to_string()));
+    }
+
+    #[test]
+    fn tool_proxy_falls_back_to_the_env_var() {
+        let _g = test_util::LOCK.blocking_lock();
+        set_tool_proxy(None).unwrap();
+        let saved = std::env::var(ENV_VAR).ok();
+        std::env::set_var(ENV_VAR, "http://env-proxy:8080");
+        let resolved = tool_proxy();
+        restore_env(ENV_VAR, saved);
+        assert_eq!(resolved, Some("http://env-proxy:8080".to_string()));
+    }
+
+    #[test]
+    fn tool_proxy_trims_the_env_var_and_ignores_a_blank_one() {
+        let _g = test_util::LOCK.blocking_lock();
+        set_tool_proxy(None).unwrap();
+        let saved = std::env::var(ENV_VAR).ok();
+
+        std::env::set_var(ENV_VAR, "  http://env-proxy:8080  ");
+        let trimmed = tool_proxy();
+        assert_eq!(trimmed, Some("http://env-proxy:8080".to_string()));
+
+        std::env::set_var(ENV_VAR, "   ");
+        let blank = tool_proxy();
+        restore_env(ENV_VAR, saved);
+        assert_eq!(blank, None, "a blank env value means no proxy");
+    }
+
+    #[test]
+    fn tool_proxy_is_none_without_override_and_without_env() {
+        let _g = test_util::LOCK.blocking_lock();
+        set_tool_proxy(None).unwrap();
+        let saved = std::env::var(ENV_VAR).ok();
+        std::env::remove_var(ENV_VAR);
+        let resolved = tool_proxy();
+        restore_env(ENV_VAR, saved);
+        assert_eq!(resolved, None);
+    }
 }

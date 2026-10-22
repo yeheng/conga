@@ -30,3 +30,10 @@ conga-host = { path = "../../conga/conga-host", features = ["session-index"] }
 conga-ext = { path = "../../conga/conga-ext", features = ["terminal", "rag"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "std", "env-filter"] }
 dotenvy = "0.15.7"
+
+[dev-dependencies]
+# Tests move $HOME into a temp dir so the whole `~/.conga` config root is
+# isolated from the developer's real one.
+tempfile = "3"
+# `macros` for #[tokio::test]; the runtime features come from the normal dep.
+tokio = { version = "1", features = ["macros"] }

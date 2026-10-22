@@ -232,4 +232,98 @@ mod tests {
             "gitignored file leaked: {text}"
         );
     }
+
+    #[test]
+    fn tool_definition_exposes_optional_path_recursive_and_pattern() {
+        let t = tool();
+        assert_eq!(t.name, "list");
+        assert_eq!(t.label, "List");
+        assert_eq!(t.risk, conga::types::tool::RiskLevel::Low);
+        assert!(t.parameters["properties"]["path"]["type"] == "string");
+        assert!(t.parameters["properties"]["recursive"]["type"] == "boolean");
+        assert!(t.parameters["properties"]["pattern"]["type"] == "string");
+        assert!(
+            t.parameters.get("required").is_none(),
+            "every argument has a default"
+        );
+    }
+
+    /// Without `recursive` the walk stops at depth 1: a file inside a
+    /// subdirectory must not show up.
+    #[tokio::test]
+    async fn does_not_recurse_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("a.rs"), "").await.unwrap();
+        tokio::fs::create_dir(tmp.path().join("sub")).await.unwrap();
+        tokio::fs::write(tmp.path().join("sub/deep.rs"), "").await.unwrap();
+        let r = run(serde_json::json!({}), tmp.path()).await;
+        let text = text_of(&r);
+        assert!(text.contains("a.rs"), "{text}");
+        assert!(text.contains("sub/"), "{text}");
+        assert!(
+            !text.contains("deep.rs"),
+            "a non-recursive listing must not descend: {text}"
+        );
+    }
+
+    /// Error path: a path that does not exist is reported, not silently
+    /// empty.
+    #[tokio::test]
+    async fn reports_path_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = run(serde_json::json!({"path": "nope"}), tmp.path()).await;
+        assert!(r.is_error);
+        assert!(text_of(&r).contains("path not found"), "{}", text_of(&r));
+    }
+
+    /// Boundary: a glob that matches nothing yields an empty listing (and
+    /// no error).
+    #[tokio::test]
+    async fn lists_nothing_when_the_glob_matches_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("a.rs"), "").await.unwrap();
+        let r = run(serde_json::json!({"pattern": "*.zzz"}), tmp.path()).await;
+        assert!(!r.is_error);
+        assert_eq!(text_of(&r), "");
+        assert_eq!(r.details["count"], 0);
+    }
+
+    /// Boundary: an invalid glob pattern is dropped (no filtering) rather
+    /// than failing the whole listing.
+    #[tokio::test]
+    async fn invalid_glob_pattern_falls_back_to_no_filtering() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("a.rs"), "").await.unwrap();
+        let r = run(serde_json::json!({"pattern": "["}), tmp.path()).await;
+        assert!(!r.is_error);
+        assert!(text_of(&r).contains("a.rs"), "{}", text_of(&r));
+    }
+
+    /// Boundary: listing a FILE (not a directory) yields nothing — the
+    /// root entry strips to an empty relative path.
+    #[tokio::test]
+    async fn lists_nothing_for_a_file_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("a.rs"), "").await.unwrap();
+        let r = run(serde_json::json!({"path": "a.rs"}), tmp.path()).await;
+        assert!(!r.is_error);
+        assert_eq!(text_of(&r), "");
+    }
+
+    /// Boundary: the listing is capped so a huge tree cannot flood the
+    /// context.
+    #[tokio::test]
+    async fn caps_the_number_of_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..(MAX_ENTRIES + 25) {
+            tokio::fs::write(tmp.path().join(format!("f{i}.rs")), "")
+                .await
+                .unwrap();
+        }
+        let r = run(serde_json::json!({"recursive": true}), tmp.path()).await;
+        assert_eq!(
+            r.details["count"], MAX_ENTRIES,
+            "the listing must stop at the cap"
+        );
+    }
 }

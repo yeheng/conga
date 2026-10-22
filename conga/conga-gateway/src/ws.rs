@@ -575,6 +575,168 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
     use dashmap::DashMap;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+    /// The server side of a real WebSocket handshake plus a connected
+    /// client. The client must stay alive for the lifetime of the socket.
+    async fn ws_pair() -> (
+        futures_util::stream::SplitSink<WebSocket, Message>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/ws",
+            get(move |ws: axum::extract::ws::WebSocketUpgrade| {
+                let tx = tx.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        let _ = tx.send(socket);
+                        futures_util::future::pending::<()>().await;
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("the handshake succeeds");
+        let socket = rx.recv().await.expect("the server hands over its socket");
+        let (sink, _stream) = socket.split();
+        (sink, client)
+    }
+
+    /// The next JSON event the client receives.
+    async fn next_json(
+        client: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> serde_json::Value {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("no event arrived within 5s")
+            .expect("the stream ended")
+            .expect("a websocket error");
+        match msg {
+            ClientMessage::Text(t) => serde_json::from_str(&t).expect("a JSON event"),
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_json_writes_the_event_as_a_json_text_frame() {
+        let (mut sink, mut client) = ws_pair().await;
+
+        send_json(&mut sink, &OutgoingEvent::content("hello".into())).await;
+
+        let v = next_json(&mut client).await;
+        assert_eq!(v["type"], "content");
+        assert_eq!(v["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn send_json_serializes_the_done_event_without_a_summary() {
+        let (mut sink, mut client) = ws_pair().await;
+
+        send_json(&mut sink, &OutgoingEvent::done()).await;
+
+        let v = next_json(&mut client).await;
+        assert_eq!(v["type"], "done");
+        assert!(v.get("usage_in").is_none(), "{v}");
+    }
+
+    /// A gateway server plus a connected client.
+    async fn gateway_client(
+        session_id: &str,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Arc<AppState>,
+    ) {
+        // Provider env so `SessionAssembly::build` succeeds headless (no
+        // network happens during assembly). Process-global; no other
+        // gateway test reads these.
+        std::env::set_var("CONGA_LLM_BASE_URL", "http://127.0.0.1:9");
+        std::env::set_var("CONGA_LLM_KEY", "test-key");
+        std::env::set_var("CONGA_LLM_MODEL", "test-model");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            sessions: DashMap::new(),
+            store_root: tmp.path().to_path_buf(),
+            index_db: tmp.path().join("index.db"),
+            auth_token: Arc::new("t".to_string()),
+        });
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (client, _resp) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws?user_id={session_id}"))
+                .await
+                .expect("the handshake succeeds");
+        (client, state)
+    }
+
+    #[tokio::test]
+    async fn handle_ws_answers_a_slash_command_without_calling_the_model() {
+        let (mut client, state) = gateway_client("slash-sess").await;
+
+        client
+            .send(ClientMessage::Text(
+                r#"{"type":"message","content":"/help"}"#.into(),
+            ))
+            .await
+            .unwrap();
+
+        let first = next_json(&mut client).await;
+        assert_eq!(first["type"], "content", "{first}");
+        assert!(
+            first["content"].as_str().unwrap().contains("/clear"),
+            "{first}"
+        );
+        // The slash reply is followed by the turn-boundary marker.
+        let second = next_json(&mut client).await;
+        assert_eq!(second["type"], "done", "{second}");
+        // The connection claims the session id.
+        assert!(state.sessions.contains_key("slash-sess"));
+    }
+
+    #[tokio::test]
+    async fn handle_ws_ignores_a_malformed_json_frame() {
+        let (mut client, _state) = gateway_client("bad-json-sess").await;
+
+        client
+            .send(ClientMessage::Text("this is not json".into()))
+            .await
+            .unwrap();
+        // Nothing may come back for a bad frame ...
+        let quiet =
+            tokio::time::timeout(std::time::Duration::from_millis(200), client.next()).await;
+        assert!(
+            quiet.is_err(),
+            "a malformed frame must not produce a reply: {quiet:?}"
+        );
+        // ... and the session must still work afterwards.
+        client
+            .send(ClientMessage::Text(
+                r#"{"type":"message","content":"/help"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let v = next_json(&mut client).await;
+        assert_eq!(v["type"], "content", "{v}");
+    }
 
     /// Two SIMULTANEOUS upgrades of one session id race past the handler's
     /// cheap pre-check; the atomic DashMap `entry` claim in `handle_ws`

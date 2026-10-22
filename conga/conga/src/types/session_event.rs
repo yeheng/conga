@@ -553,4 +553,163 @@ mod tests {
             matches!(&msgs[3], AgentMessage::ToolResult(tr) if tr.tool_call_id == "t2" && tr.is_error)
         );
     }
+
+    // ── SessionEvent::from_message ────────────────────────────────
+
+    #[test]
+    fn from_message_maps_a_user_message() {
+        let msg = AgentMessage::user("hi");
+        let ev = SessionEvent::from_message(&msg, None).expect("user maps to an event");
+        assert_eq!(ev, SessionEvent::User(msg.clone()));
+    }
+
+    #[test]
+    fn from_message_maps_an_assistant_message_with_its_usage() {
+        let msg = AgentMessage::assistant_text("hello");
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: Some(3),
+            cache_write_tokens: None,
+        };
+        let ev = SessionEvent::from_message(&msg, Some(usage)).expect("assistant maps to an event");
+        match ev {
+            SessionEvent::Assistant {
+                message,
+                usage: got,
+            } => {
+                assert_eq!(message, msg);
+                assert_eq!(got, Some(usage));
+            }
+            other => panic!("expected an assistant event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_message_maps_an_assistant_message_without_usage() {
+        let msg = AgentMessage::assistant_text("hello");
+        let ev = SessionEvent::from_message(&msg, None).expect("assistant maps to an event");
+        match ev {
+            SessionEvent::Assistant { message, usage } => {
+                assert_eq!(message, msg);
+                assert_eq!(usage, None);
+            }
+            other => panic!("expected an assistant event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_message_maps_a_tool_result_message() {
+        let msg = tool_result("t1");
+        let ev = SessionEvent::from_message(&msg, None).expect("tool result maps to an event");
+        assert_eq!(ev, SessionEvent::ToolResult(msg));
+    }
+
+    #[test]
+    fn from_message_drops_custom_messages() {
+        // Custom messages are plugin-private: they never reach the log.
+        let msg = AgentMessage::Custom(crate::types::message::CustomMessage {
+            custom_type: "todo.list".to_string(),
+            content: serde_json::json!({}),
+            timestamp: 0,
+        });
+        assert!(SessionEvent::from_message(&msg, None).is_none());
+    }
+
+    #[test]
+    fn from_message_ignores_the_usage_for_non_assistant_messages() {
+        // Usage belongs to the assistant row only; a user row carries none.
+        let msg = AgentMessage::user("hi");
+        let usage = Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        };
+        let ev = SessionEvent::from_message(&msg, Some(usage)).expect("user maps to an event");
+        assert!(matches!(ev, SessionEvent::User(_)));
+    }
+
+    // ── is_checkpoint ─────────────────────────────────────────────
+
+    #[test]
+    fn is_checkpoint_is_true_for_cleared_and_compacted() {
+        assert!(super::is_checkpoint(&SessionEvent::Cleared));
+        assert!(super::is_checkpoint(&SessionEvent::Compacted {
+            base: vec![],
+            dropped: 0,
+        }));
+    }
+
+    #[test]
+    fn is_checkpoint_is_false_for_every_other_event() {
+        assert!(!super::is_checkpoint(&SessionEvent::TurnStart));
+        assert!(!super::is_checkpoint(&SessionEvent::TurnEnd {
+            reason: TurnEndReason::Completed
+        }));
+        assert!(!super::is_checkpoint(&SessionEvent::User(
+            AgentMessage::user("hi")
+        )));
+        assert!(!super::is_checkpoint(&SessionEvent::Assistant {
+            message: AgentMessage::assistant_text("hi"),
+            usage: None,
+        }));
+        assert!(!super::is_checkpoint(&SessionEvent::ToolResult(
+            tool_result("t1")
+        )));
+    }
+
+    // ── surface ───────────────────────────────────────────────────
+
+    #[test]
+    fn surface_yields_the_message_of_the_message_events() {
+        let user = AgentMessage::user("hi");
+        let assistant = AgentMessage::assistant_text("yo");
+        let result = tool_result("t1");
+        assert_eq!(
+            super::surface(&SessionEvent::User(user.clone())),
+            Some(user)
+        );
+        assert_eq!(
+            super::surface(&SessionEvent::Assistant {
+                message: assistant.clone(),
+                usage: None,
+            }),
+            Some(assistant)
+        );
+        assert_eq!(
+            super::surface(&SessionEvent::ToolResult(result.clone())),
+            Some(result)
+        );
+    }
+
+    #[test]
+    fn surface_yields_nothing_for_the_control_events() {
+        assert_eq!(super::surface(&SessionEvent::TurnStart), None);
+        assert_eq!(
+            super::surface(&SessionEvent::TurnEnd {
+                reason: TurnEndReason::Completed
+            }),
+            None
+        );
+        assert_eq!(super::surface(&SessionEvent::Cleared), None);
+        assert_eq!(
+            super::surface(&SessionEvent::Compacted {
+                base: vec![AgentMessage::user("pinned")],
+                dropped: 3,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn surface_keeps_the_compacted_base_out_of_the_message_view() {
+        // The checkpoint's frozen base is a projection input, not a message
+        // row of its own: it must not leak into the derived message list.
+        let ev = SessionEvent::Compacted {
+            base: vec![AgentMessage::user("pinned")],
+            dropped: 1,
+        };
+        assert!(super::surface(&ev).is_none());
+    }
 }

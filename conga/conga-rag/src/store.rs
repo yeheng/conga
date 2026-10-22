@@ -520,6 +520,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qdrant_edge::ValueVariants;
 
     async fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -766,5 +767,154 @@ mod tests {
         let rows = s.docs_for_source("s").await.unwrap();
         assert_eq!(rows[0].mtime, 99);
         assert_eq!(rows[0].content_hash, "h");
+    }
+
+    // --- filters ---
+
+    #[test]
+    fn kw_filter_matches_a_single_payload_field() {
+        let f = kw_filter("source", "notes");
+        assert!(f.should.is_none(), "a keyword filter has no should clause");
+        assert!(f.min_should.is_none());
+        assert!(f.must_not.is_none());
+        let must = f.must.as_ref().expect("must clause");
+        assert_eq!(must.len(), 1);
+        match &must[0] {
+            Condition::Field(fc) => {
+                assert_eq!(fc.key.to_string(), "source");
+                match fc.r#match.as_ref().expect("match condition") {
+                    Match::Value(mv) => {
+                        assert_eq!(mv.value, ValueVariants::String("notes".into()))
+                    }
+                    other => panic!("unexpected match: {other:?}"),
+                }
+            }
+            other => panic!("unexpected condition: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doc_filter_matches_source_and_path() {
+        let f = doc_filter("notes", "/n/a.md");
+        assert!(f.should.is_none());
+        assert!(f.min_should.is_none());
+        assert!(f.must_not.is_none());
+        let must = f.must.as_ref().expect("must clause");
+        assert_eq!(must.len(), 2, "a document is source AND path");
+        let mut keys: Vec<String> = Vec::new();
+        let mut values: Vec<String> = Vec::new();
+        for c in must {
+            match c {
+                Condition::Field(fc) => {
+                    keys.push(fc.key.to_string());
+                    match fc.r#match.as_ref().expect("match condition") {
+                        Match::Value(mv) => values.push(mv.value.to_value().to_string()),
+                        other => panic!("unexpected match: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected condition: {other:?}"),
+            }
+        }
+        assert_eq!(keys, vec!["source".to_string(), "path".to_string()]);
+        assert_eq!(values, vec!["\"notes\"".to_string(), "\"/n/a.md\"".to_string()]);
+    }
+
+    // --- open / close ---
+
+    #[tokio::test]
+    async fn open_exclusive_creates_the_db_file_and_its_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("nested/t.db");
+        let s = Store::open_exclusive(&db).await.unwrap();
+        assert!(db.exists(), "the db file must be created");
+        assert!(
+            dir.path().join("nested").is_dir(),
+            "the parent dir must be created"
+        );
+        // The schema is live right after the open.
+        s.meta_set("k", "v").await.unwrap();
+        assert_eq!(s.meta_get("k").await.unwrap().as_deref(), Some("v"));
+        s.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_exclusive_does_not_create_a_vector_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let s = Store::open_exclusive(&db).await.unwrap();
+        assert!(!edge_dir(&db).exists(), "no shard before the first ingest");
+        assert_eq!(s.chunk_count().await.unwrap(), 0);
+        s.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_exclusive_refuses_a_second_holder_of_the_vector_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let first = Store::open_exclusive(&db).await.unwrap();
+        first.ensure_vec(4, "m1").await.unwrap();
+        let err = match Store::open_exclusive(&db).await {
+            Ok(_) => panic!("a second exclusive open of the same shard must fail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("向量索引"), "msg: {msg}");
+        first.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_releases_the_store_for_a_fresh_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let s = Store::open_exclusive(&db).await.unwrap();
+        s.ensure_vec(4, "m1").await.unwrap();
+        s.close().await.unwrap();
+        // The edge WAL lock is released: a fresh open succeeds and sees the
+        // persisted fingerprint.
+        let s2 = Store::open(&db).await.unwrap();
+        assert_eq!(s2.fingerprint().await.unwrap(), ("m1".to_string(), 4));
+        s2.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_keeps_a_shared_instance_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let a = Store::open(&db).await.unwrap();
+        let b = Store::open(&db).await.unwrap();
+        a.close().await.unwrap();
+        // b still holds the shared instance and must stay usable.
+        b.meta_set("k", "v").await.unwrap();
+        assert_eq!(b.meta_get("k").await.unwrap().as_deref(), Some("v"));
+        b.close().await.unwrap();
+    }
+
+    // --- metadata ---
+
+    #[tokio::test]
+    async fn meta_set_and_meta_get_round_trip() {
+        let (_d, s) = store().await;
+        assert_eq!(
+            s.meta_get("absent").await.unwrap(),
+            None,
+            "an unknown key is absent, not an error"
+        );
+        s.meta_set("k", "v").await.unwrap();
+        assert_eq!(s.meta_get("k").await.unwrap().as_deref(), Some("v"));
+        s.meta_set("k", "v2").await.unwrap();
+        assert_eq!(
+            s.meta_get("k").await.unwrap().as_deref(),
+            Some("v2"),
+            "the same key must be overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn meta_set_stores_unicode_and_empty_values() {
+        let (_d, s) = store().await;
+        s.meta_set("u", "值").await.unwrap();
+        s.meta_set("e", "").await.unwrap();
+        assert_eq!(s.meta_get("u").await.unwrap().as_deref(), Some("值"));
+        assert_eq!(s.meta_get("e").await.unwrap().as_deref(), Some(""));
     }
 }

@@ -530,3 +530,26 @@ pub fn get_context(
     );
     Ok(serde_json::json!({ "context_stats": stats }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The desktop app stores its sessions in the same place the gateway
+    /// does — the shared `~/.conga/sessions` root — so the two transports
+    /// see one set of sessions.
+    #[test]
+    fn chat_state_roots_at_the_conga_sessions_dir() {
+        // `$HOME` is process-global: hold the lock so no other test can move
+        // the config root between the two reads below.
+        let _guard = crate::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let expected = conga::JsonlStorage::default_root().base_dir_clone();
+        let state = ChatState::new();
+        assert_eq!(state.store_root, expected);
+        assert!(
+            state.store_root.ends_with("sessions"),
+            "unexpected store root: {}",
+            state.store_root.display()
+        );
+    }
+}

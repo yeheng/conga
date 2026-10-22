@@ -41,6 +41,15 @@ pub mod subagent_types;
 pub mod tools;
 pub mod wire;
 
+/// Serializes the tests that mutate process-wide environment variables.
+///
+/// `CONGA_CONFIG_DIR` and `CONGA_PROJECT_DIR` are read LAZILY by the storage
+/// layer, so a test that pins them while another test resolves a path would
+/// make the latter observe a foreign root. Test-only: it does not exist in a
+/// production build.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub use assembly::{gather_tools, resume_session, ApprovalEmit, SessionAssembly, SubagentEmit};
 pub use compact::{
     compact_by_count, max_messages_from_env, Compacted, ContextBudget, DEFAULT_MAX_MESSAGES,
@@ -990,5 +999,329 @@ mod tests {
             !log.contains("<agent-mode>"),
             "non-plan mode must not carry the directive, log: {log}"
         );
+    }
+
+    // ── project_dir ─────────────────────────────────────────────
+
+    #[test]
+    fn project_dir_follows_the_env_override_or_the_cwd() {
+        // The override is read from the process env; unset (or blank) means
+        // "the process cwd".
+        match std::env::var("CONGA_PROJECT_DIR") {
+            Ok(v) if !v.trim().is_empty() => {
+                assert_eq!(project_dir(), PathBuf::from(v.trim()));
+            }
+            _ => {
+                assert_eq!(project_dir(), std::env::current_dir().unwrap());
+            }
+        }
+    }
+
+    // ── steer ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn steer_queue_is_shared_between_handles() {
+        let host = test_host();
+        let queue = host.steer();
+        queue.push("mid-turn message");
+        // A second handle sees the same queue: the transport and the host
+        // share one mid-turn input queue.
+        assert_eq!(host.steer().drain(), vec!["mid-turn message".to_string()]);
+        assert!(host.steer().drain().is_empty(), "the queue is drained");
+    }
+
+    // ── with_budget ─────────────────────────────────────────────
+
+    /// A stub tool that never touches the filesystem.
+    fn stub_tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            label: name.into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+            risk: conga::RiskLevel::Low,
+            execute: std::sync::Arc::new(|_ctx| {
+                Box::pin(async { Ok(conga::ToolResult::text("tool ran")) })
+            }),
+        }
+    }
+
+    /// Seed a session log with three user/assistant exchanges (six
+    /// messages) so the next turn has something to compact.
+    async fn seed_history(session: &SessionManager, turns: usize) {
+        for i in 0..turns {
+            session
+                .append_event(&SessionEvent::User(AgentMessage::User(UserMessage {
+                    content: vec![ContentBlock::text(format!("m{i}"))],
+                    timestamp: 0,
+                })))
+                .await
+                .unwrap();
+            session
+                .append_event(&SessionEvent::Assistant {
+                    message: AgentMessage::Assistant(conga::AssistantMessage::new(&"m".to_string())),
+                    usage: None,
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn with_budget_makes_the_host_compact_its_history() {
+        // Tiny window + a reported occupancy: the next turn must write a
+        // compaction checkpoint. The default budget must NOT.
+        let run = |budget: Option<ContextBudget>| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = SessionManager::with_root(tmp.path().to_path_buf());
+            let events_path = tmp.path().join(session.current_id()).join("events.jsonl");
+            async move {
+                seed_history(&session, 3).await;
+                let mut host = Host::new(
+                    test_cfg(),
+                    session,
+                    Arc::new(PermissionPolicy::new(
+                        Mode::FullAuto,
+                        Arc::new(|_, _| Box::pin(async { true })),
+                    )),
+                    "sys".into(),
+                    vec![],
+                )
+                .with_stream_fn(Arc::new(ErroringProvider));
+                if let Some(b) = budget {
+                    host = host.with_budget(b);
+                }
+                let _ = host.run_turn("next", |_ev| {}).await;
+                std::fs::read_to_string(&events_path).unwrap()
+            }
+        };
+
+        let mut budget = ContextBudget::from_env_with(&|k| {
+            Ok(match k {
+                "CONGA_CONTEXT_WINDOW" => "100".to_string(),
+                "CONGA_COMPACT_THRESHOLD_PCT" => "1".to_string(),
+                "CONGA_COMPACT_TARGET_PCT" => "50".to_string(),
+                _ => return Err(std::env::VarError::NotPresent),
+            })
+        });
+        budget.record_input_tokens(1000);
+
+        let compacted = run(Some(budget)).await;
+        assert!(
+            compacted.contains("\"compacted\""),
+            "the tiny budget must write a compaction checkpoint, log: {compacted}"
+        );
+        let untouched = run(None).await;
+        assert!(
+            !untouched.contains("\"compacted\""),
+            "the default budget must not compact, log: {untouched}"
+        );
+    }
+
+    // ── with_hooks ──────────────────────────────────────────────
+
+    /// A hook chain that blocks every tool call with a fixed reason.
+    struct BlockingHook;
+    impl conga::HookChain for BlockingHook {
+        fn before_tool_call<'a>(
+            &'a self,
+            _: &'a str,
+            name: &'a str,
+            _: &'a serde_json::Value,
+            _: conga::RiskLevel,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = conga::ToolCallVerdict> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                conga::ToolCallVerdict::Block(format!("blocked-by-hook:{name}"))
+            })
+        }
+        fn after_tool_call(
+            &self,
+            _: &str,
+            r: &conga::ToolResultMessage,
+        ) -> conga::ToolResultMessage {
+            r.clone()
+        }
+    }
+
+    /// A provider that always asks for one tool call.
+    struct ToolCallingProvider;
+    impl StreamFn for ToolCallingProvider {
+        fn stream(
+            &self,
+            _model: &conga::ModelSpec,
+            _messages: &[AgentMessage],
+            _system: &str,
+            _tools: &[ToolDefinition],
+            _signal: Option<conga::CancelSignal>,
+        ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = conga::StreamChunk> + Send>>
+        {
+            Box::pin(futures_util::stream::iter([
+                conga::StreamChunk::ToolCallDelta {
+                    index: None,
+                    id: "tc1".into(),
+                    name: Some("stub_tool".into()),
+                    args_delta: "{}".into(),
+                },
+                conga::StreamChunk::Done,
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn with_hooks_installs_the_injected_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::with_root(tmp.path().to_path_buf());
+        let events_path = tmp.path().join(session.current_id()).join("events.jsonl");
+        let host = Host::new(
+            test_cfg(),
+            session,
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { true })),
+            )),
+            "sys".into(),
+            vec![stub_tool("stub_tool")],
+        )
+        .with_stream_fn(Arc::new(ToolCallingProvider))
+        .with_max_turns(1)
+        .with_hooks(Arc::new(BlockingHook));
+
+        let _ = host.run_turn("call the tool", |_ev| {}).await;
+
+        let log = std::fs::read_to_string(&events_path).unwrap();
+        assert!(
+            log.contains("blocked-by-hook:stub_tool"),
+            "the injected hook chain must gate the tool call, log: {log}"
+        );
+    }
+
+    // ── spawner ─────────────────────────────────────────────────
+
+    #[test]
+    fn spawner_is_none_until_one_is_wired() {
+        use crate::subagent_types::NoopSubagentSpawner;
+        let tmp = tempfile::tempdir().unwrap();
+        let host = Host::new(
+            test_cfg(),
+            SessionManager::with_root(tmp.path().to_path_buf()),
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { true })),
+            )),
+            "sys".into(),
+            vec![],
+        );
+        assert!(host.spawner().is_none());
+        let host = host.with_spawner(Arc::new(NoopSubagentSpawner));
+        assert!(host.spawner().is_some(), "the wired spawner must be exposed");
+    }
+
+    // ── evolve ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn evolve_without_a_spawner_reports_that_it_is_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = Host::new(
+            test_cfg(),
+            SessionManager::with_root(tmp.path().to_path_buf()),
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { true })),
+            )),
+            "sys".into(),
+            vec![],
+        );
+        let err = host.evolve(None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("spawner"),
+            "evolve must report the missing spawner: {err}"
+        );
+    }
+
+    // ── clear_session / session_mut / policy ────────────────────
+
+    #[tokio::test]
+    async fn clear_session_appends_a_cleared_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::with_root(tmp.path().to_path_buf());
+        let events_path = tmp.path().join(session.current_id()).join("events.jsonl");
+        let host = Host::new(
+            test_cfg(),
+            session,
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { true })),
+            )),
+            "sys".into(),
+            vec![],
+        );
+        host.clear_session().await.unwrap();
+        let log = std::fs::read_to_string(&events_path).unwrap();
+        assert!(
+            log.contains("\"cleared\""),
+            "the clear marker must land in the log, log: {log}"
+        );
+        // The session id does NOT rotate on clear.
+        assert!(!host.session().current_id().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_mut_exposes_the_live_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut host = Host::new(
+            test_cfg(),
+            SessionManager::with_root(tmp.path().to_path_buf()),
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { true })),
+            )),
+            "sys".into(),
+            vec![],
+        );
+        let id = host.session().current_id();
+        assert_eq!(host.session_mut().current_id(), id);
+        // A change through the mutable accessor is visible on the host.
+        host.session_mut().resume("other-session").await.unwrap();
+        assert_eq!(host.session().current_id(), "other-session");
+    }
+
+    #[test]
+    fn policy_exposes_the_shared_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = Host::new(
+            test_cfg(),
+            SessionManager::with_root(tmp.path().to_path_buf()),
+            Arc::new(PermissionPolicy::new(
+                Mode::FullAuto,
+                Arc::new(|_, _| Box::pin(async { true })),
+            )),
+            "sys".into(),
+            vec![],
+        );
+        assert_eq!(host.policy().mode(), Mode::FullAuto);
+        // The accessor hands out the LIVE policy: a mode change through it
+        // is visible immediately.
+        host.policy().set_mode(Mode::Plan);
+        assert_eq!(host.policy().mode(), Mode::Plan);
+    }
+
+    // ── install_ctrl_c ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn install_ctrl_c_arms_the_signal_without_cancelling_it() {
+        let signal = CancelSignal::new();
+        // Installing twice must be harmless (no panic, no self-cancel).
+        install_ctrl_c(signal.clone());
+        install_ctrl_c(signal.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !signal.is_cancelled(),
+            "installing the handler must not cancel the signal"
+        );
+        // The signal still works as a cancel handle.
+        signal.cancel();
+        assert!(signal.is_cancelled());
     }
 }

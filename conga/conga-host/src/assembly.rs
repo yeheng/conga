@@ -541,4 +541,176 @@ mod tests {
         assert_eq!(out[0].name, "bash");
         assert_eq!(out[1].name, "web_search");
     }
+
+    // ── AssemblyError ───────────────────────────────────────────
+
+    #[test]
+    fn assembly_error_display_names_the_class() {
+        assert_eq!(
+            AssemblyError::Config("boom".into()).to_string(),
+            "Config error: boom"
+        );
+        assert_eq!(
+            AssemblyError::Session("boom".into()).to_string(),
+            "Session error: boom"
+        );
+    }
+
+    // ── gather_tools ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn gather_tools_orders_prepend_before_append_and_dedups() {
+        let tools = gather_tools(
+            vec![named_tool("ext_pre")],
+            vec![named_tool("ext_post")],
+            true,
+        )
+        .await;
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"bash"), "built-ins are always present: {names:?}");
+        let i_pre = names.iter().position(|n| *n == "ext_pre").unwrap();
+        let i_post = names.iter().position(|n| *n == "ext_post").unwrap();
+        assert!(i_pre < i_post, "prepend outranks append: {names:?}");
+        // Every name is unique: the first registration wins.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "duplicate names: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn gather_tools_keeps_the_built_in_when_a_prepended_tool_shadows_it() {
+        let tools = gather_tools(vec![named_tool("bash")], vec![], true).await;
+        let bash_count = tools.iter().filter(|t| t.name == "bash").count();
+        assert_eq!(bash_count, 1, "the built-in registration must win");
+    }
+
+    // ── build / build_cli ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn build_fails_loud_when_the_provider_config_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_missing = ConfigLoader::load().is_err();
+        let emit: ApprovalEmit = Arc::new(|_id, _name, _args, _preview| {});
+        let sub: SubagentEmit = Arc::new(|_ev| {});
+        match SessionAssembly::build(tmp.path(), "sess-1", vec![], emit, sub).await {
+            Err(AssemblyError::Config(msg)) => {
+                assert!(config_missing, "config was loadable but the build failed");
+                assert!(msg.contains("CONGA_LLM"), "{msg}");
+            }
+            Err(AssemblyError::Session(msg)) => panic!("unexpected session error: {msg}"),
+            Ok(assembly) => {
+                assert!(!config_missing, "a missing config must not assemble");
+                assert!(!assembly.host.session().current_id().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn build_cli_fails_loud_when_the_provider_config_is_missing() {
+        let config_missing = ConfigLoader::load().is_err();
+        let approver: Approver = Arc::new(|_n, _a| Box::pin(async { true }));
+        match SessionAssembly::build_cli(Mode::FullAuto, approver, None, Vec::new(), Vec::new())
+            .await
+        {
+            Err(AssemblyError::Config(msg)) => {
+                assert!(config_missing, "config was loadable but the build failed");
+                assert!(msg.contains("CONGA_LLM"), "{msg}");
+            }
+            Err(AssemblyError::Session(msg)) => panic!("unexpected session error: {msg}"),
+            Ok(host) => {
+                assert!(!config_missing, "a missing config must not assemble");
+                assert!(!host.session().current_id().is_empty());
+            }
+        }
+    }
+
+    // ── the shared assembly ─────────────────────────────────────
+
+    fn test_host_config() -> HostConfig {
+        HostConfig {
+            provider: conga::ProviderConfig::from_parts(
+                conga::ProviderApi::OpenAiCompat,
+                "https://api.x.com/v1".into(),
+                "sk-test".into(),
+                "main-model".into(),
+            )
+            .unwrap(),
+            tunables: conga::AgentTunables::from_env_with(&|_k| Err(std::env::VarError::NotPresent)),
+        }
+    }
+
+    #[test]
+    fn apply_fast_provider_swaps_the_model_and_keeps_the_tunables() {
+        let cfg = test_host_config();
+        let mut lc = cfg.build_loop_config(3, None, None, cfg.provider_stream_fn());
+        let fast = conga::ProviderConfig::from_parts(
+            conga::ProviderApi::Anthropic,
+            "https://fast.x/v1".into(),
+            "sk-fast".into(),
+            "fast-model".into(),
+        )
+        .unwrap();
+        apply_fast_provider(&mut lc, &fast, &cfg.tunables);
+        assert_eq!(lc.model.id, "fast-model");
+        assert_eq!(lc.model.api, conga::ProviderApi::Anthropic);
+        // The parent's tunables stay: only the model+provider are swapped.
+        assert_eq!(lc.model.max_tokens, cfg.tunables.max_tokens);
+        assert_eq!(lc.max_turns, 3);
+    }
+
+    #[tokio::test]
+    async fn assemble_host_wires_the_policy_the_tools_and_the_spawner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::with_root(tmp.path().to_path_buf());
+        let approver: Approver = Arc::new(|_n, _a| Box::pin(async { true }));
+        let host = assemble_host(
+            test_host_config(),
+            session,
+            Mode::FullAuto,
+            approver,
+            Vec::new(),
+            vec![named_tool("only_tool")],
+            Arc::new(|_ev: SubagentEvent| {}),
+        )
+        .await;
+        assert_eq!(host.policy().mode(), Mode::FullAuto);
+        assert!(host.spawner().is_some(), "the spawner must be wired");
+        assert_eq!(host.tools.len(), 1);
+        assert_eq!(host.tools[0].name, "only_tool");
+    }
+
+    /// The headless variant wires the SAME policy and spawner, but its tool
+    /// set comes from the built-ins alone — no caller-supplied extras.
+    #[tokio::test]
+    async fn assemble_headless_host_wires_the_policy_and_the_builtin_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionManager::with_root(tmp.path().to_path_buf());
+        let approver: Approver = Arc::new(|_n, _a| Box::pin(async { true }));
+        let host = assemble_headless_host(
+            test_host_config(),
+            session,
+            Mode::Plan,
+            approver,
+            Arc::new(|_ev: SubagentEvent| {}),
+        )
+        .await;
+
+        assert_eq!(host.policy().mode(), Mode::Plan);
+        assert!(host.spawner().is_some(), "the spawner must be wired");
+
+        // Every built-in tool is present, and nothing else is.
+        let names: Vec<&str> = host.tools.iter().map(|t| t.name.as_str()).collect();
+        for want in crate::built_in_tools() {
+            assert!(
+                names.contains(&want.name.as_str()),
+                "missing built-in tool {}",
+                want.name
+            );
+        }
+        assert!(
+            !names.contains(&"only_tool"),
+            "the headless variant must not add caller-supplied tools"
+        );
+    }
 }
