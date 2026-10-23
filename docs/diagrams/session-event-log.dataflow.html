@@ -4840,7 +4840,7 @@
       </div>
     </div>
 
-    <script id="archify-guided-views-data" type="application/json">[{"id":"produce-append","label":"产生与落盘","focus":["uin","side","persist","legacy","log"],"note":"副作用发生即逐事件追加。"},{"id":"project","label":"派生投影","focus":["log","derive","compact"],"note":"历史每轮现派生,压缩只缩内存。"},{"id":"consume","label":"消费面","focus":["compact","llm","rest","fe"],"note":"模型与前端都从同一真相源取数。"}]</script>
+    <script id="archify-guided-views-data" type="application/json">[{"id":"produce-append","label":"产生与落盘","focus":["uin","side","persist","legacy","log"],"note":"副作用发生即逐事件追加。"},{"id":"project","label":"派生投影","focus":["log","derive","compact"],"note":"历史每轮现派生,压缩追加检查点。"},{"id":"consume","label":"消费面","focus":["compact","llm","rest","fe"],"note":"模型与前端都从同一真相源取数。"}]</script>
 
     <div class="guided-views no-print" id="guided-views" hidden aria-label="Guided diagram views">
       <button id="guided-view-prev" type="button" aria-label="Previous guided view" title="Previous guided view ([)">&#8592;</button>
@@ -5008,15 +5008,15 @@
         <text data-detail="fine" x="530" y="175" class="t-backend" font-size="7" text-anchor="middle">纯投影</text>
         </g>
 
-        <g id="node-compact" data-node-id="compact" data-node-label="ContextBudget 压缩" tabindex="0" role="button" aria-label="Focus ContextBudget 压缩, 只缩内存 · 预算自尾部, 03 / 派生" aria-pressed="false" data-node-kind="backend" data-node-sublabel="只缩内存 · 预算自尾部" data-node-context="03 / 派生">
-          <title>ContextBudget 压缩 · 只缩内存 · 预算自尾部 · 03 / 派生</title>
+        <g id="node-compact" data-node-id="compact" data-node-label="ContextBudget 压缩" tabindex="0" role="button" aria-label="Focus ContextBudget 压缩, 追加检查点 · 预算自尾部, 03 / 派生" aria-pressed="false" data-node-kind="backend" data-node-sublabel="追加检查点 · 预算自尾部" data-node-context="03 / 派生">
+          <title>ContextBudget 压缩 · 追加检查点 · 预算自尾部 · 03 / 派生</title>
           <rect x="450" y="356" width="160" height="58" rx="6" class="c-mask"/>
           <rect x="450" y="356" width="160" height="58" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(456 362) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
           <text data-detail-anchor x="530" y="377" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">ContextBudget 压缩</text>
-          <text data-detail="context" x="530" y="393" class="t-muted" font-size="7" text-anchor="middle">只缩内存 · 预算自尾部</text>
+          <text data-detail="context" x="530" y="393" class="t-muted" font-size="7" text-anchor="middle">追加检查点 · 预算自尾部</text>
         </g>
 
         <g id="node-rest" data-node-id="rest" data-node-label="REST 转录端点" tabindex="0" role="button" aria-label="Focus REST 转录端点, 按需派生 · 未知 key 404, 03 / 派生" aria-pressed="false" data-node-kind="backend" data-node-sublabel="按需派生 · 未知 key 404" data-node-context="03 / 派生">
@@ -5324,7 +5324,7 @@
         </div>
         <ul>
           <li>&bull; derive_messages 是纯函数:事件日志 → 模型可见消息</li>
-          <li>&bull; 压缩只作用于工作内存,日志永远完整</li>
+          <li>&bull; 压缩只追加 Compacted 检查点,历史行永不修改</li>
           <li>&bull; torn-tail 自愈丢崩溃截断行;中段损坏 fail-closed 报行号</li>
         </ul>
       </div>

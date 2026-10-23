@@ -101,13 +101,19 @@ pub struct McpBridge {
 
 impl McpBridge {
     /// Spawn a server, run the handshake, discover tools.
-    pub async fn spawn(
+    ///
+    /// Returns the bridge and the discovered tool list. The caller wraps
+    /// the tools into [`ToolDefinition`]s with
+    /// [`tool_definition`](Self::tool_definition) — the bridge is shared
+    /// process-wide (see [`crate::mcp`]), so the tool list is returned
+    /// separately instead of being baked into the definitions.
+    pub(super) async fn spawn(
         name: &str,
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
         timeout: Duration,
-    ) -> Result<(Arc<Self>, Vec<ToolDefinition>), McpError> {
+    ) -> Result<(Arc<Self>, Vec<McpTool>), McpError> {
         let mut child = Command::new(command)
             .args(args)
             .envs(env)
@@ -173,11 +179,7 @@ impl McpBridge {
             })
             .await?;
 
-        let tools = tools_list
-            .list
-            .into_iter()
-            .map(|t| bridge.tool_definition(t))
-            .collect();
+        let tools = tools_list.list;
         Ok((bridge, tools))
     }
 
@@ -249,7 +251,7 @@ impl McpBridge {
     /// Wrap one MCP tool as a conga [`ToolDefinition`] — via the shared
     /// [`mcp_tool_definition`] wrapper (same naming/risk/dispatch as the
     /// HTTP transport).
-    fn tool_definition(self: &Arc<Self>, t: McpTool) -> ToolDefinition {
+    pub(super) fn tool_definition(self: &Arc<Self>, t: McpTool) -> ToolDefinition {
         let bridge = Arc::clone(self);
         mcp_tool_definition(
             &self.server_name,
@@ -329,6 +331,7 @@ mod tests {
     /// - `echo`  → the arguments echoed back as text
     /// - `boom`  → a JSON-RPC error
     /// - `weird` → a result that is not a valid `CallResult`
+    ///
     /// Returns the script path; the temp dir is kept so it outlives the
     /// call.
     fn fixture_call_server_script() -> String {
@@ -669,7 +672,7 @@ for line in sys.stdin:
         }
 
         let err = bridge
-            .call_typed(5, |v| Ok(v))
+            .call_typed(5, Ok)
             .await
             .expect_err("an unmatched id must not be accepted");
         match err {
@@ -835,10 +838,14 @@ for line in sys.stdin:
     async fn mcp_handshake_list_and_call() {
         let script = fixture_mcp_server_script();
         let env = HashMap::new();
-        let (bridge, tools) =
+        let (bridge, mcp_tools) =
             McpBridge::spawn("test", "python3", &[script], &env, Duration::from_secs(10))
                 .await
                 .expect("spawn");
+        let tools: Vec<ToolDefinition> = mcp_tools
+            .into_iter()
+            .map(|t| bridge.tool_definition(t))
+            .collect();
 
         // tools/list → 1 tool, prefixed
         assert_eq!(tools.len(), 1);
@@ -875,7 +882,7 @@ for line in sys.stdin:
         let mut env = HashMap::new();
         env.insert("GITHUB_PERSONAL_ACCESS_TOKEN".into(), token);
 
-        let (bridge, tools) = McpBridge::spawn(
+        let (bridge, mcp_tools) = McpBridge::spawn(
             "github",
             "npx",
             &["-y".into(), "@modelcontextprotocol/server-github".into()],
@@ -884,6 +891,10 @@ for line in sys.stdin:
         )
         .await
         .expect("spawn github mcp");
+        let tools: Vec<ToolDefinition> = mcp_tools
+            .into_iter()
+            .map(|t| bridge.tool_definition(t))
+            .collect();
 
         // GitHub MCP exposes dozens of tools; we just need > 0.
         assert!(!tools.is_empty(), "expected tools from github server");

@@ -11,6 +11,7 @@ pub mod error;
 pub mod extension;
 pub mod guard;
 pub mod providers;
+pub mod proxy;
 pub mod steer;
 pub mod storage;
 pub mod types;
@@ -35,8 +36,9 @@ pub use types::message::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, Usage, UserMessage,
 };
 pub use types::session_event::{
-    cache_stats, derive_messages, live_range_start, repair_unanswered_tool_calls, CacheStats,
-    CancelCause, SessionEvent, TurnEndReason,
+    billing_scope_start, cache_stats, derive_messages, repair_unanswered_tool_calls, row_view,
+    row_view_from_json, view_scope_start, visible_count_from_rows, visible_message_count,
+    CacheStats, CancelCause, RowView, SessionEvent, TurnEndReason,
 };
 pub use types::tool::{
     HookChain, RiskLevel, ToolCallCtx, ToolCallVerdict, ToolContext, ToolDefinition, ToolFn,

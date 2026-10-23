@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use conga::types::tool::{RiskLevel, ToolCallCtx, ToolDefinition, ToolResult};
 use conga::ContentBlock;
+use tokio::io::AsyncReadExt;
 
 /// Maximum bytes returned in one read, to keep tool results bounded.
 const MAX_BYTES: usize = 2_000_000;
@@ -41,12 +42,25 @@ async fn execute(ctx: ToolCallCtx) -> Result<ToolResult, conga::error::ToolError
         Ok(p) => p,
         Err(msg) => return Ok(ToolResult::error(msg)),
     };
-    let bytes = tokio::fs::read(&full).await?;
-    if bytes.len() > MAX_BYTES {
+    // Read at most MAX_BYTES + 1 bytes: the whole file never lands in
+    // memory, so an oversized file cannot exhaust the heap before the
+    // size check below gets a chance to reject it.
+    let file = tokio::fs::File::open(&full).await?;
+    let mut bytes = Vec::with_capacity(64 * 1024);
+    let read = file
+        .take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if read > MAX_BYTES {
+        // The stream only proves the file is above the cap; report the
+        // real size from metadata (O(1), reads no content).
+        let size = tokio::fs::metadata(&full)
+            .await
+            .map(|m| m.len())
+            .unwrap_or((MAX_BYTES + 1) as u64);
         return Ok(ToolResult::error(format!(
             "file too large ({} bytes > {} limit)",
-            bytes.len(),
-            MAX_BYTES
+            size, MAX_BYTES
         )));
     }
     let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -280,11 +294,7 @@ mod tests {
         tokio::fs::write(tmp.path().join("f.txt"), "a\nb\n")
             .await
             .unwrap();
-        let r = run(
-            serde_json::json!({"path": "f.txt", "limit": 0}),
-            tmp.path(),
-        )
-        .await;
+        let r = run(serde_json::json!({"path": "f.txt", "limit": 0}), tmp.path()).await;
         assert!(!r.is_error);
         assert_eq!(text_of(&r), "(empty)");
         assert_eq!(r.details["lines"], 0);
@@ -314,10 +324,55 @@ mod tests {
     async fn rejects_a_file_above_the_size_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let big = vec![b'x'; MAX_BYTES + 1];
-        tokio::fs::write(tmp.path().join("big.bin"), &big).await.unwrap();
+        tokio::fs::write(tmp.path().join("big.bin"), &big)
+            .await
+            .unwrap();
         let r = run(serde_json::json!({"path": "big.bin"}), tmp.path()).await;
         assert!(r.is_error);
         assert!(text_of(&r).contains("file too large"), "{}", text_of(&r));
+    }
+
+    /// The too-large message is user-visible: keep the exact wording and
+    /// report the real file size, not just the cap.
+    #[tokio::test]
+    async fn too_large_error_reports_the_real_file_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = vec![b'x'; MAX_BYTES + 10];
+        tokio::fs::write(tmp.path().join("big.bin"), &big)
+            .await
+            .unwrap();
+        let r = run(serde_json::json!({"path": "big.bin"}), tmp.path()).await;
+        assert!(r.is_error);
+        assert_eq!(
+            text_of(&r),
+            format!(
+                "file too large ({} bytes > {} limit)",
+                MAX_BYTES + 10,
+                MAX_BYTES
+            )
+        );
+    }
+
+    /// Boundary: a file of exactly the cap is still readable — the limit
+    /// only rejects what is above it.
+    #[tokio::test]
+    async fn reads_a_file_of_exactly_the_size_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Exactly MAX_BYTES bytes over 3 lines.
+        let content = format!("a\nb\n{}", "c".repeat(MAX_BYTES - 4));
+        assert_eq!(content.len(), MAX_BYTES);
+        tokio::fs::write(tmp.path().join("at_limit.txt"), &content)
+            .await
+            .unwrap();
+        let r = run(serde_json::json!({"path": "at_limit.txt"}), tmp.path()).await;
+        assert!(!r.is_error, "{}", text_of(&r));
+        assert_eq!(r.details["lines"], 3);
+        // The rendered output is far above the context cap, so it spills to
+        // disk and only the head preview stays in-context: assert the
+        // line-number format there.
+        let text = text_of(&r);
+        assert!(text.contains("1\ta"), "{text}");
+        assert!(text.contains("2\tb"), "{text}");
     }
 
     /// Boundary: a non-UTF-8 file is read lossily (replacement chars), not

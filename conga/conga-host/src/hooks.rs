@@ -161,7 +161,10 @@ mod tests {
         let v = stack
             .before_tool_call("1", "bash", &serde_json::json!({}), RiskLevel::High)
             .await;
-        assert!(matches!(v, ToolCallVerdict::Block(_)), "the pushed chain must run");
+        assert!(
+            matches!(v, ToolCallVerdict::Block(_)),
+            "the pushed chain must run"
+        );
 
         // Pushing more chains keeps the earlier verdict (first Block wins).
         stack.push(Arc::new(AllowAll));
@@ -176,7 +179,12 @@ mod tests {
         let mut stack = HookStack::new(vec![Arc::new(AllowAll)]);
         stack.push(Arc::new(ModifyArgs));
         let v = stack
-            .before_tool_call("1", "bash", &serde_json::json!({"cmd": "ls"}), RiskLevel::Low)
+            .before_tool_call(
+                "1",
+                "bash",
+                &serde_json::json!({"cmd": "ls"}),
+                RiskLevel::Low,
+            )
             .await;
         match v {
             ToolCallVerdict::Modify(args) => assert_eq!(args["rewritten"], true),

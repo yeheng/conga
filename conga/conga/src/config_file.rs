@@ -924,9 +924,9 @@ key = ""
                 let end = rest.find("\nAPPLY_ENV ").unwrap_or(rest.len());
                 rest[..end].trim().to_string()
             }
-            None => panic!(
-                "apply probe must print APPLY_OUTCOME\nstdout:\n{stdout}\nstderr:\n{stderr}"
-            ),
+            None => {
+                panic!("apply probe must print APPLY_OUTCOME\nstdout:\n{stdout}\nstderr:\n{stderr}")
+            }
         };
         ApplyReport {
             outcome,
@@ -958,11 +958,7 @@ key = ""
             "[tools]\nproject_dir = \"/tmp/proj\"\nsandbox = true\n\n[tunables]\nmax_turns = 7\n",
         );
 
-        let report = run_apply_in_child(
-            &home,
-            &cwd,
-            &[("CONGA_CONFIG", cfg.to_str().unwrap())],
-        );
+        let report = run_apply_in_child(&home, &cwd, &[("CONGA_CONFIG", cfg.to_str().unwrap())]);
         assert_eq!(
             report.outcome,
             format!("ok:{}", cfg.display()),
@@ -1014,14 +1010,15 @@ key = ""
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         // A project-level file exists but must NOT be used as a fallback.
-        write_config(&cwd, ".conga/config.toml", "[tools]\nproject_dir = \"/p\"\n");
+        write_config(
+            &cwd,
+            ".conga/config.toml",
+            "[tools]\nproject_dir = \"/p\"\n",
+        );
         let missing = tmp.path().join("no-such-config.toml");
 
-        let report = run_apply_in_child(
-            &home,
-            &cwd,
-            &[("CONGA_CONFIG", missing.to_str().unwrap())],
-        );
+        let report =
+            run_apply_in_child(&home, &cwd, &[("CONGA_CONFIG", missing.to_str().unwrap())]);
         assert!(report.outcome.starts_with("err:"), "{}", report.outcome);
         assert!(
             report.outcome.contains("CONGA_CONFIG"),
@@ -1045,11 +1042,7 @@ key = ""
         std::fs::create_dir_all(&cwd).unwrap();
         let cfg = write_config(tmp.path(), "config.toml", "[llm]\nbase_urL = \"typo\"\n");
 
-        let report = run_apply_in_child(
-            &home,
-            &cwd,
-            &[("CONGA_CONFIG", cfg.to_str().unwrap())],
-        );
+        let report = run_apply_in_child(&home, &cwd, &[("CONGA_CONFIG", cfg.to_str().unwrap())]);
         assert!(report.outcome.starts_with("err:"), "{}", report.outcome);
         assert!(
             report.outcome.contains("invalid config.toml"),
@@ -1091,7 +1084,11 @@ key = ""
             "explicit.toml",
             "[tools]\nproject_dir = \"/explicit\"\n",
         );
-        write_config(&cwd, ".conga/config.toml", "[tools]\nproject_dir = \"/project\"\n");
+        write_config(
+            &cwd,
+            ".conga/config.toml",
+            "[tools]\nproject_dir = \"/project\"\n",
+        );
         write_config(
             &home,
             ".conga/config.toml",
@@ -1099,11 +1096,8 @@ key = ""
         );
 
         // 1. explicit wins
-        let report = run_apply_in_child(
-            &home,
-            &cwd,
-            &[("CONGA_CONFIG", explicit.to_str().unwrap())],
-        );
+        let report =
+            run_apply_in_child(&home, &cwd, &[("CONGA_CONFIG", explicit.to_str().unwrap())]);
         assert_eq!(report.outcome, format!("ok:{}", explicit.display()));
         assert_eq!(report.env_of("CONGA_PROJECT_DIR"), Some("/explicit"));
 
@@ -1138,11 +1132,7 @@ key = ""
         std::fs::create_dir_all(&cwd).unwrap();
         let cfg = write_config(tmp.path(), "config.toml", "");
 
-        let report = run_apply_in_child(
-            &home,
-            &cwd,
-            &[("CONGA_CONFIG", cfg.to_str().unwrap())],
-        );
+        let report = run_apply_in_child(&home, &cwd, &[("CONGA_CONFIG", cfg.to_str().unwrap())]);
         assert_eq!(report.outcome, format!("ok:{}", cfg.display()));
         for key in PROBE_ENV_KEYS {
             assert_eq!(

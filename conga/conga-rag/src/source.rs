@@ -189,10 +189,7 @@ mod tests {
     fn new_rejects_an_invalid_include_glob() {
         let dir = tempfile::tempdir().unwrap();
         let err = DirSource::new("s", &cfg(dir.path(), &["["], &[])).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("非法 glob"),
-            "err: {err:#}"
-        );
+        assert!(format!("{err:#}").contains("非法 glob"), "err: {err:#}");
     }
 
     // --- accessors ---

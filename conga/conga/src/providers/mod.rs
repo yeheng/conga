@@ -70,10 +70,7 @@ impl ProviderConfig {
         api_key: String,
         model: String,
     ) -> Result<Self, ConfigError> {
-        let generic_proxy = std::env::var("CONGA_LLM_PROXY").ok();
-        let http_proxy = std::env::var("CONGA_LLM_HTTP_PROXY").ok();
-        let https_proxy = std::env::var("CONGA_LLM_HTTPS_PROXY").ok();
-        let client = build_client(&http_proxy, &https_proxy, &generic_proxy)?;
+        let client = build_client(&crate::proxy::LlmProxy::from_env())?;
         Ok(Self {
             api,
             base_url,
@@ -93,10 +90,13 @@ impl ProviderConfig {
         model: String,
         generic_proxy: Option<&str>,
     ) -> Result<Self, ConfigError> {
-        let proxy = generic_proxy
+        let generic = generic_proxy
             .filter(|p| !p.trim().is_empty())
             .map(str::to_string);
-        let client = build_client(&None, &None, &proxy)?;
+        let client = build_client(&crate::proxy::LlmProxy {
+            generic,
+            ..Default::default()
+        })?;
         Ok(Self {
             api,
             base_url,
@@ -133,10 +133,8 @@ impl ProviderConfig {
             _ => ProviderApi::OpenAiCompat,
         };
         // Proxy fallback: prefixed vars first, then the main LLM proxy knobs.
-        let generic_proxy = var("PROXY").or_else(|| lookup("CONGA_LLM_PROXY").ok());
-        let http_proxy = var("HTTP_PROXY").or_else(|| lookup("CONGA_LLM_HTTP_PROXY").ok());
-        let https_proxy = var("HTTPS_PROXY").or_else(|| lookup("CONGA_LLM_HTTPS_PROXY").ok());
-        let client = build_client(&http_proxy, &https_proxy, &generic_proxy)?;
+        let proxy = crate::proxy::LlmProxy::from_prefixed_env_with(prefix, lookup);
+        let client = build_client(&proxy)?;
         Ok(Some(Self {
             api,
             base_url,
@@ -161,11 +159,8 @@ impl ProviderConfig {
             _ => ProviderApi::OpenAiCompat,
         };
 
-        let generic_proxy = lookup("CONGA_LLM_PROXY").ok();
-        let http_proxy = lookup("CONGA_LLM_HTTP_PROXY").ok();
-        let https_proxy = lookup("CONGA_LLM_HTTPS_PROXY").ok();
-
-        let client = build_client(&http_proxy, &https_proxy, &generic_proxy)?;
+        let proxy = crate::proxy::LlmProxy::from_env_with(lookup);
+        let client = build_client(&proxy)?;
 
         Ok(Self {
             api,
@@ -180,31 +175,25 @@ impl ProviderConfig {
 /// Build a reqwest client applying proxy precedence:
 /// http scheme -> `http_proxy` else `generic`; https scheme -> `https_proxy`
 /// else `generic`.
-fn build_client(
-    http_proxy: &Option<String>,
-    https_proxy: &Option<String>,
-    generic_proxy: &Option<String>,
-) -> Result<reqwest::Client, ConfigError> {
+fn build_client(proxy: &crate::proxy::LlmProxy) -> Result<reqwest::Client, ConfigError> {
     let mut builder = reqwest::Client::builder();
 
-    let http_url = http_proxy.as_ref().or(generic_proxy.as_ref());
-    if let Some(url) = http_url {
-        let proxy = reqwest::Proxy::http(url).map_err(|e| ConfigError::BadProxy {
+    if let Some(url) = proxy.for_scheme(false) {
+        let p = reqwest::Proxy::http(url).map_err(|e| ConfigError::BadProxy {
             var: "CONGA_LLM_HTTP_PROXY/CONGA_LLM_PROXY",
-            url: url.clone(),
+            url: url.to_string(),
             source: e,
         })?;
-        builder = builder.proxy(proxy);
+        builder = builder.proxy(p);
     }
 
-    let https_url = https_proxy.as_ref().or(generic_proxy.as_ref());
-    if let Some(url) = https_url {
-        let proxy = reqwest::Proxy::https(url).map_err(|e| ConfigError::BadProxy {
+    if let Some(url) = proxy.for_scheme(true) {
+        let p = reqwest::Proxy::https(url).map_err(|e| ConfigError::BadProxy {
             var: "CONGA_LLM_HTTPS_PROXY/CONGA_LLM_PROXY",
-            url: url.clone(),
+            url: url.to_string(),
             source: e,
         })?;
-        builder = builder.proxy(proxy);
+        builder = builder.proxy(p);
     }
 
     builder.build().map_err(ConfigError::ClientBuild)
@@ -425,14 +414,18 @@ mod tests {
 
     #[test]
     fn build_client_without_any_proxy() {
-        let client = build_client(&None, &None, &None).expect("no proxy must build");
+        let client = build_client(&crate::proxy::LlmProxy::default()).expect("no proxy must build");
         let _ = client;
     }
 
     #[test]
     fn build_client_with_a_generic_proxy() {
         let generic = Some("http://127.0.0.1:7890".to_string());
-        let client = build_client(&None, &None, &generic).expect("generic proxy must build");
+        let client = build_client(&crate::proxy::LlmProxy {
+            generic: generic.clone(),
+            ..Default::default()
+        })
+        .expect("generic proxy must build");
         let _ = client;
     }
 
@@ -440,14 +433,23 @@ mod tests {
     fn build_client_with_scheme_specific_proxies() {
         let http = Some("http://127.0.0.1:7890".to_string());
         let https = Some("http://127.0.0.1:7891".to_string());
-        let client = build_client(&http, &https, &None).expect("scheme proxies must build");
+        let client = build_client(&crate::proxy::LlmProxy {
+            http: http.clone(),
+            https: https.clone(),
+            ..Default::default()
+        })
+        .expect("scheme proxies must build");
         let _ = client;
     }
 
     #[test]
     fn build_client_with_only_an_http_proxy() {
         let http = Some("http://127.0.0.1:7890".to_string());
-        let client = build_client(&http, &None, &None).expect("http-only proxy must build");
+        let client = build_client(&crate::proxy::LlmProxy {
+            http: http.clone(),
+            ..Default::default()
+        })
+        .expect("http-only proxy must build");
         let _ = client;
     }
 
@@ -487,10 +489,7 @@ mod tests {
         .expect("no proxy must build");
         assert_eq!(cfg.api, ProviderApi::Anthropic);
         let dbg = format!("{:?}", cfg.client);
-        assert!(
-            !dbg.contains("18899"),
-            "no proxy must be installed: {dbg}"
-        );
+        assert!(!dbg.contains("18899"), "no proxy must be installed: {dbg}");
     }
 
     #[test]
@@ -529,14 +528,22 @@ mod tests {
     #[test]
     fn build_client_with_only_an_https_proxy() {
         let https = Some("http://127.0.0.1:7891".to_string());
-        let client = build_client(&None, &https, &None).expect("https-only proxy must build");
+        let client = build_client(&crate::proxy::LlmProxy {
+            https: https.clone(),
+            ..Default::default()
+        })
+        .expect("https-only proxy must build");
         let _ = client;
     }
 
     #[test]
     fn build_client_rejects_a_malformed_http_proxy() {
         let http = Some("not a url %".to_string());
-        let err = build_client(&http, &None, &None).expect_err("malformed proxy must fail");
+        let err = build_client(&crate::proxy::LlmProxy {
+            http: http.clone(),
+            ..Default::default()
+        })
+        .expect_err("malformed proxy must fail");
         match err {
             ConfigError::BadProxy { var, url, .. } => {
                 assert!(var.contains("HTTP_PROXY"), "var must name the knob: {var}");
@@ -549,7 +556,11 @@ mod tests {
     #[test]
     fn build_client_rejects_a_malformed_https_proxy() {
         let https = Some("not a url %".to_string());
-        let err = build_client(&None, &https, &None).expect_err("malformed proxy must fail");
+        let err = build_client(&crate::proxy::LlmProxy {
+            https: https.clone(),
+            ..Default::default()
+        })
+        .expect_err("malformed proxy must fail");
         match err {
             ConfigError::BadProxy { var, url, .. } => {
                 assert!(var.contains("HTTPS_PROXY"), "var must name the knob: {var}");
@@ -562,7 +573,11 @@ mod tests {
     #[test]
     fn build_client_error_message_names_the_offending_url() {
         let generic = Some("not a url %".to_string());
-        let err = build_client(&None, &None, &generic).expect_err("malformed proxy must fail");
+        let err = build_client(&crate::proxy::LlmProxy {
+            generic: generic.clone(),
+            ..Default::default()
+        })
+        .expect_err("malformed proxy must fail");
         let msg = err.to_string();
         assert!(msg.contains("not a url %"), "{msg}");
         assert!(msg.contains("CONGA_LLM_PROXY"), "{msg}");

@@ -118,7 +118,11 @@ fn compacted(messages: &[AgentMessage], max_messages: usize) -> Option<Vec<Agent
     }
 
     let mut out: Vec<AgentMessage> = Vec::with_capacity(kept_msg_count + 1);
-    out.push(messages[0].clone()); // pinned original task
+    // Pin the WHOLE first group: an `Assistant(tool_call)` and the
+    // `ToolResult`s that answer it form ONE atomic group. Keeping only
+    // the group's first message would hand the model a tool call without
+    // its result — the provider answers that with HTTP 400.
+    out.extend(messages[groups[0].0..groups[0].1].iter().cloned());
     out.push(AgentMessage::User(UserMessage {
         content: vec![ContentBlock::text(format!(
             "[compacted {dropped} earlier messages; original task kept]"
@@ -846,18 +850,13 @@ mod tests {
         assert_eq!(text_of(&out[2]), "u2");
     }
 
-    /// KNOWN BUG (reported, not fixed): the "pinned original task" is pushed
-    /// as `messages[0]` only — the REST of the pinned group is dropped. When
-    /// the transcript starts with an `Assistant` message, the pinned group is
-    /// `[assistant, tool_result, ...]`, so the tool result disappears and
-    /// the assistant is left with an ORPHAN tool call. The notice also
-    /// under-counts the dropped messages (`dropped` subtracts the pinned
-    /// group's length, but only its first message is actually kept).
-    ///
-    /// This test pins the CURRENT behaviour so the bug stays visible; it
-    /// must be updated when the bug is fixed.
+    /// The pinned first group is kept WHOLE. When the transcript starts with
+    /// an `Assistant` message, the pinned group is
+    /// `[assistant, tool_result, ...]` — dropping any of it would leave the
+    /// assistant with an ORPHAN tool call, which the provider answers with
+    /// HTTP 400.
     #[test]
-    fn pinned_first_group_keeps_only_its_first_message_known_bug() {
+    fn pinned_first_group_keeps_every_message_of_the_group() {
         let msgs = vec![
             assistant_with_tool("t1"),
             result("t1"),
@@ -874,7 +873,7 @@ mod tests {
                 .any(|b| matches!(b, ContentBlock::ToolCall { .. }))),
             other => panic!("expected the pinned assistant, got {other:?}"),
         }
-        // ...but its tool result is gone → an orphan tool call.
+        // ...and so does its tool result — no orphan tool call.
         let result_ids: Vec<String> = out
             .iter()
             .filter_map(|m| match m {
@@ -882,17 +881,65 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            result_ids.is_empty(),
-            "the pinned group's tool result was dropped: {result_ids:?}"
+        assert_eq!(
+            result_ids,
+            vec!["t1".to_string()],
+            "the pinned group's tool result must survive"
         );
-        // Two messages were dropped (the tool result and u2), but the notice
-        // counts only one.
+        // One message (u2) was dropped and the notice counts it.
         assert!(
-            text_of(&out[1]).contains("compacted 1 earlier messages"),
-            "notice under-counts: {}",
-            text_of(&out[1])
+            text_of(&out[2]).contains("compacted 1 earlier messages"),
+            "notice must count every dropped message: {}",
+            text_of(&out[2])
         );
+    }
+
+    /// Every tool call in a compacted view must be answered by a tool
+    /// result — that pairing is a provider-protocol requirement, not a
+    /// nicety.
+    #[test]
+    fn compacted_output_pairs_every_tool_call_with_a_result() {
+        let msgs = vec![
+            assistant_with_tool("t1"),
+            result("t1"),
+            user("u2"),
+            assistant_with_tool("t2"),
+            result("t2"),
+            user("u3"),
+            assistant_with_tool("t3"),
+            result("t3"),
+            user("u4"),
+        ];
+        for max in 1..=msgs.len() {
+            let out = compact_by_count(&msgs, max);
+            let calls: Vec<String> = out
+                .iter()
+                .flat_map(|m| match m {
+                    AgentMessage::Assistant(a) => a
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolCall { tool_call } => Some(tool_call.id.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .collect();
+            let results: Vec<String> = out
+                .iter()
+                .filter_map(|m| match m {
+                    AgentMessage::ToolResult(r) => Some(r.tool_call_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            for call in &calls {
+                assert!(
+                    results.contains(call),
+                    "max_messages={max}: tool call {call} lost its result"
+                );
+            }
+        }
     }
 
     #[test]

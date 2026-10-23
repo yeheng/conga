@@ -259,7 +259,11 @@ mod tests {
     fn output_one_byte_over_the_limit_is_truncated() {
         let over = "x".repeat(MAX_OUTPUT_BYTES + 1);
         let out = truncate_output(&over);
-        assert!(out.ends_with("\n...(truncated)"), "{}", &out[out.len() - 20..]);
+        assert!(
+            out.ends_with("\n...(truncated)"),
+            "{}",
+            &out[out.len() - 20..]
+        );
         assert_eq!(out.len(), MAX_OUTPUT_BYTES + "\n...(truncated)".len());
     }
 
@@ -417,10 +421,7 @@ mod tests {
         let deep = tmp.path().join("a/b/c/new.txt");
         let (ancestor, tail) = nearest_existing_ancestor(&deep);
         assert_eq!(ancestor, tmp.path());
-        assert_eq!(
-            tail,
-            PathBuf::from("a").join("b").join("c").join("new.txt")
-        );
+        assert_eq!(tail, PathBuf::from("a").join("b").join("c").join("new.txt"));
     }
 
     /// Walking up must stop at the filesystem root instead of looping

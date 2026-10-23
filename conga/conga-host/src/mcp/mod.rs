@@ -27,6 +27,8 @@ mod http;
 mod stdio;
 mod types;
 
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use conga::ToolDefinition;
@@ -34,6 +36,8 @@ use conga::ToolDefinition;
 pub use config::{load_config, load_config_from, McpServerConfig};
 pub use http::McpHttpClient;
 pub use stdio::McpBridge;
+
+use types::McpTool;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -78,8 +82,11 @@ pub async fn load_all_mcp() -> Vec<ToolDefinition> {
             }
         } else {
             let command = cfg.command.as_deref().unwrap_or("");
-            match McpBridge::spawn(&name, command, &cfg.args, &cfg.env, timeout).await {
-                Ok((_, defs)) => defs,
+            match acquire_stdio_server(&name, command, &cfg.args, &cfg.env, timeout).await {
+                Ok((bridge, mcp_tools)) => mcp_tools
+                    .into_iter()
+                    .map(|t| bridge.tool_definition(t))
+                    .collect(),
                 Err(e) => {
                     tracing::warn!("mcp {name} load failed: {e}");
                     continue;
@@ -92,6 +99,72 @@ pub async fn load_all_mcp() -> Vec<ToolDefinition> {
         tools.extend(defs);
     }
     tools
+}
+
+/// A cached stdio server: the bridge (weakly) and the tools it advertised.
+struct CachedServer {
+    bridge: std::sync::Weak<McpBridge>,
+    tools: Vec<McpTool>,
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+}
+
+/// Process-wide cache of the stdio MCP servers this process has spawned.
+///
+/// The cache holds WEAK references on purpose: a cached server stays alive
+/// exactly as long as some tool definition still references it. The
+/// consequence is what we want — the subprocess is NOT re-spawned per
+/// connection (the gateway builds a session per WebSocket, so ten tabs
+/// used to mean ten servers), and `kill_on_drop` still reaps it when the
+/// last user goes away, because nothing in the cache keeps it alive.
+static STDIO_SERVERS: LazyLock<parking_lot::Mutex<HashMap<String, CachedServer>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Reuse the live server for `name` if there is one for the SAME command,
+/// else spawn a fresh one.
+async fn acquire_stdio_server(
+    name: &str,
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+    timeout: Duration,
+) -> Result<(Arc<McpBridge>, Vec<McpTool>), McpError> {
+    if let Some((bridge, tools)) = reuse_stdio_server(name, command, args, env) {
+        tracing::info!("mcp {name}: reusing the live server process");
+        return Ok((bridge, tools));
+    }
+    let (bridge, tools) = McpBridge::spawn(name, command, args, env, timeout).await?;
+    let mut cache = STDIO_SERVERS.lock();
+    cache.insert(
+        name.to_string(),
+        CachedServer {
+            bridge: Arc::downgrade(&bridge),
+            tools: tools.clone(),
+            command: command.to_string(),
+            args: args.to_vec(),
+            env: env.clone(),
+        },
+    );
+    Ok((bridge, tools))
+}
+
+/// The cached server for `name`, if it is still alive and was started with
+/// the same command line.
+fn reuse_stdio_server(
+    name: &str,
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Option<(Arc<McpBridge>, Vec<McpTool>)> {
+    let cache = STDIO_SERVERS.lock();
+    let entry = cache.get(name)?;
+    if entry.command != command || entry.args != args || entry.env != *env {
+        // The configuration changed — the running server is stale.
+        return None;
+    }
+    let bridge = entry.bridge.upgrade()?;
+    Some((bridge, entry.tools.clone()))
 }
 
 /// Read the MCP call timeout from `CONGA_MCP_CALL_TIMEOUT_S` (default 60s).
@@ -183,11 +256,74 @@ for line in sys.stdin:
         let kept = dir.keep();
         kept.join("mcp_echo.py").to_string_lossy().into_owned()
     }
+
+    /// Write a tiny local MCP server (python3) that APPENDS ITS PID to
+    /// `spawn_log` when it starts — so a test can count how many server
+    /// processes were actually spawned.
+    pub(crate) fn fixture_pid_logging_server_script(spawn_log: &std::path::Path) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_pid.py");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/usr/bin/env python3
+import sys, json, os
+
+with open({log:?}, "a") as f:
+    f.write(str(os.getpid()) + "\n")
+
+def send(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method", "")
+
+    if method == "initialize":
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{
+            "protocolVersion": "2025-06-18",
+            "capabilities": {{"tools": {{"listChanged": False}}}},
+            "serverInfo": {{"name": "pid-server", "version": "1.0.0"}}
+        }}}})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{"tools": [{{
+            "name": "echo",
+            "description": "echo back the arguments",
+            "inputSchema": {{
+                "type": "object",
+                "properties": {{"text": {{"type": "string"}}}},
+                "required": ["text"]
+            }}
+        }}]}}}})
+    elif method == "tools/call":
+        args = msg.get("params", {{}}).get("arguments", {{}})
+        text = args.get("text", "")
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{
+            "content": [{{"type": "text", "text": text}}],
+            "isError": False
+        }}}})
+"#,
+                log = spawn_log.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let kept = dir.keep();
+        kept.join("mcp_pid.py").to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_util::{fixture_echo_server_script, ENV_LOCK};
+    use super::test_util::{
+        fixture_echo_server_script, fixture_pid_logging_server_script, ENV_LOCK,
+    };
     use super::*;
 
     /// Scoped, process-global MCP env (`CONGA_MCP_CONFIG` /
@@ -303,6 +439,91 @@ mod tests {
         let tools = load_all_mcp().await;
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "mcp__echo__echo");
+    }
+
+    /// Two sessions in the same process must SHARE one server process.
+    /// The gateway builds a session per WebSocket connection, so without
+    /// the cache every browser tab would spawn its own MCP server.
+    #[tokio::test]
+    async fn load_all_mcp_reuses_the_live_server_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spawn_log = tmp.path().join("spawns.log");
+        let script = fixture_pid_logging_server_script(&spawn_log);
+        let path = write_config(
+            tmp.path(),
+            &format!(
+                r#"{{"mcpServers":{{"reuse-probe":{{"command":"python3","args":["{script}"]}}}}}}"#
+            ),
+        );
+        let _env = McpEnv::set_async(Some(&path), Some("20")).await;
+
+        let first = load_all_mcp().await;
+        assert_eq!(first.len(), 1);
+        let spawns = || {
+            std::fs::read_to_string(&spawn_log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        assert_eq!(spawns(), 1, "the first load spawns one server");
+
+        // The first load's tools still reference the server, so the second
+        // load must reuse that process instead of spawning another one.
+        let second = load_all_mcp().await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            spawns(),
+            1,
+            "the second load must reuse the live server process"
+        );
+        assert_eq!(first[0].name, second[0].name);
+
+        drop(first);
+        drop(second);
+    }
+
+    /// A changed command line invalidates the cached server.
+    #[tokio::test]
+    async fn load_all_mcp_respawns_when_the_command_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spawn_log = tmp.path().join("spawns.log");
+        let script = fixture_pid_logging_server_script(&spawn_log);
+        let path = write_config(
+            tmp.path(),
+            &format!(
+                r#"{{"mcpServers":{{"reuse-probe":{{"command":"python3","args":["{script}"]}}}}}}"#
+            ),
+        );
+        // The env guard holds a process-wide lock, so it must be released
+        // before the second one is taken. The tools outlive the guard.
+        let first = {
+            let _env = McpEnv::set_async(Some(&path), Some("20")).await;
+            load_all_mcp().await
+        };
+        assert_eq!(first.len(), 1);
+
+        // Same server name, different command line -> the cached server is
+        // stale and must not be reused.
+        let other = fixture_pid_logging_server_script(&spawn_log);
+        let path2 = write_config(
+            tmp.path(),
+            &format!(
+                r#"{{"mcpServers":{{"reuse-probe":{{"command":"python3","args":["{other}"]}}}}}}"#
+            ),
+        );
+        {
+            let _env = McpEnv::set_async(Some(&path2), Some("20")).await;
+            let second = load_all_mcp().await;
+            assert_eq!(second.len(), 1);
+        }
+
+        let spawns = std::fs::read_to_string(&spawn_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(spawns, 2, "a changed command line must respawn the server");
+
+        drop(first);
     }
 
     #[test]

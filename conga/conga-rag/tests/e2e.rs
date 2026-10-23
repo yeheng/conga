@@ -79,11 +79,7 @@ fn run_cli(dir: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> std::p
 /// not live on the test's runtime.
 fn mock_embeddings_server() -> (String, tokio::runtime::Runtime) {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let base = rt.block_on(async {
-        conga_rag::testsupport::spawn_mock_embeddings(0)
-            .await
-            .0
-    });
+    let base = rt.block_on(async { conga_rag::testsupport::spawn_mock_embeddings(0).await.0 });
     (base, rt)
 }
 
@@ -129,10 +125,7 @@ fn cli_ingest_prints_the_stats_as_json() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "cli must succeed: {stdout}\n{stderr}"
-    );
+    assert!(out.status.success(), "cli must succeed: {stdout}\n{stderr}");
     let line = stdout.lines().last().expect("a stats line on stdout");
     let stats: serde_json::Value = serde_json::from_str(line).expect("stats must be JSON");
     // KNOWN BUG (src/main.rs:71-78): `print_stats` is handed the *config
@@ -187,10 +180,7 @@ fn cli_status_reports_the_index() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "cli must succeed: {stdout}\n{stderr}"
-    );
+    assert!(out.status.success(), "cli must succeed: {stdout}\n{stderr}");
     let line = stdout.lines().last().expect("a status line on stdout");
     let status: serde_json::Value = serde_json::from_str(line).expect("status must be JSON");
     assert_eq!(status["store"], db.to_string_lossy().as_ref());

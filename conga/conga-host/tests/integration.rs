@@ -133,7 +133,7 @@ async fn mid_turn_failure_preserves_side_effect() {
     // Reopen: the derived history keeps user + assistant + tool result.
     let sid = host.session().current_id().to_string();
     let reopen = SessionManager::with_root(tmp.path().to_path_buf());
-    let events = reopen.open_or_migrate(&sid).await.unwrap();
+    let events = reopen.open(&sid).await.unwrap();
     let msgs = derive_messages(&events);
     assert!(
         msgs.iter().any(|m| matches!(m, AgentMessage::User(_))),
@@ -451,7 +451,7 @@ async fn legacy_messages_migrate_once_and_delete_legacy() {
     std::fs::write(dir.join("messages.jsonl"), raw).unwrap();
 
     let sm = SessionManager::with_root(tmp.path().to_path_buf());
-    let events = sm.open_or_migrate(sid).await.unwrap();
+    let events = sm.migrate(sid).await.unwrap();
     assert_eq!(
         derive_messages(&events),
         legacy,
@@ -471,12 +471,12 @@ async fn legacy_messages_migrate_once_and_delete_legacy() {
     );
 
     // Second open: loads events.jsonl directly, no legacy to touch.
-    let events2 = sm.open_or_migrate(sid).await.unwrap();
+    let events2 = sm.migrate(sid).await.unwrap();
     assert_eq!(events, events2, "second open must be idempotent");
     assert!(!dir.join("messages.jsonl").exists());
 }
 
-/// Corruption fails closed: a mid-file bad row makes open_or_migrate return
+/// Corruption fails closed: a mid-file bad row makes the open return
 /// Err — the old adopt-and-start-fresh behavior is gone, and a failed
 /// migration leaves the legacy file untouched.
 #[tokio::test]
@@ -497,7 +497,7 @@ async fn corrupted_session_errors_instead_of_adopting() {
     std::fs::write(dir.join("events.jsonl"), raw).unwrap();
     let sm = SessionManager::with_root(tmp.path().to_path_buf());
     assert!(
-        sm.open_or_migrate(sid).await.is_err(),
+        sm.open(sid).await.is_err(),
         "corrupt events.jsonl must fail closed, not adopt"
     );
 
@@ -515,7 +515,7 @@ async fn corrupted_session_errors_instead_of_adopting() {
     std::fs::write(dir2.join("messages.jsonl"), raw2).unwrap();
     let sm2 = SessionManager::with_root(tmp.path().to_path_buf());
     assert!(
-        sm2.open_or_migrate(sid2).await.is_err(),
+        sm2.migrate(sid2).await.is_err(),
         "corrupt legacy transcript must fail closed, not adopt"
     );
     assert!(
@@ -618,7 +618,7 @@ async fn compaction_checkpoints_at_turn_start_and_pins_prefix() {
 
     // The log keeps every pre-checkpoint row AND the checkpoint itself.
     let reopen = SessionManager::with_root(tmp.path().to_path_buf());
-    let events = reopen.open_or_migrate(&sid).await.unwrap();
+    let events = reopen.open(&sid).await.unwrap();
     assert!(
         events
             .iter()
@@ -771,7 +771,7 @@ async fn consecutive_requests_are_prefix_stable_and_env_stays_out_of_system() {
         "env must be the tail of the persisted user message, got: {first_user:.60}…"
     );
     let reopen = SessionManager::with_root(tmp.path().to_path_buf());
-    let events = reopen.open_or_migrate(&sid).await.unwrap();
+    let events = reopen.open(&sid).await.unwrap();
     let projected = derive_messages(&events);
     // The turn-2 request equals the final projection minus its TRAILING
     // assistant — that message is persisted by this very provider call
@@ -823,7 +823,7 @@ async fn clear_session_marks_log_and_next_turn_starts_empty() {
 
     // Derived history: exactly the post-clear turn (user + assistant).
     let reopen = SessionManager::with_root(tmp.path().to_path_buf());
-    let events = reopen.open_or_migrate(&sid).await.unwrap();
+    let events = reopen.open(&sid).await.unwrap();
     assert!(events.contains(&SessionEvent::Cleared));
     let msgs = derive_messages(&events);
     assert_eq!(msgs.len(), 2, "only the post-clear turn, got {msgs:?}");

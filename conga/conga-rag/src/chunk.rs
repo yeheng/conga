@@ -7,6 +7,10 @@ pub struct Chunk {
     pub content: String,
 }
 
+/// Split `text` into chunks of roughly `target_chars` characters.
+///
+/// `target_chars == 0` means "do not split": the text is kept as-is (one
+/// chunk per paragraph) instead of being cut.
 pub fn chunk(text: &str, target_chars: usize, overlap_chars: usize) -> Vec<Chunk> {
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut cur = String::new();
@@ -69,6 +73,13 @@ pub fn chunk(text: &str, target_chars: usize, overlap_chars: usize) -> Vec<Chunk
 /// hard character cuts — never exceeding `target` unless a single
 /// non-splittable run is itself longer.
 fn soft_split(para: &str, target: usize) -> Vec<String> {
+    if target == 0 {
+        // A zero target means "do not split". Without this guard the cut
+        // windows below are empty (`start == end`), so `cut` stays equal to
+        // `start`: the loop never advances and pushes an empty string on
+        // every iteration (infinite loop + unbounded memory growth).
+        return vec![para.to_string()];
+    }
     if para.chars().count() <= target {
         return vec![para.to_string()];
     }
@@ -178,6 +189,32 @@ mod tests {
             "500 chars / 120 target must split, got {}",
             out.len()
         );
+    }
+
+    #[test]
+    fn chunk_with_a_zero_target_yields_one_chunk() {
+        let out = chunk("hello world", 0, 0);
+        assert_eq!(out.len(), 1, "a zero target must not split");
+        assert_eq!(out[0].content, "hello world");
+        assert_eq!(out[0].ordinal, 0);
+    }
+
+    #[test]
+    fn chunk_with_a_zero_target_yields_no_empty_chunks() {
+        let text = (0..20)
+            .map(|i| format!("paragraph {i} {}", "x".repeat(200)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let out = chunk(&text, 0, 0);
+        assert!(!out.is_empty(), "a zero target must still emit the text");
+        assert_eq!(
+            out.len(),
+            20,
+            "one chunk per paragraph, no runaway empty chunks"
+        );
+        for c in &out {
+            assert!(!c.content.is_empty(), "empty chunk: {c:?}");
+        }
     }
 
     #[test]
@@ -324,6 +361,23 @@ mod tests {
     #[test]
     fn soft_split_of_an_empty_paragraph_yields_one_empty_piece() {
         assert_eq!(soft_split("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn soft_split_of_a_zero_target_paragraph_returns_it_whole() {
+        // A zero target means "do not split". Before the guard this call
+        // looped forever (the cut window was empty, so `start` never
+        // advanced) and grew the output vector without bound.
+        let para = "hello world";
+        assert_eq!(soft_split(para, 0), vec![para.to_string()]);
+    }
+
+    #[test]
+    fn soft_split_of_a_zero_target_long_paragraph_returns_it_whole() {
+        let para = "x".repeat(10_000);
+        let out = soft_split(&para, 0);
+        assert_eq!(out.len(), 1, "a zero target must not split");
+        assert_eq!(out[0], para, "no content may be lost");
     }
 
     // --- tail_chars ---

@@ -581,7 +581,11 @@ mod tests {
     fn load_file_defaults_a_zero_timeout_to_ten_seconds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
-        std::fs::write(&path, hook_json(r#"{"hooks": [{"command": "true", "timeout": 0}]}"#)).unwrap();
+        std::fs::write(
+            &path,
+            hook_json(r#"{"hooks": [{"command": "true", "timeout": 0}]}"#),
+        )
+        .unwrap();
         let mut out: Vec<ProcessHook> = Vec::new();
         load_file(&path, &mut out);
         assert_eq!(out.len(), 1);
@@ -647,7 +651,10 @@ mod tests {
             RiskLevel::Low,
         )
         .await;
-        assert!(matches!(d, HookDecision::NoOpinion), "pwd prints no decision");
+        assert!(
+            matches!(d, HookDecision::NoOpinion),
+            "pwd prints no decision"
+        );
         // The command really ran inside the pinned cwd.
         let marker = tmp.path().join("marker.txt");
         let hook = hook_with(
@@ -731,16 +738,12 @@ mod tests {
     #[test]
     fn parse_decision_allow_returns_allow() {
         let stdout = br#"{"hookSpecificOutput": {"permissionDecision": "allow"}}"#;
-        assert!(matches!(
-            parse_decision(stdout, ""),
-            HookDecision::Allow
-        ));
+        assert!(matches!(parse_decision(stdout, ""), HookDecision::Allow));
     }
 
     #[test]
     fn parse_decision_updated_input_returns_modify() {
-        let stdout =
-            br#"{"hookSpecificOutput": {"updatedInput": {"command": "rtk git status"}}}"#;
+        let stdout = br#"{"hookSpecificOutput": {"updatedInput": {"command": "rtk git status"}}}"#;
         match parse_decision(stdout, "") {
             HookDecision::Modify(args) => assert_eq!(args["command"], "rtk git status"),
             _other => panic!("expected Modify, got something else"),
@@ -753,10 +756,7 @@ mod tests {
             parse_decision(b"not json at all", ""),
             HookDecision::NoOpinion
         ));
-        assert!(matches!(
-            parse_decision(b"{}", ""),
-            HookDecision::NoOpinion
-        ));
+        assert!(matches!(parse_decision(b"{}", ""), HookDecision::NoOpinion));
         assert!(matches!(
             parse_decision(br#"{"hookSpecificOutput": {}}"#, ""),
             HookDecision::NoOpinion
@@ -770,10 +770,7 @@ mod tests {
         ));
         // A non-object `updatedInput` is not a rewrite.
         assert!(matches!(
-            parse_decision(
-                br#"{"hookSpecificOutput": {"updatedInput": "nope"}}"#,
-                ""
-            ),
+            parse_decision(br#"{"hookSpecificOutput": {"updatedInput": "nope"}}"#, ""),
             HookDecision::NoOpinion
         ));
     }

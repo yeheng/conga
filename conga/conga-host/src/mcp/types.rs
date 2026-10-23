@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use super::McpError;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct McpTool {
     pub(super) name: String,
     #[serde(default)]

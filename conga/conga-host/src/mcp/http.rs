@@ -17,13 +17,8 @@ use super::{McpError, PROTOCOL_VERSION};
 /// override > `CONGA_TOOL_PROXY`), then the legacy LLM-proxy env chain for
 /// backward compatibility. Direct connection when none is set.
 fn pick_mcp_proxy(lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>) -> Option<String> {
-    if let Some(p) = crate::proxy::tool_proxy() {
-        return Some(p);
-    }
-    ["CONGA_LLM_PROXY", "HTTPS_PROXY", "https_proxy"]
-        .iter()
-        .find_map(|k| lookup(k).ok().map(|s| s.trim().to_string()))
-        .filter(|s| !s.is_empty())
+    let tool = crate::proxy::tool_proxy();
+    conga::proxy::mcp_proxy_from_env_with(lookup, tool.as_deref())
 }
 
 /// Session header for the Streamable HTTP transport: stateful servers

@@ -816,7 +816,10 @@ mod tests {
             }
         }
         assert_eq!(keys, vec!["source".to_string(), "path".to_string()]);
-        assert_eq!(values, vec!["\"notes\"".to_string(), "\"/n/a.md\"".to_string()]);
+        assert_eq!(
+            values,
+            vec!["\"notes\"".to_string(), "\"/n/a.md\"".to_string()]
+        );
     }
 
     // --- open / close ---

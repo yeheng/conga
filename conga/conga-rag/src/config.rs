@@ -920,7 +920,10 @@ overlap_chars = 50
     fn builtin_base_follows_the_env_override() {
         match std::env::var("CONGA_RAG_BUILTIN_BASE") {
             Ok(v) if v.trim().is_empty() => {
-                assert!(builtin_base().is_none(), "an empty override disables the builtins")
+                assert!(
+                    builtin_base().is_none(),
+                    "an empty override disables the builtins"
+                )
             }
             Ok(v) => assert_eq!(builtin_base(), Some(PathBuf::from(v))),
             Err(_) => assert_eq!(builtin_base(), Some(conga::storage::config_dir())),

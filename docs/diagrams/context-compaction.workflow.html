@@ -5219,10 +5219,10 @@
       <div class="card">
         <div class="card-header">
           <div class="card-dot emerald"></div>
-          <h3>只缩内存,不改盘</h3>
+          <h3>日志只追加,压缩以检查点追加</h3>
         </div>
         <ul>
-          <li>&bull; events.jsonl 永远 append-only,压缩只作用于本轮喂给 LLM 的 history</li>
+          <li>&bull; events.jsonl 永远 append-only:压缩只追加一条 Compacted 检查点,已有行不改</li>
           <li>&bull; 无 LLM 摘要:丢弃最旧整组 + 一条前置提示,不调模型</li>
           <li>&bull; usage 随 Assistant 事件持久化,预算跨重启存活</li>
         </ul>

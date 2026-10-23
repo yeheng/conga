@@ -348,13 +348,13 @@ mod tests {
     /// Error path: the task array is mandatory.
     #[tokio::test]
     async fn requires_a_tasks_array() {
-        let err = execute(Arc::new(crate::subagent_types::NoopSubagentSpawner), ctx_with_args(serde_json::json!({})))
-            .await
-            .expect_err("a missing tasks array must fail");
-        assert!(
-            err.to_string().contains("tasks array is required"),
-            "{err}"
-        );
+        let err = execute(
+            Arc::new(crate::subagent_types::NoopSubagentSpawner),
+            ctx_with_args(serde_json::json!({})),
+        )
+        .await
+        .expect_err("a missing tasks array must fail");
+        assert!(err.to_string().contains("tasks array is required"), "{err}");
     }
 
     /// Error path: an empty task list has nothing to spawn.
@@ -367,7 +367,11 @@ mod tests {
         .await
         .unwrap();
         assert!(r.is_error);
-        assert!(result_text(&r).contains("no valid tasks"), "{}", result_text(&r));
+        assert!(
+            result_text(&r).contains("no valid tasks"),
+            "{}",
+            result_text(&r)
+        );
     }
 
     /// Error path: entries without a `task` string are all invalid.
@@ -380,7 +384,11 @@ mod tests {
         .await
         .unwrap();
         assert!(r.is_error);
-        assert!(result_text(&r).contains("no valid tasks"), "{}", result_text(&r));
+        assert!(
+            result_text(&r).contains("no valid tasks"),
+            "{}",
+            result_text(&r)
+        );
     }
 
     /// Error path: an aborted call must not spawn anything.
@@ -388,12 +396,9 @@ mod tests {
     async fn aborts_on_signal() {
         let mut ctx = ctx_with(serde_json::json!([{ "task": "a" }]));
         ctx.signal = Arc::new(AtomicBool::new(true));
-        let r = execute(
-            Arc::new(crate::subagent_types::NoopSubagentSpawner),
-            ctx,
-        )
-        .await
-        .unwrap();
+        let r = execute(Arc::new(crate::subagent_types::NoopSubagentSpawner), ctx)
+            .await
+            .unwrap();
         assert!(r.is_error);
         assert!(result_text(&r).contains("aborted"), "{}", result_text(&r));
     }
@@ -408,9 +413,12 @@ mod tests {
         let spawner = Arc::new(ScriptedSpawner {
             results: vec![result],
         });
-        let r = execute(spawner, ctx_with(serde_json::json!([{ "task": "do the thing" }])))
-            .await
-            .unwrap();
+        let r = execute(
+            spawner,
+            ctx_with(serde_json::json!([{ "task": "do the thing" }])),
+        )
+        .await
+        .unwrap();
         assert!(!r.is_error);
         let text = result_text(&r);
         assert!(text.contains("the full transcript"), "{text}");
@@ -430,9 +438,12 @@ mod tests {
         let spawner = Arc::new(ScriptedSpawner {
             results: vec![result],
         });
-        let r = execute(spawner, ctx_with(serde_json::json!([{ "task": "do the thing" }])))
-            .await
-            .unwrap();
+        let r = execute(
+            spawner,
+            ctx_with(serde_json::json!([{ "task": "do the thing" }])),
+        )
+        .await
+        .unwrap();
         let text = result_text(&r);
         assert!(text.contains("ERROR - boom"), "{text}");
         assert_eq!(r.details["errors"], 1);
@@ -445,9 +456,12 @@ mod tests {
         let spawner = Arc::new(ScriptedSpawner {
             results: vec![scripted_result(1, "do the thing")],
         });
-        let r = execute(spawner, ctx_with(serde_json::json!([{ "task": "do the thing" }])))
-            .await
-            .unwrap();
+        let r = execute(
+            spawner,
+            ctx_with(serde_json::json!([{ "task": "do the thing" }])),
+        )
+        .await
+        .unwrap();
         let text = result_text(&r);
         assert!(text.contains("Subagent 1 (do the thing)"), "{text}");
         assert!(text.contains("headline"), "{text}");

@@ -96,11 +96,13 @@ pub fn settings_path() -> PathBuf {
 
 /// Load from an explicit path. Missing file → empty settings; a corrupt
 /// file warns and degrades to empty (the process env still provides a
-/// working provider — a hand-mangled file must not brick the app).
+/// working provider — a hand-mangled file must not brick the app). An
+/// out-of-range `maxTokens` is dropped to `None` (env / 128k default
+/// applies), the rest of the file is kept.
 pub fn load_settings_at(path: &Path) -> EnvSettings {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<EnvSettings>(&bytes) {
-            Ok(s) => s,
+            Ok(s) => sanitize_loaded_settings(path, s),
             Err(e) => {
                 tracing::warn!("{}: corrupt settings file ignored: {e}", path.display());
                 EnvSettings::default()
@@ -121,11 +123,12 @@ pub fn load_settings() -> EnvSettings {
 /// Async variant of [`load_settings_at`] for callers already on the Tokio
 /// runtime (`Host::run_turn` re-reads the file every turn): `tokio::fs`
 /// keeps the read off the worker thread's synchronous path. Same
-/// degrade-to-empty semantics as the sync loader.
+/// degrade-to-empty semantics as the sync loader, and the same
+/// `maxTokens` sanitizing.
 pub async fn load_settings_at_async(path: &Path) -> EnvSettings {
     match tokio::fs::read(path).await {
         Ok(bytes) => match serde_json::from_slice::<EnvSettings>(&bytes) {
-            Ok(s) => s,
+            Ok(s) => sanitize_loaded_settings(path, s),
             Err(e) => {
                 tracing::warn!("{}: corrupt settings file ignored: {e}", path.display());
                 EnvSettings::default()
@@ -137,6 +140,23 @@ pub async fn load_settings_at_async(path: &Path) -> EnvSettings {
             EnvSettings::default()
         }
     }
+}
+
+/// Validate a freshly loaded settings file. The write path rejects an
+/// out-of-range `maxTokens` outright; the read path must degrade instead
+/// of discarding the whole file (that would also drop the user's
+/// `base_url` / `model`). An invalid `maxTokens` is dropped to `None` —
+/// the env / 128k default window applies — while every other field is
+/// kept as-is.
+fn sanitize_loaded_settings(path: &Path, mut s: EnvSettings) -> EnvSettings {
+    if let Err(e) = validate_max_tokens(s.max_tokens) {
+        tracing::warn!(
+            "{}: invalid maxTokens ignored ({e}), falling back to the env/default context window",
+            path.display()
+        );
+        s.max_tokens = None;
+    }
+    s
 }
 
 pub async fn load_settings_async() -> EnvSettings {
@@ -237,15 +257,21 @@ fn validate_max_tokens(n: Option<u64>) -> Result<(), String> {
 }
 
 /// Mask a stored key for display: `sk-…ab12`. Short keys mask entirely.
+/// The length threshold and the kept prefix/suffix are counted in
+/// CHARACTERS, not bytes, so a multi-byte key is sliced on char
+/// boundaries (a byte slice would panic mid-char).
 pub fn mask_key(key: &str) -> String {
     let k = key.trim();
     if k.is_empty() {
         return String::new();
     }
-    if k.len() <= 8 {
+    let chars: Vec<char> = k.chars().collect();
+    if chars.len() <= 8 {
         return "…".to_string();
     }
-    format!("{}…{}", &k[..3], &k[k.len() - 4..])
+    let prefix: String = chars[..3].iter().collect();
+    let suffix: String = chars[chars.len() - 4..].iter().collect();
+    format!("{prefix}…{suffix}")
 }
 
 /// The GET view: same shape as [`EnvSettings`] but the raw `api_key` is
@@ -434,6 +460,89 @@ mod tests {
         assert_eq!(load_settings_at(&path), EnvSettings::default());
     }
 
+    // ── load path sanitizes maxTokens ───────────────────────────
+
+    fn write_settings(dir: &Path, json: serde_json::Value) -> PathBuf {
+        let path = dir.join("settings.json");
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_settings_rejects_an_out_of_range_max_tokens() {
+        // A hand-edited file with an absurd window must not reach the
+        // compaction budget: the field is dropped, the REST of the file
+        // (provider config!) is kept.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(
+            dir.path(),
+            serde_json::json!({
+                "llm": {
+                    "baseUrl": "https://a.x/v1",
+                    "apiKey": "sk-1",
+                    "model": "m1",
+                    "api": "openai",
+                },
+                "maxTokens": 999_999_999_999u64,
+            }),
+        );
+        let s = load_settings_at(&path);
+        assert_eq!(s.max_tokens, None, "an out-of-range window must be dropped");
+        let g = s.llm.expect("the llm group must survive");
+        assert_eq!(g.base_url, "https://a.x/v1");
+        assert_eq!(g.model, "m1");
+        assert_eq!(g.api_key, "sk-1");
+    }
+
+    #[test]
+    fn load_settings_rejects_a_too_small_max_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(dir.path(), serde_json::json!({ "maxTokens": 10u64 }));
+        assert_eq!(load_settings_at(&path).max_tokens, None);
+    }
+
+    #[test]
+    fn load_settings_keeps_a_valid_max_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(dir.path(), serde_json::json!({ "maxTokens": 200_000u64 }));
+        assert_eq!(load_settings_at(&path).max_tokens, Some(200_000));
+    }
+
+    #[tokio::test]
+    async fn async_load_settings_rejects_an_out_of_range_max_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(
+            dir.path(),
+            serde_json::json!({
+                "llm": { "baseUrl": "https://a.x/v1", "model": "m1" },
+                "maxTokens": 999_999_999_999u64,
+            }),
+        );
+        let s = load_settings_at_async(&path).await;
+        assert_eq!(s.max_tokens, None);
+        assert_eq!(
+            s.llm.expect("the llm group must survive").base_url,
+            "https://a.x/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_and_async_loaders_agree_on_a_bad_max_tokens() {
+        // The sync and async loaders must not drift apart again.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(
+            dir.path(),
+            serde_json::json!({
+                "llm": { "baseUrl": "https://a.x/v1", "model": "m1" },
+                "maxTokens": 999_999_999_999u64,
+            }),
+        );
+        assert_eq!(load_settings_at(&path), load_settings_at_async(&path).await);
+
+        let path = write_settings(dir.path(), serde_json::json!({ "maxTokens": 200_000u64 }));
+        assert_eq!(load_settings_at(&path), load_settings_at_async(&path).await);
+    }
+
     #[test]
     fn masked_view_never_leaks_the_key() {
         let s = EnvSettings {
@@ -457,6 +566,42 @@ mod tests {
         assert_eq!(mask_key(""), "");
         assert_eq!(mask_key("short"), "…");
         assert_eq!(mask_key("sk-abcdefgh"), "sk-…efgh");
+    }
+
+    /// Regression: a multi-byte API key must not panic. The mask slices
+    /// on char boundaries, so the length threshold and the prefix/suffix
+    /// are counted in characters, not bytes.
+    #[test]
+    fn mask_key_handles_multibyte_keys() {
+        // 9 bytes / 7 chars: the byte slice used to cut inside "密".
+        assert_eq!(mask_key("abcd密ef"), "…");
+        // Pure Chinese key, 8 chars -> masked entirely.
+        assert_eq!(mask_key("中文密钥中文密钥"), "…");
+        // Emoji key: the emoji is 4 bytes, a byte slice would split it.
+        assert_eq!(mask_key("sk-🔑密钥-🔑"), "…");
+        // Exactly 8 multi-byte chars -> masked entirely (char count).
+        assert_eq!(mask_key("一二三四五六七八"), "…");
+        // Longer than 8 chars: prefix/suffix are cut on char boundaries.
+        assert_eq!(mask_key("密abcdefghij"), "密ab…ghij");
+        assert_eq!(mask_key("密钥abcdefg"), "密钥a…defg");
+    }
+
+    #[test]
+    fn mask_key_masks_short_keys_entirely() {
+        assert_eq!(mask_key("short"), "…");
+        assert_eq!(mask_key("12345678"), "…");
+    }
+
+    #[test]
+    fn mask_key_of_an_empty_key_is_empty() {
+        assert_eq!(mask_key(""), "");
+        assert_eq!(mask_key("   "), "");
+    }
+
+    /// ASCII baseline: the first 3 and last 4 characters are kept.
+    #[test]
+    fn mask_key_masks_an_ascii_key() {
+        assert_eq!(mask_key("sk-1234567890"), "sk-…7890");
     }
 
     #[test]
@@ -825,8 +970,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("not-a-dir");
         std::fs::write(&blocker, "x").unwrap();
-        let err = save_settings_at(&blocker.join("settings.json"), &EnvSettings::default())
-            .unwrap_err();
+        let err =
+            save_settings_at(&blocker.join("settings.json"), &EnvSettings::default()).unwrap_err();
         assert!(!err.is_empty());
         let names: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()

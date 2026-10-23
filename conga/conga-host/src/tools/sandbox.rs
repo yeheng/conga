@@ -344,8 +344,8 @@ mod tests {
             // Without a working Seatbelt the capability check fires first —
             // also a fail-closed refusal, but with a different reason.
             let mut cmd = tokio::process::Command::new("true");
-            let err = confine(&mut cmd, std::path::Path::new("/conga-no-such-dir-xyz"))
-                .unwrap_err();
+            let err =
+                confine(&mut cmd, std::path::Path::new("/conga-no-such-dir-xyz")).unwrap_err();
             assert!(err.contains("sandbox"), "{err}");
             return;
         }
@@ -421,8 +421,8 @@ mod landlock_tests {
     #[test]
     fn confine_landlock_rejects_a_missing_cwd() {
         let mut cmd = tokio::process::Command::new("true");
-        let err = confine_landlock(&mut cmd, std::path::Path::new("/conga-no-such-dir-xyz"))
-            .unwrap_err();
+        let err =
+            confine_landlock(&mut cmd, std::path::Path::new("/conga-no-such-dir-xyz")).unwrap_err();
         assert!(err.contains("cwd not accessible"), "{err}");
     }
 }

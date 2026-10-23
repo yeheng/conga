@@ -411,7 +411,7 @@ pub async fn run_evolve(
         Some(id) => id.to_string(),
         None => session.current_id(),
     };
-    let events = session.open_or_migrate(&sid).await?;
+    let events = session.open(&sid).await?;
     let messages = conga::derive_messages(&events);
     let trajectory = render_trajectory(&messages, MAX_TRAJECTORY_CHARS);
     let catalog = catalog_snapshot(memory_root, cwd, &conga::storage::config_dir());

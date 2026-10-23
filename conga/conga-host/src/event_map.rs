@@ -241,7 +241,12 @@ mod tests {
     #[test]
     fn error_event_maps_to_the_error_event() {
         let mut tool_names = HashMap::new();
-        let v = ws_json(&AgentEvent::Error { message: "boom".into() }, &mut tool_names);
+        let v = ws_json(
+            &AgentEvent::Error {
+                message: "boom".into(),
+            },
+            &mut tool_names,
+        );
         assert_eq!(v["type"], "error");
         assert_eq!(v["content"], "boom");
         assert_eq!(v["message"], "boom");

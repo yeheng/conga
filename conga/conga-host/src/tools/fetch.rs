@@ -187,9 +187,7 @@ fn build_client(pin: Option<&SsrfPin>) -> Result<reqwest::Client, reqwest::Error
     let builder = match pin {
         // Pinned: no proxy of any kind - the connection must land on the
         // guard-validated address.
-        Some(pin) => builder
-            .no_proxy()
-            .resolve_to_addrs(&pin.host, &pin.addrs),
+        Some(pin) => builder.no_proxy().resolve_to_addrs(&pin.host, &pin.addrs),
         // Unpinned: the tool proxy may be configured; reqwest's own system
         // proxy detection stays on.
         None => crate::proxy::apply_tool_proxy(builder),
@@ -305,7 +303,10 @@ mod tests {
         let text = html_to_text(html);
         assert!(text.contains("one"), "{text:?}");
         assert!(text.contains("two"), "{text:?}");
-        assert!(!text.contains("\n\n"), "blank lines must be collapsed: {text:?}");
+        assert!(
+            !text.contains("\n\n"),
+            "blank lines must be collapsed: {text:?}"
+        );
     }
 
     #[test]
@@ -726,7 +727,10 @@ mod tests {
         // Reset before asserting: a failing assert must not leave the
         // global override installed for other tests.
         crate::proxy::set_tool_proxy(None).unwrap();
-        assert!(res.is_ok(), "the guard must stand down for a proxied request");
+        assert!(
+            res.is_ok(),
+            "the guard must stand down for a proxied request"
+        );
         assert!(res.unwrap().is_none());
     }
 }

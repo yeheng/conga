@@ -255,7 +255,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::write(tmp.path().join("a.rs"), "").await.unwrap();
         tokio::fs::create_dir(tmp.path().join("sub")).await.unwrap();
-        tokio::fs::write(tmp.path().join("sub/deep.rs"), "").await.unwrap();
+        tokio::fs::write(tmp.path().join("sub/deep.rs"), "")
+            .await
+            .unwrap();
         let r = run(serde_json::json!({}), tmp.path()).await;
         let text = text_of(&r);
         assert!(text.contains("a.rs"), "{text}");

@@ -474,7 +474,11 @@ mod tests {
             .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], vec![1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(requests.load(Ordering::SeqCst), 2, "the 429 must be retried");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "the 429 must be retried"
+        );
     }
 
     #[tokio::test]
@@ -518,7 +522,10 @@ mod tests {
         ]}))
         .await;
         let client = without_proxy(EmbeddingsClient::with_retry(&cfg(4), &base, fast_retry(0)));
-        let err = client.one_request(&["only one".to_string()]).await.unwrap_err();
+        let err = client
+            .one_request(&["only one".to_string()])
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         match err {
             EmbedError::Count { want, got } => {

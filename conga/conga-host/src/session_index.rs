@@ -77,6 +77,13 @@ fn block_text(content: &[conga::ContentBlock]) -> String {
 /// Project one session's event log into indexable rows. `seq` is the event's
 /// index in the log (0-based), so the high-water mark stays monotonic even
 /// though marker events produce no row.
+///
+/// SCOPE: the index covers the WHOLE log, including the rows before the
+/// last `Cleared` / `Compacted` checkpoint. That is deliberate — search is
+/// "find this in my history", not "find this in the model's current
+/// window". A hit may therefore point at text the model no longer sees;
+/// the transcript the user opens is the model-visible projection
+/// (`conga::derive_messages`), which is a different, narrower view.
 fn event_rows(events: &[SessionEvent]) -> Vec<Row> {
     events
         .iter()
@@ -119,7 +126,6 @@ fn event_rows(events: &[SessionEvent]) -> Vec<Row> {
 /// callers simply `.await` — no `spawn_blocking` needed.
 pub async fn reindex(store_root: &Path, db_path: &Path) -> anyhow::Result<Stats> {
     let pool = init_db(db_path).await?;
-    let storage = EventStorage::new(store_root);
     let mut stats = Stats::default();
     // Fresh install: no store root yet → empty index, not an error (search
     // just returns no hits). Any other read failure still fails loud.
@@ -135,8 +141,12 @@ pub async fn reindex(store_root: &Path, db_path: &Path) -> anyhow::Result<Stats>
         .filter(|id| conga::is_valid_session_id(id))
         .collect();
     ids.sort(); // deterministic order for tests and logging
+    let manager = crate::session::SessionManager::with_root(store_root.to_path_buf());
     for id in ids {
-        let events = storage.load_events_sync(&id)?;
+        // Read through the same read-only open the transcript endpoint
+        // uses, so search and transcript see the same rows — including a
+        // legacy transcript that has not been migrated yet.
+        let events = manager.open(&id).await?;
         // No mark yet → -1, so a text event at seq 0 is indexed on first run.
         let last: i64 = sqlx::query_scalar("SELECT value FROM meta WHERE key = ?1")
             .bind(&id)

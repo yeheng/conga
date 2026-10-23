@@ -371,7 +371,10 @@ mod tests {
         }
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "too-far").unwrap();
-        assert!(find_project_doc(&deep).is_none(), "the 8-level cap must hold");
+        assert!(
+            find_project_doc(&deep).is_none(),
+            "the 8-level cap must hold"
+        );
         // One level less is still found.
         let mut near = tmp.path().to_path_buf();
         for _ in 0..7 {
@@ -384,18 +387,25 @@ mod tests {
     #[tokio::test]
     async fn git_output_returns_none_outside_a_git_repository() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(git_output(tmp.path(), &["status", "--porcelain"], 64, "omitted")
-            .await
-            .is_none());
+        assert!(
+            git_output(tmp.path(), &["status", "--porcelain"], 64, "omitted")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn git_output_returns_none_for_a_failing_command() {
         let cwd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         // Inside the repo, but the ref does not exist -> nonzero exit.
-        assert!(git_output(cwd, &["rev-parse", "--verify", "no-such-ref"], 64, "omitted")
-            .await
-            .is_none());
+        assert!(git_output(
+            cwd,
+            &["rev-parse", "--verify", "no-such-ref"],
+            64,
+            "omitted"
+        )
+        .await
+        .is_none());
     }
 
     #[tokio::test]
@@ -410,9 +420,14 @@ mod tests {
     #[tokio::test]
     async fn git_output_caps_the_line_count_and_appends_the_note() {
         let cwd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let out = git_output(cwd, &["log", "--oneline", "-n", "5"], 2, "log lines omitted")
-            .await
-            .unwrap();
+        let out = git_output(
+            cwd,
+            &["log", "--oneline", "-n", "5"],
+            2,
+            "log lines omitted",
+        )
+        .await
+        .unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3, "2 kept lines + the omission note: {out}");
         assert!(lines[2].contains("[... 3 log lines omitted ...]"), "{out}");

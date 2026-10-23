@@ -87,7 +87,10 @@ mod tests {
 
     #[test]
     fn keeps_leading_indentation_but_trims_trailing_whitespace() {
-        assert_eq!(clean("  indented  \n\talso indented\t"), "  indented\n\talso indented");
+        assert_eq!(
+            clean("  indented  \n\talso indented\t"),
+            "  indented\n\talso indented"
+        );
     }
 
     #[test]

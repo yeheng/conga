@@ -39,9 +39,9 @@
   "cards": [
     {
       "dot": "emerald",
-      "title": "只缩内存,不改盘",
+      "title": "日志只追加,压缩以检查点追加",
       "items": [
-        "events.jsonl 永远 append-only,压缩只作用于本轮喂给 LLM 的 history",
+        "events.jsonl 永远 append-only:压缩只追加一条 Compacted 检查点,已有行不改",
         "无 LLM 摘要:丢弃最旧整组 + 一条前置提示,不调模型",
         "usage 随 Assistant 事件持久化,预算跨重启存活"
       ]

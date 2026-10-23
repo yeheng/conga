@@ -164,13 +164,12 @@ mod tests {
     }
 
     #[tokio::test]
+    // The env lock is deliberately held across the await: the whole
+    // point is that no other test mutates the process env meanwhile.
+    #[allow(clippy::await_holding_lock)]
     async fn headless_with_takes_typed_config_and_restores_env_pins() {
         let roots = scratch();
-        let saved = env_snapshot(&[
-            "CONGA_CONFIG_DIR",
-            "CONGA_PROJECT_DIR",
-            "CONGA_LLM_KEY",
-        ]);
+        let saved = env_snapshot(&["CONGA_CONFIG_DIR", "CONGA_PROJECT_DIR", "CONGA_LLM_KEY"]);
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CONGA_LLM_KEY");
         let spec = HeadlessSpec {
@@ -183,9 +182,15 @@ mod tests {
             max_tokens: Some(1234),
             tool_timeout_secs: None,
         };
-        let session = build_headless_with("sk-inline", &spec, roots.path(), roots.path(), Mode::FullAuto)
-            .await
-            .expect("inline headless assembly");
+        let session = build_headless_with(
+            "sk-inline",
+            &spec,
+            roots.path(),
+            roots.path(),
+            Mode::FullAuto,
+        )
+        .await
+        .expect("inline headless assembly");
         // 钉根在位（turn 进行中懒读的路径都落在 roots 内）
         assert_eq!(conga::storage::config_dir(), roots.path().join("conga"));
         assert_eq!(crate::project_dir(), roots.path());
@@ -214,6 +219,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // The env lock is deliberately held across the await: the whole
+    // point is that no other test mutates the process env meanwhile.
+    #[allow(clippy::await_holding_lock)]
     async fn headless_settings_file_cannot_reach_the_provider() {
         // The poison: a settings override that would win on the CLI path.
         let poisoned = EnvSettings {
@@ -293,9 +301,10 @@ impl Drop for ScopedEnvPin {
     }
 }
 
-/// Explicit, typed configuration for in-process hosts: provider trio + proxy
-/// + tunables arrive as values (no `CONGA_*` env round-trip), the api key as
-/// a parameter — the same never-through-env rule as [`build_headless`].
+/// Explicit, typed configuration for in-process hosts: the provider trio,
+/// the proxy and the tunables arrive as values (no `CONGA_*` env
+/// round-trip), the api key as a parameter — the same never-through-env
+/// rule as [`build_headless`].
 #[derive(Debug, Clone)]
 pub struct HeadlessSpec {
     pub base_url: String,
@@ -386,7 +395,10 @@ pub async fn build_headless_with(
     };
     let pin = ScopedEnvPin::pin(&[
         ("CONGA_CONFIG_DIR", roots.join("conga").into_os_string()),
-        ("CONGA_PROJECT_DIR", project_dir.to_path_buf().into_os_string()),
+        (
+            "CONGA_PROJECT_DIR",
+            project_dir.to_path_buf().into_os_string(),
+        ),
     ]);
     if !conga::storage::config_dir().starts_with(roots) {
         return Err(AssemblyError::Config(format!(
@@ -403,7 +415,8 @@ pub async fn build_headless_with(
             false
         })
     });
-    let quiet_emit: crate::assembly::SubagentEmit = Arc::new(|_: crate::subagent_types::SubagentEvent| {});
+    let quiet_emit: crate::assembly::SubagentEmit =
+        Arc::new(|_: crate::subagent_types::SubagentEvent| {});
     let stream_fn = cfg.provider_stream_fn();
     let host = crate::assembly::assemble_headless_host(cfg, session, mode, deny, quiet_emit).await;
     Ok(HeadlessHost {

@@ -557,7 +557,9 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/bg-1.log")),
         );
         assert!(
-            outcome.output.contains("[background output -> /tmp/bg-1.log]"),
+            outcome
+                .output
+                .contains("[background output -> /tmp/bg-1.log]"),
             "{}",
             outcome.output
         );

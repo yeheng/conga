@@ -26,7 +26,7 @@
     { "from": 785, "to": 1010, "label": "取消与收尾" }
   ],
   "messages": [
-    { "id": "w01-upgrade", "from": "fe", "to": "gw", "y": 180, "label": "WS 升级 /ws?user_id=<chatId>", "variant": "emphasis", "note": "open_or_migrate:日志损坏则拒绝连接" },
+    { "id": "w01-upgrade", "from": "fe", "to": "gw", "y": 180, "label": "WS 升级 /ws?user_id=<chatId>", "variant": "emphasis", "note": "open:日志损坏则拒绝连接" },
     { "id": "w02-ready", "from": "gw", "to": "fe", "y": 220, "label": "会话就绪 · 历史可派生", "variant": "return" },
     { "id": "w03-msg", "from": "fe", "to": "gw", "y": 300, "label": "{\"type\":\"message\",\"content\":…}", "variant": "emphasis", "note": "trace_id 关联本轮" },
     { "id": "w04-run", "from": "gw", "to": "host", "y": 338, "label": "run_turn(user_msg)" },

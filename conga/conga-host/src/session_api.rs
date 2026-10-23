@@ -67,9 +67,12 @@ pub async fn list_sessions(store_root: &Path) -> Result<Vec<SessionListItem>, Se
 }
 
 /// Backend-truth transcript for a session: `derive_messages` over the
-/// on-disk event log, migrating a legacy `messages.jsonl` once. `Ok(None)`
-/// means the session has no on-disk data (a local-only chat). A corrupt log
-/// is `Internal` (fail loud, never silently adopt).
+/// on-disk event log. `Ok(None)` means the session has no on-disk data (a
+/// local-only chat). A corrupt log is `Internal` (fail loud, never silently
+/// adopt).
+///
+/// READ-ONLY: a legacy `messages.jsonl` is converted in memory, never
+/// migrated and never deleted. Only a turn (the write path) installs it.
 pub async fn session_messages(
     store_root: &Path,
     session_id: &str,
@@ -80,7 +83,7 @@ pub async fn session_messages(
     }
     let mgr = SessionManager::with_root(store_root.to_path_buf());
     let events = mgr
-        .open_or_migrate(session_id)
+        .open(session_id)
         .await
         .map_err(|e| SessionApiError::Internal(e.to_string()))?;
     Ok(Some(conga::derive_messages(&events)))
@@ -100,7 +103,7 @@ pub async fn session_cache_stats(
     }
     let mgr = SessionManager::with_root(store_root.to_path_buf());
     let events = mgr
-        .open_or_migrate(session_id)
+        .open(session_id)
         .await
         .map_err(|e| SessionApiError::Internal(e.to_string()))?;
     Ok(Some(conga::cache_stats(&events)))

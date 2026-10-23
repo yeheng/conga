@@ -8,7 +8,7 @@
     "viewBox": [1160, 820],
     "views": [
       { "id": "produce-append", "label": "产生与落盘", "focus": ["uin", "side", "persist", "legacy", "log"], "note": "副作用发生即逐事件追加。" },
-      { "id": "project", "label": "派生投影", "focus": ["log", "derive", "compact"], "note": "历史每轮现派生,压缩只缩内存。" },
+      { "id": "project", "label": "派生投影", "focus": ["log", "derive", "compact"], "note": "历史每轮现派生,压缩追加检查点。" },
       { "id": "consume", "label": "消费面", "focus": ["compact", "llm", "rest", "fe"], "note": "模型与前端都从同一真相源取数。" }
     ]
   },
@@ -25,7 +25,7 @@
     { "id": "log", "type": "database", "label": "events.jsonl", "sublabel": "每行一条 SessionEvent", "stage": 1, "row": 2, "tag": "torn-tail 自愈", "width": 160 },
     { "id": "legacy", "type": "database", "label": "messages.jsonl", "sublabel": "旧格式迁移源", "stage": 1, "row": 4, "tag": "迁移后删除", "width": 150 },
     { "id": "derive", "type": "backend", "label": "derive_messages", "sublabel": "TurnStart/End 不产出", "stage": 2, "row": 0, "tag": "纯投影", "width": 150 },
-    { "id": "compact", "type": "backend", "label": "ContextBudget 压缩", "sublabel": "只缩内存 · 预算自尾部", "stage": 2, "row": 2, "width": 160 },
+    { "id": "compact", "type": "backend", "label": "ContextBudget 压缩", "sublabel": "追加检查点 · 预算自尾部", "stage": 2, "row": 2, "width": 160 },
     { "id": "rest", "type": "backend", "label": "REST 转录端点", "sublabel": "按需派生 · 未知 key 404", "stage": 2, "row": 4, "width": 160 },
     { "id": "llm", "type": "external", "label": "LLM Provider", "sublabel": "模型可见消息", "stage": 3, "row": 1, "width": 140 },
     { "id": "fe", "type": "frontend", "label": "前端 / CLI", "sublabel": "会话恢复 · 转录", "stage": 3, "row": 3, "width": 140 }
@@ -56,7 +56,7 @@
       "title": "投影无状态",
       "items": [
         "derive_messages 是纯函数:事件日志 → 模型可见消息",
-        "压缩只作用于工作内存,日志永远完整",
+        "压缩只追加 Compacted 检查点,历史行永不修改",
         "torn-tail 自愈丢崩溃截断行;中段损坏 fail-closed 报行号"
       ]
     },

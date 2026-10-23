@@ -328,7 +328,16 @@ pub(crate) async fn assemble_headless_host(
     subagent_emit: SubagentEmit,
 ) -> Host {
     let tools = gather_tools(Vec::new(), Vec::new(), true).await;
-    assemble_host(cfg, session, mode, approver, Vec::new(), tools, subagent_emit).await
+    assemble_host(
+        cfg,
+        session,
+        mode,
+        approver,
+        Vec::new(),
+        tools,
+        subagent_emit,
+    )
+    .await
 }
 
 /// The one Host assembly shared by every caller of this module:
@@ -567,7 +576,10 @@ mod tests {
         )
         .await;
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"bash"), "built-ins are always present: {names:?}");
+        assert!(
+            names.contains(&"bash"),
+            "built-ins are always present: {names:?}"
+        );
         let i_pre = names.iter().position(|n| *n == "ext_pre").unwrap();
         let i_post = names.iter().position(|n| *n == "ext_post").unwrap();
         assert!(i_pre < i_post, "prepend outranks append: {names:?}");
@@ -636,7 +648,9 @@ mod tests {
                 "main-model".into(),
             )
             .unwrap(),
-            tunables: conga::AgentTunables::from_env_with(&|_k| Err(std::env::VarError::NotPresent)),
+            tunables: conga::AgentTunables::from_env_with(&|_k| {
+                Err(std::env::VarError::NotPresent)
+            }),
         }
     }
 

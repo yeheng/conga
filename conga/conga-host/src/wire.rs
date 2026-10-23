@@ -312,10 +312,7 @@ mod tests {
         assert!(desc.ends_with("..."), "{desc}");
         assert_eq!(desc.chars().count(), 303);
         // The raw arguments keep the full payload.
-        assert_eq!(
-            v["arguments"].as_str().unwrap(),
-            args.to_string().as_str()
-        );
+        assert_eq!(v["arguments"].as_str().unwrap(), args.to_string().as_str());
     }
 
     #[test]

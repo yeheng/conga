@@ -12,7 +12,6 @@ use conga::{
 
 pub mod approval;
 pub mod assembly;
-pub mod headless;
 pub mod compact;
 pub mod config;
 pub mod event_map;
@@ -20,6 +19,7 @@ pub mod evolve;
 #[cfg(feature = "ext-js")]
 pub mod ext_js;
 pub mod external_tool;
+pub mod headless;
 pub mod hooks;
 pub mod mcp;
 pub mod memory;
@@ -403,8 +403,10 @@ impl Host {
 
         let sid = self.session.current_id();
         // Open (migrating a legacy transcript once, if any), fail closed on
-        // corruption, then frame the turn.
-        let events = self.session.open_or_migrate(&sid).await?;
+        // corruption, then frame the turn. This is the WRITE path: a turn
+        // appends to the log, so it is the right place to install a legacy
+        // transcript. Read-only callers use `SessionManager::open`.
+        let events = self.session.migrate(&sid).await?;
         self.session.append_event(&SessionEvent::TurnStart).await?;
 
         // Restore the token budget from the log tail (the last persisted
@@ -416,7 +418,7 @@ impl Host {
         // the checkpoint (e.g. the turn right after one) simply means
         // occupancy is unknown-yet-small; the next provider report sets it
         // straight — that is the hysteresis.
-        let live = conga::live_range_start(&events);
+        let live = conga::view_scope_start(&events);
         let mut budget = self.budget.clone();
         if let Some(input_tokens) = events[live..].iter().rev().find_map(|ev| match ev {
             SessionEvent::Assistant { usage, .. } => usage.as_ref().map(|u| u.input_tokens),
@@ -1059,7 +1061,9 @@ mod tests {
                 .unwrap();
             session
                 .append_event(&SessionEvent::Assistant {
-                    message: AgentMessage::Assistant(conga::AssistantMessage::new(&"m".to_string())),
+                    message: AgentMessage::Assistant(conga::AssistantMessage::new(
+                        &"m".to_string(),
+                    )),
                     usage: None,
                 })
                 .await
@@ -1129,12 +1133,11 @@ mod tests {
             name: &'a str,
             _: &'a serde_json::Value,
             _: conga::RiskLevel,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = conga::ToolCallVerdict> + Send + 'a>,
-        > {
-            Box::pin(async move {
-                conga::ToolCallVerdict::Block(format!("blocked-by-hook:{name}"))
-            })
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = conga::ToolCallVerdict> + Send + 'a>>
+        {
+            Box::pin(
+                async move { conga::ToolCallVerdict::Block(format!("blocked-by-hook:{name}")) },
+            )
         }
         fn after_tool_call(
             &self,
@@ -1215,7 +1218,10 @@ mod tests {
         );
         assert!(host.spawner().is_none());
         let host = host.with_spawner(Arc::new(NoopSubagentSpawner));
-        assert!(host.spawner().is_some(), "the wired spawner must be exposed");
+        assert!(
+            host.spawner().is_some(),
+            "the wired spawner must be exposed"
+        );
     }
 
     // ── evolve ──────────────────────────────────────────────────

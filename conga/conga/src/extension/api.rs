@@ -201,7 +201,10 @@ mod tests {
         // The definition itself is stored verbatim (label, schema, risk).
         assert_eq!(api.tools[0].label, "alpha");
         assert_eq!(api.tools[0].risk, RiskLevel::Low);
-        assert_eq!(api.tools[0].parameters, serde_json::json!({"type": "object"}));
+        assert_eq!(
+            api.tools[0].parameters,
+            serde_json::json!({"type": "object"})
+        );
     }
 
     /// The trait object is the surface extension crates use; registering

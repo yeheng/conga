@@ -106,8 +106,13 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = run_search(&cfg, "match", 5, Some("no-such-source")).await.unwrap();
-        assert!(hits.is_empty(), "an unknown source must not match: {hits:?}");
+        let hits = run_search(&cfg, "match", 5, Some("no-such-source"))
+            .await
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "an unknown source must not match: {hits:?}"
+        );
     }
 
     /// k = 0 asks for no result at all: the search must stay empty instead

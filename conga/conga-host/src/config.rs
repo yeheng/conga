@@ -237,16 +237,16 @@ mod tests {
         let cfg = test_cfg(&[]);
         let signal = CancelSignal::new();
         signal.cancel();
-        assert!(signal.is_cancelled(), "precondition: the signal is cancelled");
+        assert!(
+            signal.is_cancelled(),
+            "precondition: the signal is cancelled"
+        );
 
         let history = vec![AgentMessage::User(conga::UserMessage {
             content: vec![conga::ContentBlock::text("hi".to_string())],
             timestamp: 1,
         })];
-        let tools = vec![crate::tools::built_in_tools()
-            .into_iter()
-            .next()
-            .unwrap()];
+        let tools = vec![crate::tools::built_in_tools().into_iter().next().unwrap()];
         let (context, config) = cfg.prepare_turn(
             TurnInputs {
                 system_prompt: "sys",

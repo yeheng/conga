@@ -124,14 +124,162 @@ fn surface(ev: &SessionEvent) -> Option<AgentMessage> {
     }
 }
 
-/// Index (0-based) of the first event a checkpointed log still projects
-/// from — i.e. just past the last [`SessionEvent::Cleared`] or
+/// A log row reduced to what the model-visible projection needs.
+///
+/// Every consumer of the event log reduces its input to this first — the
+/// full projection, the row-level counter, the index builder — so "what
+/// the model sees" has exactly ONE implementation instead of one per
+/// call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowView {
+    /// Projects to one model-visible message (`User` / `Assistant` /
+    /// `ToolResult`).
+    Message,
+    /// A compaction checkpoint whose frozen `base` holds this many
+    /// messages. Everything before it stops being projected.
+    Compacted { base_len: usize },
+    /// A `/clear` marker: the conversation restarts empty.
+    Cleared,
+    /// Projects to nothing (`TurnStart` / `TurnEnd` / unknown variant).
+    Inactive,
+}
+
+/// Reduce a parsed event to its projection contribution.
+pub fn row_view(ev: &SessionEvent) -> RowView {
+    match ev {
+        SessionEvent::User(_) | SessionEvent::Assistant { .. } | SessionEvent::ToolResult(_) => {
+            RowView::Message
+        }
+        SessionEvent::Cleared => RowView::Cleared,
+        SessionEvent::Compacted { base, .. } => RowView::Compacted {
+            base_len: base.len(),
+        },
+        SessionEvent::TurnStart | SessionEvent::TurnEnd { .. } => RowView::Inactive,
+    }
+}
+
+/// Fold log rows (in log order) into the model-visible message count.
+///
+/// A checkpoint REPLACES the count so far: `Cleared` resets it to zero,
+/// `Compacted` sets it to the size of the frozen base. This is exactly the
+/// scope rule [`derive_messages`] applies, expressed on the reduced row so
+/// a cheap row-level scan reuses it instead of re-deriving the rule.
+pub fn visible_count_from_rows<I: IntoIterator<Item = RowView>>(rows: I) -> usize {
+    let mut count = 0usize;
+    for row in rows {
+        match row {
+            RowView::Message => count += 1,
+            RowView::Compacted { base_len } => count = base_len,
+            RowView::Cleared => count = 0,
+            RowView::Inactive => {}
+        }
+    }
+    count
+}
+
+/// The number of model-visible messages a log projects to.
+///
+/// Equal to `derive_messages(log).len()` by construction.
+pub fn visible_message_count(log: &[SessionEvent]) -> usize {
+    visible_count_from_rows(log.iter().map(row_view))
+}
+
+/// Reduce one raw JSONL row to its projection contribution, WITHOUT
+/// materializing the row's payload.
+///
+/// `None` = the row is not a decodable event row (torn tail, not JSON) and
+/// contributes nothing. An unknown variant decodes to
+/// [`RowView::Inactive`] — the same "skip" the full projection gives it.
+pub fn row_view_from_json(line: &str) -> Option<RowView> {
+    let probe: RowProbe = serde_json::from_str(line).ok()?;
+    Some(match probe.kind.as_str() {
+        "user" | "assistant" | "tool_result" => RowView::Message,
+        "cleared" => RowView::Cleared,
+        "compacted" => RowView::Compacted {
+            base_len: probe.base.map_or(0, |b| b.0),
+        },
+        _ => RowView::Inactive,
+    })
+}
+
+/// Minimal probe of an event row: the variant discriminant plus, for a
+/// compaction checkpoint, the LENGTH of its frozen base. The length is
+/// counted without materializing the base's messages — a compacted base
+/// can carry megabytes of tool output.
+#[derive(serde::Deserialize)]
+struct RowProbe {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    base: Option<BaseLen>,
+}
+
+/// The number of elements in a JSON array, counted without allocating
+/// them.
+struct BaseLen(usize);
+
+impl<'de> serde::Deserialize<'de> for BaseLen {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BaseLenVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BaseLenVisitor {
+            type Value = BaseLen;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an array of messages")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<BaseLen, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut len = 0usize;
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    len += 1;
+                }
+                Ok(BaseLen(len))
+            }
+        }
+
+        deserializer.deserialize_seq(BaseLenVisitor)
+    }
+}
+
+/// Index (0-based) of the first event the model-visible view still
+/// projects from — i.e. just past the last [`SessionEvent::Cleared`] or
 /// [`SessionEvent::Compacted`], or 0 when neither appears. Hosts use this
 /// to scope log-tail scans (e.g. the compaction budget's usage restore) to
 /// the post-checkpoint slice, matching [`derive_messages`]: a usage row
 /// from before a checkpoint describes history that no longer exists.
-pub fn live_range_start(log: &[SessionEvent]) -> usize {
+///
+/// This is THE scope of the model-visible view. Anything that needs to
+/// know "which part of the log is still in play" uses this function —
+/// there is no second predicate.
+pub fn view_scope_start(log: &[SessionEvent]) -> usize {
     log.iter().rposition(is_checkpoint).map_or(0, |i| i + 1)
+}
+
+/// Index (0-based) of the first event that still belongs to the
+/// conversation for BILLING purposes — i.e. just past the last
+/// [`SessionEvent::Cleared`], or 0 when none appears.
+///
+/// Deliberately different from [`view_scope_start`]: tokens billed before
+/// a compaction checkpoint are still facts about this conversation, even
+/// though the checkpoint stops them from being projected into the model's
+/// view. Only `/clear` starts a new conversation.
+pub fn billing_scope_start(log: &[SessionEvent]) -> usize {
+    log.iter()
+        .rposition(is_conversation_reset)
+        .map_or(0, |i| i + 1)
+}
+
+/// True at conversation resets: `/clear` starts a NEW conversation, a
+/// compaction checkpoint does not (same conversation, shorter window).
+fn is_conversation_reset(ev: &SessionEvent) -> bool {
+    matches!(ev, SessionEvent::Cleared)
 }
 
 /// Session-wide prompt-cache accounting, folded from the persisted usage
@@ -163,12 +311,9 @@ impl CacheStats {
 }
 
 /// Fold the log's usage rows into [`CacheStats`] (scoped past the last
-/// `Cleared`, like the conversation itself).
+/// `Cleared`, like the conversation itself — see [`billing_scope_start`]).
 pub fn cache_stats(log: &[SessionEvent]) -> CacheStats {
-    let from = log
-        .iter()
-        .rposition(|ev| matches!(ev, SessionEvent::Cleared))
-        .map_or(0, |i| i + 1);
+    let from = billing_scope_start(log);
     log[from..].iter().fold(CacheStats::default(), |mut s, ev| {
         if let SessionEvent::Assistant { usage: Some(u), .. } = ev {
             s.input_tokens += u.input_tokens;
@@ -255,8 +400,9 @@ pub fn repair_unanswered_tool_calls(messages: &mut Vec<AgentMessage>) {
 mod tests {
     use crate::types::message::AgentMessage;
     use crate::types::session_event::{
-        cache_stats, derive_messages, live_range_start, CancelCause, SessionEvent, TurnEndReason,
-        Usage,
+        billing_scope_start, cache_stats, derive_messages, row_view, row_view_from_json,
+        view_scope_start, visible_count_from_rows, visible_message_count, CancelCause, RowView,
+        SessionEvent, TurnEndReason, Usage,
     };
 
     #[test]
@@ -330,14 +476,14 @@ mod tests {
     }
 
     #[test]
-    fn live_range_start_matches_derive() {
+    fn view_scope_start_matches_derive() {
         let log = vec![
             SessionEvent::User(AgentMessage::user("a")),
             SessionEvent::Cleared,
             SessionEvent::User(AgentMessage::user("b")),
         ];
-        assert_eq!(live_range_start(&log), 2);
-        assert_eq!(live_range_start(&log[..1]), 0, "never cleared -> 0");
+        assert_eq!(view_scope_start(&log), 2);
+        assert_eq!(view_scope_start(&log[..1]), 0, "never cleared -> 0");
     }
 
     #[test]
@@ -390,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn live_range_start_recognizes_compacted() {
+    fn view_scope_start_recognizes_compacted() {
         let log = vec![
             SessionEvent::User(AgentMessage::user("a")),
             SessionEvent::Compacted {
@@ -399,7 +545,221 @@ mod tests {
             },
             SessionEvent::User(AgentMessage::user("b")),
         ];
-        assert_eq!(live_range_start(&log), 2);
+        assert_eq!(view_scope_start(&log), 2);
+    }
+
+    // ---- scope functions --------------------------------------------------
+
+    #[test]
+    fn billing_scope_start_ignores_compacted_checkpoints() {
+        // Billing scope = the CONVERSATION, not the view: a compaction
+        // checkpoint shortens the model's window but does not start a new
+        // conversation, so the tokens billed before it still count.
+        let log = vec![
+            SessionEvent::User(AgentMessage::user("a")),
+            SessionEvent::Compacted {
+                base: vec![],
+                dropped: 1,
+            },
+            SessionEvent::User(AgentMessage::user("b")),
+        ];
+        assert_eq!(billing_scope_start(&log), 0, "compaction is not a reset");
+        assert_eq!(
+            view_scope_start(&log),
+            2,
+            "the view restarts at the checkpoint"
+        );
+    }
+
+    #[test]
+    fn billing_scope_start_stops_at_the_last_cleared() {
+        let log = vec![
+            SessionEvent::User(AgentMessage::user("a")),
+            SessionEvent::Cleared,
+            SessionEvent::User(AgentMessage::user("b")),
+        ];
+        assert_eq!(billing_scope_start(&log), 2);
+    }
+
+    #[test]
+    fn billing_scope_start_of_a_log_without_cleared_is_zero() {
+        let log = vec![SessionEvent::User(AgentMessage::user("a"))];
+        assert_eq!(billing_scope_start(&log), 0);
+    }
+
+    // ---- visible count ----------------------------------------------------
+
+    #[test]
+    fn visible_message_count_matches_the_projection() {
+        let log = vec![
+            SessionEvent::TurnStart,
+            SessionEvent::User(AgentMessage::user("a")),
+            SessionEvent::Assistant {
+                message: AgentMessage::assistant_text("b"),
+                usage: None,
+            },
+            SessionEvent::ToolResult(tool_result("t1")),
+            SessionEvent::TurnEnd {
+                reason: TurnEndReason::Completed,
+            },
+        ];
+        assert_eq!(visible_message_count(&log), derive_messages(&log).len());
+        assert_eq!(visible_message_count(&log), 3);
+    }
+
+    #[test]
+    fn visible_message_count_restarts_at_a_compacted_checkpoint() {
+        // The checkpoint's frozen base REPLACES everything before it.
+        let log = vec![
+            SessionEvent::User(AgentMessage::user("old1")),
+            SessionEvent::User(AgentMessage::user("old2")),
+            SessionEvent::Compacted {
+                base: vec![AgentMessage::user("pinned task")],
+                dropped: 1,
+            },
+            SessionEvent::User(AgentMessage::user("new")),
+        ];
+        assert_eq!(visible_message_count(&log), derive_messages(&log).len());
+        assert_eq!(
+            visible_message_count(&log),
+            2,
+            "base + one appended message"
+        );
+    }
+
+    #[test]
+    fn visible_message_count_resets_at_a_cleared_marker() {
+        let log = vec![
+            SessionEvent::User(AgentMessage::user("old")),
+            SessionEvent::Cleared,
+            SessionEvent::User(AgentMessage::user("new")),
+        ];
+        assert_eq!(visible_message_count(&log), derive_messages(&log).len());
+        assert_eq!(visible_message_count(&log), 1);
+    }
+
+    #[test]
+    fn visible_count_from_rows_applies_the_checkpoint_rules() {
+        let rows = vec![
+            RowView::Message,
+            RowView::Message,
+            RowView::Inactive,
+            RowView::Compacted { base_len: 5 },
+            RowView::Message,
+            RowView::Cleared,
+            RowView::Message,
+        ];
+        assert_eq!(visible_count_from_rows(rows), 1);
+    }
+
+    #[test]
+    fn row_view_reduces_an_event_to_its_contribution() {
+        assert_eq!(
+            row_view(&SessionEvent::User(AgentMessage::user("a"))),
+            RowView::Message
+        );
+        assert_eq!(
+            row_view(&SessionEvent::TurnStart),
+            RowView::Inactive,
+            "markers project to nothing"
+        );
+        assert_eq!(row_view(&SessionEvent::Cleared), RowView::Cleared);
+        assert_eq!(
+            row_view(&SessionEvent::Compacted {
+                base: vec![AgentMessage::user("a"), AgentMessage::user("b")],
+                dropped: 3,
+            }),
+            RowView::Compacted { base_len: 2 }
+        );
+    }
+
+    // ---- row-level probe --------------------------------------------------
+
+    #[test]
+    fn row_view_from_json_reads_the_discriminant() {
+        assert_eq!(
+            row_view_from_json(r#"{"type":"user"}"#),
+            Some(RowView::Message)
+        );
+        assert_eq!(
+            row_view_from_json(r#"{"type":"assistant"}"#),
+            Some(RowView::Message)
+        );
+        assert_eq!(
+            row_view_from_json(r#"{"type":"tool_result"}"#),
+            Some(RowView::Message)
+        );
+        assert_eq!(
+            row_view_from_json(r#"{"type":"cleared"}"#),
+            Some(RowView::Cleared)
+        );
+        assert_eq!(
+            row_view_from_json(r#"{"type":"turn_start"}"#),
+            Some(RowView::Inactive)
+        );
+    }
+
+    #[test]
+    fn row_view_from_json_counts_a_compacted_base() {
+        let row = r#"{"type":"compacted","base":[{"a":1},{"b":2},{"c":3}],"dropped":7}"#;
+        assert_eq!(
+            row_view_from_json(row),
+            Some(RowView::Compacted { base_len: 3 })
+        );
+    }
+
+    #[test]
+    fn row_view_from_json_ignores_undecodable_rows() {
+        assert_eq!(row_view_from_json(r#"{"type":"user""#), None, "torn tail");
+        assert_eq!(row_view_from_json("not json at all"), None);
+        assert_eq!(row_view_from_json(r#"{"no_type":true}"#), None);
+    }
+
+    #[test]
+    fn row_view_from_json_treats_an_unknown_variant_as_inactive() {
+        assert_eq!(
+            row_view_from_json(r#"{"type":"future_variant"}"#),
+            Some(RowView::Inactive)
+        );
+    }
+
+    #[test]
+    fn the_row_probe_and_the_projection_agree_on_a_real_log() {
+        // The row-level probe is a cheap path to the SAME answer the full
+        // projection gives. If these two ever drift, the session list and
+        // the model disagree about the conversation.
+        let log = vec![
+            SessionEvent::TurnStart,
+            SessionEvent::User(AgentMessage::user("a")),
+            SessionEvent::Assistant {
+                message: AgentMessage::assistant_text("b"),
+                usage: None,
+            },
+            SessionEvent::TurnEnd {
+                reason: TurnEndReason::Completed,
+            },
+            SessionEvent::Compacted {
+                base: vec![AgentMessage::user("pinned")],
+                dropped: 2,
+            },
+            SessionEvent::User(AgentMessage::user("c")),
+            SessionEvent::Cleared,
+            SessionEvent::User(AgentMessage::user("d")),
+        ];
+        let rows: Vec<RowView> = log
+            .iter()
+            .filter_map(|ev| {
+                serde_json::to_string(ev)
+                    .ok()
+                    .and_then(|line| row_view_from_json(&line))
+            })
+            .collect();
+        assert_eq!(
+            visible_count_from_rows(rows),
+            visible_message_count(&log),
+            "the row probe and the full projection must agree"
+        );
+        assert_eq!(visible_message_count(&log), derive_messages(&log).len());
     }
 
     #[test]

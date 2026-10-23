@@ -41,55 +41,48 @@ impl Default for SessionManager {
     }
 }
 
-/// Count model-visible messages in one transcript's raw contents, mirroring
-/// [`derive_messages`]: only `User`/`Assistant`/`ToolResult` rows count, and
-/// everything up to the last `Cleared` marker is not counted (the cleared
-/// prefix is history on disk, not conversation). A legacy `messages.jsonl`
-/// (pre-migration) holds one message per non-empty line. A torn/unparseable
-/// event row is not a message and is skipped.
+/// Count model-visible messages in one transcript's raw contents.
+///
+/// The event-log branch reuses the CORE projection rules
+/// (`conga::visible_count_from_rows`): a `/clear` marker resets the count
+/// to zero, a `Compacted` checkpoint sets it to the size of its frozen
+/// base — exactly what the model sees (`conga::derive_messages`). The
+/// row-level probe (`conga::row_view_from_json`) keeps the count cheap on
+/// large logs (a session holds megabytes of tool output per row). A legacy
+/// `messages.jsonl` (pre-migration) holds one message per non-empty line. A
+/// torn/unparseable event row is not a message and is skipped.
 fn count_messages(raw: &str, is_events: bool) -> usize {
-    raw.lines()
-        .filter(|l| !l.trim().is_empty())
-        .fold(0usize, |count, line| {
-            if !is_events {
-                return count + 1;
-            }
-            match serde_json::from_str::<EventTypeProbe>(line)
-                .map(|p| p.kind)
-                .as_deref()
-            {
-                Ok("user" | "assistant" | "tool_result") => count + 1,
-                Ok("cleared") => 0,
-                _ => count,
-            }
-        })
-}
-
-/// Type-only probe for [`count_messages`]: counting rows must not
-/// materialize each row's full `SessionEvent` (a large session holds
-/// megabytes of tool output per row). serde skips unknown fields without
-/// allocating, so only the discriminant string is built. Unknown `type`
-/// values (a newer writer's variants) hit the catch-all arm — the same skip
-/// a full-parse failure produced.
-#[derive(serde::Deserialize)]
-struct EventTypeProbe {
-    #[serde(rename = "type")]
-    kind: String,
+    if !is_events {
+        // A pre-migration messages.jsonl holds one message per non-empty line.
+        return raw.lines().filter(|l| !l.trim().is_empty()).count();
+    }
+    conga::visible_count_from_rows(raw.lines().filter_map(conga::row_view_from_json))
 }
 
 /// `msg_count` cache keys stored in the session's `meta.json` sidecar.
 /// Additive — core's `SessionMeta` reader ignores unknown fields, so the
 /// display name written by rename flows keeps working. `msg_count` is the
 /// model-visible message count; `msg_count_bytes` is the `events.jsonl`
-/// size it was computed at (the freshness check: appends grow the file).
+/// size it was computed at (the freshness check: appends grow the file);
+/// `msg_count_rule` names the counting rule that produced it.
 const META_MSG_COUNT: &str = "msg_count";
 const META_MSG_COUNT_BYTES: &str = "msg_count_bytes";
+const META_MSG_COUNT_RULE: &str = "msg_count_rule";
+
+/// The counting rule this build implements. Bump it whenever the rule
+/// changes: a cache written by the previous rule would otherwise keep
+/// serving its (now wrong) number until the log happens to grow.
+const MSG_COUNT_RULE: &str = "v2-compacted-aware";
 
 /// Read the cached `(msg_count, events_bytes)` pair from a `meta.json`.
-/// `None` when the sidecar is missing, unreadable, or predates the cache.
+/// `None` when the sidecar is missing, unreadable, predates the cache, or
+/// was written by a different counting rule.
 async fn read_msg_count_cache(meta_path: &std::path::Path) -> Option<(usize, u64)> {
     let raw = tokio::fs::read(meta_path).await.ok()?;
     let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    if v.get(META_MSG_COUNT_RULE)?.as_str()? != MSG_COUNT_RULE {
+        return None;
+    }
     Some((
         v.get(META_MSG_COUNT)?.as_u64()? as usize,
         v.get(META_MSG_COUNT_BYTES)?.as_u64()?,
@@ -108,6 +101,7 @@ async fn write_msg_count_cache(meta_path: &std::path::Path, count: usize, events
         if let Some(map) = v.as_object_mut() {
             map.insert(META_MSG_COUNT.into(), count.into());
             map.insert(META_MSG_COUNT_BYTES.into(), events_len.into());
+            map.insert(META_MSG_COUNT_RULE.into(), MSG_COUNT_RULE.into());
         }
         // Unique tmp name: concurrent `list` self-heals of the same session
         // must not write through one shared `meta.json.tmp`.
@@ -119,6 +113,29 @@ async fn write_msg_count_cache(meta_path: &std::path::Path, count: usize, events
         Ok::<(), std::io::Error>(())
     };
     let _ = write.await;
+}
+
+/// Wrap legacy messages into session events.
+///
+/// A legacy row the event vocabulary cannot express — a plugin-private
+/// `Custom` message — is SKIPPED with a warning instead of failing the
+/// whole transcript: such a message is not model-visible anyway (the LLM
+/// boundary filters it), and refusing to read the session because of it
+/// would make an otherwise healthy conversation unreadable.
+fn legacy_to_events(legacy: &[AgentMessage], session_id: &str) -> Vec<SessionEvent> {
+    legacy
+        .iter()
+        .filter_map(|msg| {
+            let ev = SessionEvent::from_message(msg, None);
+            if ev.is_none() {
+                tracing::warn!(
+                    session = %session_id,
+                    "legacy row cannot be represented as a session event; skipped"
+                );
+            }
+            ev
+        })
+        .collect()
 }
 
 impl SessionManager {
@@ -139,14 +156,51 @@ impl SessionManager {
         self.current_id.lock().clone()
     }
 
-    /// 打开或迁移:events.jsonl 存在 → load;否则 messages.jsonl 存在 →
-    /// 旧消息逐条 `SessionEvent::from_message` 包裹,经 tmp+rename 原子
-    /// 写入 events.jsonl,迁移成功后删除旧 messages.jsonl(D1:不保留);
-    /// 两者皆无 → 新会话。中间行损坏 → `Err`(fail closed,绝不 adopt)。
+    /// Open a session READ-ONLY: `events.jsonl` exists → load; otherwise a
+    /// legacy `messages.jsonl` is converted IN MEMORY (nothing is written,
+    /// nothing is deleted).
+    ///
+    /// This is what read endpoints use. Opening a session must never
+    /// MIGRATE the user's disk — a GET that migrates (and deletes the
+    /// legacy file) is a write disguised as a read.
+    ///
+    /// The one disk write a read can still do is the documented torn-tail
+    /// self-heal inside the event-log reader: an incomplete LAST line (a
+    /// crash artifact) is dropped and the file is truncated at its start.
+    /// A mid-file corruption is never healed — it fails closed.
+    ///
+    /// Middle-row corruption → `Err` (fail closed, never adopt).
     ///
     /// Does not change the current-session cursor; [`resume`](Self::resume)
     /// adopts the id on top of this.
-    pub async fn open_or_migrate(&self, session_id: &str) -> Result<Vec<SessionEvent>, AgentError> {
+    pub async fn open(&self, session_id: &str) -> Result<Vec<SessionEvent>, AgentError> {
+        if self.storage.has_events(session_id) {
+            return self.storage.load_events(session_id).await;
+        }
+        let legacy = self.storage.load_messages(session_id).await?;
+        Ok(legacy_to_events(&legacy, session_id))
+    }
+
+    /// Open a session, migrating a legacy transcript ONCE if needed.
+    ///
+    /// The legacy rows are installed atomically (tmp + rename) into
+    /// `events.jsonl`, and the legacy file is deleted only after the
+    /// install succeeded. This is the WRITE path — use it where the
+    /// session is about to be written (a turn), not where it is only read.
+    ///
+    /// Crash windows:
+    ///  * before the rename — only the `.tmp` exists, `has_events` stays
+    ///    false, and the next migrate re-migrates from the untouched legacy
+    ///    (idempotent; the stale `.tmp` is replaced wholesale).
+    ///  * after the rename, before `delete_legacy` — events.jsonl is
+    ///    complete and `has_events` short-circuits to it, so the leftover
+    ///    legacy file is inert and is deliberately left in place: D1's
+    ///    "delete after success" is satisfied at the rename boundary, and
+    ///    a second opportunistic cleanup pass is not worth the code.
+    ///
+    /// Does not change the current-session cursor; [`resume`](Self::resume)
+    /// adopts the id on top of this.
+    pub async fn migrate(&self, session_id: &str) -> Result<Vec<SessionEvent>, AgentError> {
         if self.storage.has_events(session_id) {
             return self.storage.load_events(session_id).await;
         }
@@ -155,25 +209,14 @@ impl SessionManager {
             // Neither an event log nor legacy content: fresh session.
             return Ok(Vec::new());
         }
-        let mut events = Vec::with_capacity(legacy.len());
-        for msg in &legacy {
-            let ev = SessionEvent::from_message(msg, None).ok_or_else(|| {
-                AgentError::Transcript(format!(
-                    "session {session_id}: legacy row cannot be represented as a session event"
-                ))
-            })?;
-            events.push(ev);
+        let events = legacy_to_events(&legacy, session_id);
+        if events.is_empty() {
+            // Nothing representable: leave the legacy file alone rather
+            // than installing an empty log and deleting the original.
+            return Ok(Vec::new());
         }
         // Atomic install (tmp + rename): a crash can never leave a torn
-        // events.jsonl shadowing the intact legacy file. Crash windows:
-        //  * before the rename — only the `.tmp` exists, `has_events` stays
-        //    false, and the next open re-migrates from the untouched legacy
-        //    (idempotent; the stale `.tmp` is replaced wholesale).
-        //  * after the rename, before `delete_legacy` — events.jsonl is
-        //    complete and `has_events` short-circuits to it, so the leftover
-        //    legacy file is inert and is deliberately left in place: D1's
-        //    "delete after success" is satisfied at the rename boundary, and
-        //    a second opportunistic cleanup pass is not worth the code.
+        // events.jsonl shadowing the intact legacy file.
         self.storage
             .append_events_atomic(session_id, &events)
             .await?;
@@ -208,7 +251,7 @@ impl SessionManager {
     /// a shared `&SessionManager` (no `&mut` gymnastics).
     pub async fn resume(&self, id: &str) -> Result<Vec<AgentMessage>, crate::HostError> {
         let events = self
-            .open_or_migrate(id)
+            .open(id)
             .await
             .map_err(|e| crate::HostError::Session(e.to_string()))?;
         *self.current_id.lock() = id.to_string();
@@ -464,7 +507,7 @@ mod tests {
             if matches!(&u.content[0], conga::ContentBlock::Text { text } if text == "after clear")));
 
         // The log on disk kept the pre-clear rows (append-only intact).
-        let events = sm2.open_or_migrate(&id).await.unwrap();
+        let events = sm2.open(&id).await.unwrap();
         assert!(events.contains(&SessionEvent::Cleared));
         assert!(events.iter().any(|ev| matches!(ev,
             SessionEvent::User(m) if matches!(m, AgentMessage::User(u)
@@ -491,7 +534,7 @@ mod tests {
         let persist = sm.persist_fn();
         persist(&user_event("via-callback")).unwrap();
 
-        let events = sm.open_or_migrate("persisted").await.unwrap();
+        let events = sm.open("persisted").await.unwrap();
         assert_eq!(events, vec![user_event("via-callback")]);
     }
 
@@ -502,6 +545,108 @@ mod tests {
             raw.push('\n');
         }
         std::fs::write(dir.join("messages.jsonl"), raw).unwrap();
+    }
+
+    /// A read endpoint must not write: opening a legacy session converts
+    /// it IN MEMORY and leaves the disk exactly as it was.
+    #[tokio::test]
+    async fn open_does_not_touch_the_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "legacy-readonly";
+        let dir = tmp.path().join(sid);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = vec![user_msg("hello"), user_msg("again")];
+        write_legacy(&dir, &legacy);
+
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let events = sm.open(sid).await.unwrap();
+        assert_eq!(derive_messages(&events), legacy);
+        assert!(
+            dir.join("messages.jsonl").exists(),
+            "a read must not delete the legacy file"
+        );
+        assert!(
+            !dir.join("events.jsonl").exists(),
+            "a read must not install a migrated log"
+        );
+    }
+
+    /// The write path installs the legacy transcript and removes it.
+    #[tokio::test]
+    async fn migrate_installs_the_legacy_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "legacy-migrate";
+        let dir = tmp.path().join(sid);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = vec![user_msg("hello"), user_msg("again")];
+        write_legacy(&dir, &legacy);
+
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let events = sm.migrate(sid).await.unwrap();
+        assert_eq!(derive_messages(&events), legacy);
+        assert!(dir.join("events.jsonl").exists());
+        assert!(!dir.join("messages.jsonl").exists());
+    }
+
+    /// A legacy row the event vocabulary cannot express (a plugin-private
+    /// `Custom` message) must not make the whole session unreadable: it is
+    /// skipped, the rest of the transcript is served.
+    #[tokio::test]
+    async fn open_skips_a_legacy_row_the_event_vocabulary_cannot_express() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "legacy-custom";
+        let dir = tmp.path().join(sid);
+        std::fs::create_dir_all(&dir).unwrap();
+        let custom = AgentMessage::Custom(conga::types::message::CustomMessage {
+            custom_type: "todo.list".into(),
+            content: serde_json::json!({"items": []}),
+            timestamp: 1,
+        });
+        write_legacy(&dir, &[user_msg("before"), custom, user_msg("after")]);
+
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let events = sm.open(sid).await.unwrap();
+        let projected = derive_messages(&events);
+        assert_eq!(projected.len(), 2, "the two user rows survive");
+        assert_eq!(text_of_first(&projected[0]), "before");
+        assert_eq!(text_of_first(&projected[1]), "after");
+    }
+
+    /// The same tolerant handling on the write path: the representable
+    /// rows are installed, the legacy file goes away.
+    #[tokio::test]
+    async fn migrate_skips_a_legacy_row_the_event_vocabulary_cannot_express() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "legacy-custom-migrate";
+        let dir = tmp.path().join(sid);
+        std::fs::create_dir_all(&dir).unwrap();
+        let custom = AgentMessage::Custom(conga::types::message::CustomMessage {
+            custom_type: "todo.list".into(),
+            content: serde_json::json!({"items": []}),
+            timestamp: 1,
+        });
+        write_legacy(&dir, &[user_msg("before"), custom, user_msg("after")]);
+
+        let sm = SessionManager::with_root(tmp.path().to_path_buf());
+        let events = sm.migrate(sid).await.unwrap();
+        assert_eq!(derive_messages(&events).len(), 2);
+        assert!(dir.join("events.jsonl").exists());
+        assert!(!dir.join("messages.jsonl").exists());
+    }
+
+    fn text_of_first(msg: &AgentMessage) -> String {
+        match msg {
+            AgentMessage::User(u) => u
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    conga::ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+            other => panic!("expected a user message, got {other:?}"),
+        }
     }
 
     /// Crash window before the rename: `events.jsonl.tmp` exists (possibly
@@ -520,7 +665,7 @@ mod tests {
         std::fs::write(dir.join("events.jsonl.tmp"), "{\"type\":\"TurnSta").unwrap();
 
         let sm = SessionManager::with_root(tmp.path().to_path_buf());
-        let events = sm.open_or_migrate(sid).await.unwrap();
+        let events = sm.migrate(sid).await.unwrap();
         assert_eq!(
             derive_messages(&events),
             legacy,
@@ -558,7 +703,7 @@ mod tests {
         write_legacy(&dir, &[user_msg("old-a"), user_msg("old-b")]);
 
         let sm = SessionManager::with_root(tmp.path().to_path_buf());
-        let loaded = sm.open_or_migrate(sid).await.unwrap();
+        let loaded = sm.migrate(sid).await.unwrap();
         assert_eq!(
             loaded, events,
             "must load the complete events.jsonl, never consult the legacy file"
@@ -701,6 +846,60 @@ mod tests {
     }
 
     #[test]
+    fn count_messages_counts_a_compacted_checkpoint_as_its_base() {
+        // A compaction checkpoint REPLACES the pre-checkpoint history with
+        // its frozen base: the count must follow the checkpoint, not add
+        // the folded-away messages on top of it.
+        let events = vec![
+            SessionEvent::User(user_msg("old1")),
+            SessionEvent::User(user_msg("old2")),
+            SessionEvent::Compacted {
+                base: vec![user_msg("pinned task")],
+                dropped: 1,
+            },
+            SessionEvent::User(user_msg("new")),
+        ];
+        let raw: String = events
+            .iter()
+            .map(|e| format!("{}\n", serde_json::to_string(e).unwrap()))
+            .collect();
+        assert_eq!(count_messages(&raw, true), 2, "base + one appended message");
+        assert_eq!(
+            count_messages(&raw, true),
+            conga::derive_messages(&events).len(),
+            "the counter and the model-visible view must agree"
+        );
+    }
+
+    #[test]
+    fn count_messages_follows_the_last_checkpoint() {
+        // Two checkpoints in one log: the LAST one wins, exactly like the
+        // model-visible projection.
+        let events = vec![
+            SessionEvent::User(user_msg("a")),
+            SessionEvent::Compacted {
+                base: vec![user_msg("pinned")],
+                dropped: 0,
+            },
+            SessionEvent::User(user_msg("b")),
+            SessionEvent::Compacted {
+                base: vec![user_msg("pinned2"), user_msg("notice")],
+                dropped: 2,
+            },
+            SessionEvent::User(user_msg("c")),
+        ];
+        let raw: String = events
+            .iter()
+            .map(|e| format!("{}\n", serde_json::to_string(e).unwrap()))
+            .collect();
+        assert_eq!(count_messages(&raw, true), 3);
+        assert_eq!(
+            count_messages(&raw, true),
+            conga::derive_messages(&events).len()
+        );
+    }
+
+    #[test]
     fn count_messages_skips_torn_unknown_and_typeless_rows() {
         let raw = concat!(
             "{\"type\":\"user\"}\n",
@@ -750,8 +949,24 @@ mod tests {
     async fn read_msg_count_cache_returns_the_pair_for_a_valid_sidecar() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("meta.json");
-        std::fs::write(&p, r#"{"name":"x","msg_count":7,"msg_count_bytes":123}"#).unwrap();
+        std::fs::write(
+            &p,
+            format!(
+                r#"{{"name":"x","msg_count":7,"msg_count_bytes":123,"msg_count_rule":"{MSG_COUNT_RULE}"}}"#
+            ),
+        )
+        .unwrap();
         assert_eq!(read_msg_count_cache(&p).await, Some((7, 123)));
+    }
+
+    #[tokio::test]
+    async fn read_msg_count_cache_rejects_a_cache_written_by_an_older_rule() {
+        // A cache written before the counting rule changed (it ignored
+        // compaction checkpoints) would keep serving its wrong number.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("meta.json");
+        std::fs::write(&p, r#"{"msg_count":7,"msg_count_bytes":123}"#).unwrap();
+        assert!(read_msg_count_cache(&p).await.is_none());
     }
 
     // ---- write_msg_count_cache ----
@@ -765,6 +980,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v[META_MSG_COUNT], 4);
         assert_eq!(v[META_MSG_COUNT_BYTES], 55);
+        assert_eq!(v[META_MSG_COUNT_RULE], MSG_COUNT_RULE);
     }
 
     #[tokio::test]

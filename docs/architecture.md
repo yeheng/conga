@@ -89,15 +89,15 @@ conga 后端是一个 Cargo workspace(`conga/Cargo.toml`),包含 5 个 crate,呈
 | 概念 | 定义 | 代码位置 |
 |---|---|---|
 | **Session** | 一次连续对话,对应磁盘上 `~/.conga/sessions/<id>/events.jsonl` 的一份 append-only 事件日志(唯一真相源) | `host/src/session.rs`(`SessionManager`) |
-| **SessionEvent** | 事件日志的追加写词汇表:`TurnStart` / `User` / `Assistant{message,usage}` / `ToolResult` / `TurnEnd{reason}` | `core/src/types/session_event.rs:15` |
-| **derive_messages** | 纯投影:事件日志 → 模型可见消息列表(`TurnStart`/`TurnEnd` 不产出消息) | `core/src/types/session_event.rs:69` |
+| **SessionEvent** | 事件日志的追加写词汇表:`TurnStart` / `User` / `Assistant{message,usage}` / `ToolResult` / `TurnEnd{reason}` / `Cleared` / `Compacted{base,dropped}` | `conga/src/types/session_event.rs:15` |
+| **derive_messages** | 纯投影:事件日志 → 模型可见消息列表(`TurnStart`/`TurnEnd` 不产出消息;投影从最后一个 `Cleared`/`Compacted` 之后重启) | `conga/src/types/session_event.rs:94` |
 | **EventStorage** | `events.jsonl` 的追加写 / 读取存储:`O_APPEND` 单次 `write_all`、torn-tail 自愈、未知变体 fail-closed、原子批量安装(tmp+rename) | `core/src/storage/mod.rs:323` |
 | **Host** | 把 config/session/policy/hooks/stream_fn 组装在一起的驱动器;对外暴露 `run_turn`(历史从日志派生,不由调用方携带) | `host/src/lib.rs:51` |
 | **Agent Loop** | 无状态的推理循环:调 LLM → 解析响应 → 执行工具 → 把工具结果喂回 → 直到结束或超限;经注入的 `persist` 回调逐事件落盘 | `core/src/agent_loop.rs` |
 | **Tool** | 一个带 JSON Schema 参数、风险等级、执行闭包的函数,LLM 可主动调用 | `core/src/types/tool.rs`(`ToolDefinition`) |
 | **Hook** | 围绕每次工具调用的拦截器:`before_tool_call` 可 Allow/Block/Modify,`after_tool_call` 可改写结果(如脱敏) | `core/src/types/tool.rs`(`HookChain`) |
 | **Provider** | 一个实现了 `StreamFn` 的 LLM 客户端;内核只认这个 trait,不认具体厂商 | `core/src/providers/mod.rs` |
-| **Compaction** | 在喂给 LLM 之前**压缩工作内存**(只缩内存、日志仍是 append-only 全量);预算从日志尾部恢复 | `host/src/compact.rs`(`ContextBudget`) |
+| **Compaction** | 在喂给 LLM 之前压缩工作 transcript;压缩结果作为 `Compacted` 检查点**追加**到事件日志(日志仍 append-only,但投影从最后一个检查点重启);预算从日志尾部恢复 | `conga-host/src/compact.rs`(`ContextBudget`) |
 | **Gateway** | 每条 WebSocket 连接 = 一个会话;内联 `Host::run_turn` 驱动 agent loop,经 select! 多路复用推事件回 WS;历史按需从日志 `derive_messages` | `conga-gateway/src/ws.rs` |
 
 ---
@@ -113,13 +113,15 @@ conga 有两条入口路径,但都汇聚到同一个 `Host::run_turn` → `run_a
 ```
 run_turn(user_msg, on_event)
    │
-   1. session.open_or_migrate(sid)        ← 读 events.jsonl(必要时迁移旧 messages.jsonl)
+   1. session.migrate(sid)              ← 写路径:读 events.jsonl(必要时迁移旧 messages.jsonl)
       session.append_event(TurnStart)     ← 框定本轮开始
       session.append_event(User)          ← 用户消息先于循环落盘
    │
    2. history = derive_messages(events)   ← 纯投影:事件日志 → 模型可见消息
       budget 从日志尾部恢复(最后一条 Assistant 的 usage.input_tokens)
-      history = budget.compact(&history)  ← 只缩内存;日志仍是 append-only 全量
+      history = budget.compact(&history)  ← 超预算则追加一条 Compacted 检查点
+                                           (base = 压缩后视图,dropped = 丢弃条数);
+                                           日志仍 append-only,投影从最后一个检查点重启
    │
    3. cfg.prepare_turn(TurnInputs{ system_prompt, history, tools, cwd, session_id },
                         signal, hooks, stream_fn, max_turns, Some(session.persist_fn()))
@@ -135,6 +137,10 @@ run_turn(user_msg, on_event)
 ```
 
 关键不变量:**`history` 每轮从日志现派生**(`derive_messages`),调用方不再持有一份内存 transcript;**磁盘是逐事件追加**——已发生的副作用(助手消息、工具结果)在它们发生时就落盘,崩溃 / 失败 / 取消的轮次仍保有其已经发生的全部事实。`persist: None` 路径(裸 `agent_loop` / 既有测试)不落盘,行为与之前逐字节一致。
+
+**检查点(checkpoint)**:日志里有两种事件会让投影重启,取**最后一个**生效——`Cleared`(`/clear` 重置为空白对话)与 `Compacted`(压缩检查点,携带压缩后的视图 `base`)。检查点**之前**的事件仍完整躺在日志里,只是不再投影给模型;`derive_messages` / `view_scope_start` 都以「最后一个检查点之后」为作用域边界。
+
+**两种作用域,两个名字**:`view_scope_start`(视图范围,`Cleared`|`Compacted` 之后)用于「模型还看得见什么」;`billing_scope_start`(计费范围,仅 `Cleared` 之后)用于「这通对话一共花了多少 token」——压缩只缩短模型的窗口,不会让已计费的事实消失。两者刻意不同,不要合并。
 
 ### 4.2 路径 A:CLI REPL
 
@@ -297,7 +303,9 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 - 中间行损坏 → 报错带**文件 + 行号**(位腐 / 外部编辑 = 真实损坏)。
 - `EventStorage.load_events` 额外开启 `fail_closed_on_data`:一条**完整**但 `type` 不匹配任何已知 `SessionEvent` 变体的行(`serde_json::error::Category::Data`)→ 加载失败带行号(版本错位,绝不当 torn tail 抹掉)。
 
-**原子批量安装**(`append_events_atomic`,`storage/mod.rs:459`):整批先写 `events.jsonl.tmp` → `sync_all` → `rename`(POSIX 原子)。专用于**迁移**:旧 `messages.jsonl` 经 `SessionManager::open_or_migrate` 一次性包裹、原子写入 `events.jsonl`,成功后才 `delete_legacy` 删旧文件——崩溃要么只留 `.tmp`(下次重迁),要么 `events.jsonl` 已完整。详见 [ADR 0001](./adr/0001-event-sourced-session-log.md)。
+**原子批量安装**(`append_events_atomic`,`storage/mod.rs:459`):整批先写 `events.jsonl.tmp` → `sync_all` → `rename`(POSIX 原子)。专用于**迁移**:旧 `messages.jsonl` 经 `SessionManager::migrate` 一次性包裹、原子写入 `events.jsonl`,成功后才 `delete_legacy` 删旧文件——崩溃要么只留 `.tmp`(下次重迁),要么 `events.jsonl` 已完整。详见 [ADR 0001](./adr/0001-event-sourced-session-log.md)。
+
+**读路径不写盘**:`SessionManager::open` 是纯读的——有 `events.jsonl` 就读它,否则把旧 `messages.jsonl` **在内存里**转换后返回,不落盘、不删文件。只有写路径(`run_turn` → `migrate`)才安装迁移产物。因此一个 GET 请求永远不会改写用户的磁盘。
 
 ### 5.6 出站工具代理(`proxy.rs`)
 
@@ -329,7 +337,7 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 | 模块 | 职责 | 关键导出 |
 |---|---|---|
 | `config.rs` | 从 env 读取并组装 `HostConfig`(`ProviderConfig` + `AgentTunables` + system prompt + cwd),产出 `TurnInputs` | `ConfigLoader` / `HostConfig` / `TurnInputs` |
-| `session.rs` | 会话 CRUD、列出、恢复(`resume`/`resume_last`)、事件追加、`open_or_migrate`(读 events.jsonl,首次打开迁移旧 messages.jsonl,失败 fail-closed)、clear(uuid 轮换);持有 `EventStorage` | `SessionManager` / `SessionInfo` |
+| `session.rs` | 会话 CRUD、列出、恢复(`resume`/`resume_last`)、事件追加、`open`(纯读:读 events.jsonl,旧 messages.jsonl 只在内存里转换)/`migrate`(写路径:首次打开迁移旧 messages.jsonl,失败 fail-closed)、clear(uuid 轮换);持有 `EventStorage` | `SessionManager` / `SessionInfo` |
 | `permission.rs` | 权限策略:三档 `Mode` × 工具 `RiskLevel` 决策,内部持 approver 回调 | `Mode` / `PermissionPolicy` |
 | `hooks.rs` | 把多个 `HookChain` 串成栈;`before` 取首个 Block / 末个 Modify,`after` 链式改写 | `HookStack` |
 | `compact.rs` | 上下文压缩(见第 9 章) | `ContextBudget` / `compact_by_count` |
@@ -441,13 +449,13 @@ forwarder 任务: AgentEvent → event_to_ws() → JSON → 推回 WS
 
 ## 9. 上下文压缩(Compaction)
 
-压缩是**纯宿主策略**(`host/src/compact.rs`),目的是在喂给 LLM 前缩小工作 transcript。三个硬约束:
+压缩是**纯宿主策略**(`conga-host/src/compact.rs`),目的是在喂给 LLM 前缩小工作 transcript。三个硬约束:
 
-1. **只缩内存,不改盘**——`~/.conga/sessions/<id>/events.jsonl` 始终是 append-only 事件日志,压缩只作用于本次喂给 LLM 的 `history`(每轮现派生)。
+1. **日志只追加,压缩以「检查点」的形式追加**——`~/.conga/sessions/<id>/events.jsonl` 永远只追加、不改写已有行;压缩不修改历史,而是**追加一条 `Compacted` 检查点**(`base` = 压缩后的视图,`dropped` = 丢弃条数)。投影(`derive_messages`)从**最后一个** `Cleared` 或 `Compacted` 之后重启:被折叠的原文仍在磁盘上,只是不再投影给模型。
 2. **无 LLM 摘要**——不调用模型做总结,只做"丢弃最旧的若干组 + 前置一条 `[compacted N earlier messages; original task kept]` 提示"。
 3. **永不切断 tool_call ↔ result**——见 `atomic_groups`。
 4. **pin 原始任务**(harness 约束)——首组(最初的用户任务)**永不丢弃**,钉在压缩输出最前;忘了为什么出发的 agent 比窗口短一点的 agent 更糟。
-5. **老工具结果截断**(harness 约束)——最后一组之前的 `ToolResult` 文本块压到头部 400 字符 + 截断标记;最新交互保持逐字。二者都只改 wire view,日志不动。
+5. **老工具结果截断**(harness 约束)——最后一组之前的 `ToolResult` 文本块压到头部 400 字符 + 截断标记;最新交互保持逐字。截断只发生在压缩视图里;检查点之前的原始行仍完整留在日志中。
 
 ### 9.1 原子组(`atomic_groups`)
 
@@ -622,7 +630,7 @@ src/
 | **JSONL torn-tail 自愈 + fail-closed** | 末行解析失败 = 崩溃截断 → 丢弃并截断;中行损坏 = 真实损坏 → 报错带行号。事件日志额外 fail-closed:未知 `type` 变体(版本错位)→ 加载失败带行号,绝不当 torn tail 抹掉 |
 | **审批双通道取消** | `AtomicBool` 驱动 loop 中止 + `watch` channel 解锁挂起审批,防止取消后闩锁毒化 |
 | **前端 isTauri 双传输** | Tauri 桌面端通过 `isTauri` 运行时分支在 WS/HTTP(浏览器)与 IPC(桌面)之间切换,其中 8 个 `#[tauri::command]` 与 gateway 端点一一对应;单一 `WireEvent` 枚举 + emitter task 保证跨流有序,前端消息处理逻辑完全共享 |
-| **压缩只缩内存、不改盘;预算从日志恢复** | append-only 事件日志永远是真相源;工作内存压缩有损但不破坏 protocol(原子组保护 tool_call↔result)。`usage` 随 `Assistant` 事件持久化,token 预算每轮从日志尾部恢复,跨重启存活 |
+| **压缩追加检查点、不改写日志;预算从日志恢复** | append-only 事件日志永远是真相源:压缩只**追加**一条 `Compacted` 检查点(`base` + `dropped`),已有行一字不改;投影从最后一个 `Cleared`\|`Compacted` 之后重启。工作内存压缩有损但不破坏 protocol(原子组保护 tool_call↔result)。`usage` 随 `Assistant` 事件持久化,token 预算每轮从日志尾部恢复,跨重启存活 |
 
 ---
 

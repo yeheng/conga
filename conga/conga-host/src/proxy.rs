@@ -9,7 +9,6 @@ use std::sync::RwLock;
 /// means "fall back to the env var".
 static OVERRIDE: RwLock<Option<String>> = RwLock::new(None);
 
-const ENV_VAR: &str = "CONGA_TOOL_PROXY";
 const ALLOWED_SCHEMES: &[&str] = &["http", "https", "socks5", "socks5h"];
 
 /// Set (or clear) the runtime override. The URL is validated eagerly so a
@@ -41,10 +40,7 @@ fn resolve_with(lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>) -> 
     if let Some(o) = OVERRIDE.read().unwrap().clone() {
         return Some(o);
     }
-    lookup(ENV_VAR)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    conga::proxy::tool_proxy_from_env_with(lookup)
 }
 
 /// Validate a proxy URL without installing it. Single source of truth for
@@ -146,19 +142,28 @@ mod tests {
         let _g = test_util::LOCK.blocking_lock();
         set_tool_proxy(Some("socks5://override:1080")).unwrap();
         assert_eq!(
-            resolve_with(&fake_env(&[(ENV_VAR, "http://env:8080")])),
+            resolve_with(&fake_env(&[(
+                conga::proxy::TOOL_PROXY_VAR,
+                "http://env:8080"
+            )])),
             Some("socks5://override:1080".to_string())
         );
 
         set_tool_proxy(None).unwrap();
         assert_eq!(
-            resolve_with(&fake_env(&[(ENV_VAR, "http://env:8080")])),
+            resolve_with(&fake_env(&[(
+                conga::proxy::TOOL_PROXY_VAR,
+                "http://env:8080"
+            )])),
             Some("http://env:8080".to_string())
         );
         // env unset and no override -> none
         assert_eq!(resolve_with(&fake_env(&[])), None);
         // blank env value treated as unset
-        assert_eq!(resolve_with(&fake_env(&[(ENV_VAR, "  ")])), None);
+        assert_eq!(
+            resolve_with(&fake_env(&[(conga::proxy::TOOL_PROXY_VAR, "  ")])),
+            None
+        );
     }
 
     #[test]
@@ -221,10 +226,10 @@ mod tests {
     fn tool_proxy_falls_back_to_the_env_var() {
         let _g = test_util::LOCK.blocking_lock();
         set_tool_proxy(None).unwrap();
-        let saved = std::env::var(ENV_VAR).ok();
-        std::env::set_var(ENV_VAR, "http://env-proxy:8080");
+        let saved = std::env::var(conga::proxy::TOOL_PROXY_VAR).ok();
+        std::env::set_var(conga::proxy::TOOL_PROXY_VAR, "http://env-proxy:8080");
         let resolved = tool_proxy();
-        restore_env(ENV_VAR, saved);
+        restore_env(conga::proxy::TOOL_PROXY_VAR, saved);
         assert_eq!(resolved, Some("http://env-proxy:8080".to_string()));
     }
 
@@ -232,15 +237,15 @@ mod tests {
     fn tool_proxy_trims_the_env_var_and_ignores_a_blank_one() {
         let _g = test_util::LOCK.blocking_lock();
         set_tool_proxy(None).unwrap();
-        let saved = std::env::var(ENV_VAR).ok();
+        let saved = std::env::var(conga::proxy::TOOL_PROXY_VAR).ok();
 
-        std::env::set_var(ENV_VAR, "  http://env-proxy:8080  ");
+        std::env::set_var(conga::proxy::TOOL_PROXY_VAR, "  http://env-proxy:8080  ");
         let trimmed = tool_proxy();
         assert_eq!(trimmed, Some("http://env-proxy:8080".to_string()));
 
-        std::env::set_var(ENV_VAR, "   ");
+        std::env::set_var(conga::proxy::TOOL_PROXY_VAR, "   ");
         let blank = tool_proxy();
-        restore_env(ENV_VAR, saved);
+        restore_env(conga::proxy::TOOL_PROXY_VAR, saved);
         assert_eq!(blank, None, "a blank env value means no proxy");
     }
 
@@ -248,10 +253,10 @@ mod tests {
     fn tool_proxy_is_none_without_override_and_without_env() {
         let _g = test_util::LOCK.blocking_lock();
         set_tool_proxy(None).unwrap();
-        let saved = std::env::var(ENV_VAR).ok();
-        std::env::remove_var(ENV_VAR);
+        let saved = std::env::var(conga::proxy::TOOL_PROXY_VAR).ok();
+        std::env::remove_var(conga::proxy::TOOL_PROXY_VAR);
         let resolved = tool_proxy();
-        restore_env(ENV_VAR, saved);
+        restore_env(conga::proxy::TOOL_PROXY_VAR, saved);
         assert_eq!(resolved, None);
     }
 }

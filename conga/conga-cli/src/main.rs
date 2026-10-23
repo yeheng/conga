@@ -423,7 +423,7 @@ mod tests {
 
         let events = host
             .session()
-            .open_or_migrate(&sid)
+            .open(&sid)
             .await
             .expect("the session log is readable");
         assert!(
@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(host.policy().mode(), Mode::AutoEdit);
         let events = host
             .session()
-            .open_or_migrate(&sid)
+            .open(&sid)
             .await
             .expect("the session log is readable");
         assert!(

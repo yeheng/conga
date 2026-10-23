@@ -504,7 +504,9 @@ mod tests {
         for _ in 0..10 {
             body.push_str("hit\n");
         }
-        tokio::fs::write(tmp.path().join("a.txt"), &body).await.unwrap();
+        tokio::fs::write(tmp.path().join("a.txt"), &body)
+            .await
+            .unwrap();
 
         let rg_out = grep_rg("hit", tmp.path(), "a.txt", None, false, 3).await;
         if rg_available() {
@@ -545,7 +547,10 @@ mod tests {
             );
         } else {
             assert!(rg_out.is_err(), "rg must fail without ripgrep");
-            let re = RegexBuilder::new("mixed").case_insensitive(true).build().unwrap();
+            let re = RegexBuilder::new("mixed")
+                .case_insensitive(true)
+                .build()
+                .unwrap();
             let (matches, _) = grep_builtin(
                 &re,
                 tmp.path(),
@@ -567,7 +572,9 @@ mod tests {
     #[tokio::test]
     async fn grep_rg_reports_an_invalid_regex_as_an_error() {
         let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join("a.txt"), "x\n").await.unwrap();
+        tokio::fs::write(tmp.path().join("a.txt"), "x\n")
+            .await
+            .unwrap();
         let res = grep_rg("(", tmp.path(), "a.txt", None, false, 100).await;
         assert!(res.is_err(), "an invalid regex must not produce matches");
     }
@@ -576,8 +583,12 @@ mod tests {
     #[tokio::test]
     async fn grep_rg_honors_the_glob_filter() {
         let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join("a.txt"), "hit\n").await.unwrap();
-        tokio::fs::write(tmp.path().join("b.rs"), "hit\n").await.unwrap();
+        tokio::fs::write(tmp.path().join("a.txt"), "hit\n")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("b.rs"), "hit\n")
+            .await
+            .unwrap();
 
         let rg_out = grep_rg("hit", tmp.path(), ".", Some("*.txt"), false, 100).await;
         if rg_available() {
